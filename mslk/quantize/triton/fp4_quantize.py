@@ -496,23 +496,29 @@ def _kernel_quantize_mx4_unpack(
                 pack=1,
             )
 
-        row = exp_offset // GROUPS_PER_ROW
-        col = exp_offset % GROUPS_PER_ROW
-        padded_exp_offset = row * SCALE_K + col
+        if IS_ROCM:
+            # AMD Triton GEMMs (f4f4bf16 / mx8mx4) consume the plain
+            # [M, K//32] scale layout, not the NVIDIA TCGen5-swizzled one.
+            # exp_offset already equals row * GROUPS_PER_ROW + col.
+            actual_offset = exp_offset
+        else:
+            row = exp_offset // GROUPS_PER_ROW
+            col = exp_offset % GROUPS_PER_ROW
+            padded_exp_offset = row * SCALE_K + col
 
-        n_col_blocks = SCALE_K // 4
-        first_dim = padded_exp_offset // (512 * n_col_blocks)
-        second_dim = (padded_exp_offset % (512 * n_col_blocks)) // (128 * n_col_blocks)
-        third_dim = (padded_exp_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
-        fourth_dim = (padded_exp_offset % (4 * n_col_blocks)) // 4
-        fifth_dim = padded_exp_offset % 4
-        actual_offset = (
-            first_dim * (512 * n_col_blocks)
-            + fourth_dim * (512)
-            + third_dim * (16)
-            + second_dim * (4)
-            + fifth_dim
-        )
+            n_col_blocks = SCALE_K // 4
+            first_dim = padded_exp_offset // (512 * n_col_blocks)
+            second_dim = (padded_exp_offset % (512 * n_col_blocks)) // (128 * n_col_blocks)
+            third_dim = (padded_exp_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
+            fourth_dim = (padded_exp_offset % (4 * n_col_blocks)) // 4
+            fifth_dim = padded_exp_offset % 4
+            actual_offset = (
+                first_dim * (512 * n_col_blocks)
+                + fourth_dim * (512)
+                + third_dim * (16)
+                + second_dim * (4)
+                + fifth_dim
+            )
         # We're done with group_exp now so we can write it out.
         tl.store(
             scale + actual_offset,
@@ -662,9 +668,16 @@ def triton_quantize_mx4_unpack(
     def round_up(x: int, y: int) -> int:
         return (x + y - 1) // y * y
 
-    rounded_M = round_up(M, 128)
     scale_K = K // block_size
-    rounded_K = round_up(scale_K, 4)
+    # On ROCm the kernel emits the plain [M, K//32] scale layout (no TCGen5
+    # swizzle/padding) that the AMD Triton GEMMs consume; on NVIDIA the scales
+    # are padded to a 128x4 tile and swizzled.
+    is_rocm = torch.version.hip is not None
+    if is_rocm:
+        rounded_M, rounded_K = M, scale_K
+    else:
+        rounded_M = round_up(M, 128)
+        rounded_K = round_up(scale_K, 4)
     # E8M0 scale byte 127 is 2^0, the neutral scale for rounded tail slots.
     scale = torch.full(
         (rounded_M, rounded_K),
@@ -743,8 +756,13 @@ def triton_quantize_mx4_unpack(
         IS_GFX950=_detect_gfx950(),
     )
 
+    out = out.view(list(orig_shape[:-1]) + [-1]).view(torch.uint8)
+    if is_rocm:
+        # Plain [..., K//32] layout for the AMD Triton GEMMs.
+        scale = scale.view(torch.uint8).reshape(list(orig_shape[:-1]) + [scale_K])
+        return out, scale
     scale = scale.flatten()
-    return out.view(list(orig_shape[:-1]) + [-1]).view(torch.uint8), scale
+    return out, scale
 
 
 @triton.jit

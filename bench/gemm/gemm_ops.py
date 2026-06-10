@@ -88,6 +88,7 @@ class Accelerator(Enum):
     NVIDIA_SM100 = auto()
     NVIDIA_SM103 = auto()
     AMD_MI300X = auto()
+    AMD_MI350X = auto()
 
 
 class GemmType(Enum):
@@ -110,6 +111,10 @@ def get_current_accelerator() -> Accelerator | None:
 
     if torch.version.hip is not None:
         device_name = torch.cuda.get_device_name()
+        # device_name can be generic on ROCm; gcnArchName is the reliable source.
+        arch = (getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or "").lower()
+        if "gfx950" in arch:
+            return Accelerator.AMD_MI350X
         if "MI300X" in device_name.upper():
             return Accelerator.AMD_MI300X
     elif torch.version.cuda is not None:
@@ -2240,7 +2245,11 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_MI350X,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2426,7 +2435,72 @@ class CutlassMXFP4GroupwiseGrouped(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_MI350X,
+        }
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
+
+@register_gemm_op
+class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
+    """
+    MXFP4 grouped matmul (3D weight variant) with groupwise scaling.
+
+    Dispatches to mslk::f4f4bf16_grouped_mm. Weight tensor is `[G, N, K//2]`
+    and the call site transposes the last two dims (see existing test
+    MXFP4Tests::test_grouped_gemm_2d_3d). Inputs are uniform [G, M, K]
+    activations and [G, N, K] weights with no per-expert size variation
+    (offsets are the cumulative row endpoints across equal-sized chunks).
+    """
+
+    def preprocess(self, x, w):
+        # x: list[Tensor [M, K]], w: list[Tensor [N, K]]; convert to stacked tensors.
+        wq, w_scale = zip(*[triton_quantize_mx4_unpack(i) for i in w])
+        wq = torch.stack(wq, dim=0).contiguous()                 # [G, N, K//2]
+        w_scale = torch.stack(w_scale, dim=0).contiguous()       # [G, N, K//32]
+        return x, wq, w_scale
+
+    def quantize(self, x, wq, w_scale):
+        xq_list, x_scale_list = [], []
+        for xi in x:
+            q, s = triton_quantize_mx4_unpack(xi)
+            xq_list.append(q)
+            x_scale_list.append(s)
+        xq = torch.cat(xq_list, dim=0).contiguous()              # [total_M, K//2]
+        x_scale = torch.stack(x_scale_list, dim=0).contiguous()  # [G, M, K//32]
+        # offsets: cumulative M per expert (int32 per the op schema).
+        G = len(x)
+        M_each = x[0].shape[0]
+        offsets = torch.arange(
+            M_each, G * M_each + 1, M_each, dtype=torch.int32, device=xq.device
+        )
+        return xq, wq, x_scale, w_scale, offsets
+
+    def compute(self, xq, wq, x_scale, w_scale, offsets):
+        return torch.ops.mslk.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+
+    def quantize_and_compute(self, x, w):
+        xq, wq, x_scale, w_scale, offsets = self.quantize(*self.preprocess(x, w))
+        return self.compute(xq, wq, x_scale, w_scale, offsets)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_MI350X,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:

@@ -7,6 +7,7 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import itertools
 import os
 import unittest
 from typing import Optional, Union
@@ -111,6 +112,11 @@ def supports_nvfp4():
     if torch.cuda.is_available():
         if torch.version.cuda:
             return evaluate_cuda_compute_capability(10)
+        if torch.version.hip is not None:
+            # AMD runs NVFP4 via dequant→FP8 (no native FP4 needed); gfx942/gfx950.
+            props = torch.cuda.get_device_properties(0)
+            arch = (getattr(props, "gcnArchName", "") or "").lower()
+            return "gfx942" in arch or "gfx950" in arch
     return False
 
 
@@ -122,11 +128,26 @@ def supports_nvfp4_ultra():
     return cuda_major >= 13 and (major, minor) >= (10, 3)
 
 
-def supports_mxfp4():
+def supports_mxfp4_native():
+    # Native MXFP4 scaled MFMA: SM100, or gfx950 (grouped MXFP4 is native-only).
     if torch.cuda.is_available():
         if torch.version.cuda:
             return evaluate_cuda_compute_capability(10)
-        # TODO add AMD here later
+        if torch.version.hip is not None:
+            props = torch.cuda.get_device_properties(0)
+            arch = (getattr(props, "gcnArchName", "") or "").lower()
+            return "gfx950" in arch
+    return False
+
+
+def supports_mxfp4():
+    # Dense MXFP4: native MFMA, plus gfx942 via the dequant→FP8 fallback.
+    if supports_mxfp4_native():
+        return True
+    if torch.cuda.is_available() and torch.version.hip is not None:
+        props = torch.cuda.get_device_properties(0)
+        arch = (getattr(props, "gcnArchName", "") or "").lower()
+        return "gfx942" in arch
     return False
 
 
@@ -138,6 +159,7 @@ SUPPORTS_BF16_INT4 = supports_bf16_int4()
 SUPPORTS_NVFP4 = supports_nvfp4()
 SUPPORTS_NVFP4_ULTRA = supports_nvfp4_ultra()
 SUPPORTS_MXFP4 = supports_mxfp4()
+SUPPORTS_MXFP4_NATIVE = supports_mxfp4_native()
 
 if torch.cuda.is_available() and supports_float8_fnuz(
     throw_on_hip_incompatibility=(not running_on_github)
@@ -2416,6 +2438,38 @@ class BF16Tests(unittest.TestCase):
             )
 
 
+def _nvfp4_quantize_plain(x: torch.Tensor):
+    """Reference NVFP4 quantizer producing the plain [M, K//16] layout the AMD
+    dequant GEMM consumes . Pure PyTorch, test-only.
+
+    Convention matches nvfp4_dequant_gemm (dequant = value * stored_scale /
+    global_scale): global = (448 * 6) / amax; per-16-block stored fp8 =
+    (blockamax/6 * global); effective per-block scale = stored_fp8 / global.
+    Returns (packed uint8 [M, K//2], scale uint8 [M, K//16], global fp32 scalar).
+    """
+    FP8_MAX, FP4_MAX = 448.0, 6.0
+    xf = x.to(torch.float32)
+    M, K = xf.shape
+    amax = xf.abs().amax().clamp_min(1e-30)
+    global_scale = (FP8_MAX * FP4_MAX) / amax
+    blk = xf.reshape(M, K // 16, 16)
+    block_amax = blk.abs().amax(dim=2).clamp_min(1e-30)
+    stored = (block_amax / FP4_MAX * global_scale).clamp_max(FP8_MAX)
+    stored_fp8 = stored.to(torch.float8_e4m3fn)
+    eff = (stored_fp8.to(torch.float32) / global_scale).clamp_min(1e-30)
+    y = blk / eff[:, :, None]
+    ay = y.abs()
+    code = (
+        (ay > 0.25).int() + (ay > 0.75).int() + (ay > 1.25).int()
+        + (ay > 1.75).int() + (ay > 2.5).int() + (ay > 3.5).int()
+        + (ay > 5.0).int()
+    ).clamp_max(7)
+    nib = torch.where(code == 0, 0, ((y < 0).int() << 3) | code).reshape(M, K).to(torch.uint8)
+    packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.uint8)
+    scale = stored_fp8.view(torch.uint8)
+    return packed, scale, global_scale.reshape(())
+
+
 @unittest.skipIf(
     not SUPPORTS_NVFP4, "Skip if NVFP4Tests is not supported on this device."
 )
@@ -2435,20 +2489,32 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        global_scales, a_global_scales, b_global_scales = get_nvfp4_global_scales_naive(
-            [A],
-            [B],
-        )
-        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
-
-        out_nvfp4 = torch.ops.mslk.f4f4bf16(
-            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
-        )
+        if torch.version.hip is not None:
+            # AMD consumes NVFP4 via dequant→FP8. main's triton_quantize_nvfp4
+            # is NVIDIA-PTX-only, so quantize here in plain [M, K//16] layout.
+            aq, a_scale, a_global = _nvfp4_quantize_plain(A)
+            bq, b_scale, b_global = _nvfp4_quantize_plain(B)
+            global_scale = torch.stack([a_global, b_global])
+            out_nvfp4 = torch.ops.mslk.f4f4bf16(
+                aq, bq, a_scale, b_scale, None, global_scale, mxfp4_block_size=16
+            )
+            rtol = atol = 8e-2
+        else:
+            global_scales, a_global_scales, b_global_scales = (
+                get_nvfp4_global_scales_naive([A], [B])
+            )
+            aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
+            bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+            out_nvfp4 = torch.ops.mslk.f4f4bf16(
+                aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+            )
+            rtol = atol = 5e-2
         out_bf16 = A @ B.t()
 
-        torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
+        torch.testing.assert_close(out_nvfp4, out_bf16, atol=atol, rtol=rtol)
 
+    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel);
+    # the ROCm path only implements dense NVFP4.
     @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small
@@ -2456,6 +2522,7 @@ class NVFP4Tests(unittest.TestCase):
             (16, 3500, 6144, 3584),  # large
         ]
     )
+    @unittest.skipIf(not torch.version.cuda, "NVFP4 grouped GEMM is CUDA-only")
     def test_grouped_gemm_2d_3d(
         self,
         G: int,
@@ -2506,6 +2573,7 @@ class NVFP4Tests(unittest.TestCase):
             (64, 3500, 6144, 3584),  # large G
         ]
     )
+    @unittest.skipIf(not torch.version.cuda, "NVFP4 grouped GEMM is CUDA-only")
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
@@ -2670,6 +2738,10 @@ class MXFP4Tests(unittest.TestCase):
             (64, 3500, 6144, 3584),  # large G
         ]
     )
+    @unittest.skipIf(
+        not SUPPORTS_MXFP4_NATIVE,
+        "Grouped MXFP4 is native-only (tl.dot_scaled); no gfx942 dequant fallback",
+    )
     def test_grouped_gemm_2d_3d(
         self,
         G: int,
@@ -2720,6 +2792,113 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
+        itertools.product(
+            [1, 4],  # G
+            [250, 500],  # M
+            [256, 1024],  # N
+            [2048, 3584],  # K
+        )
+    )
+    @unittest.skipIf(
+        not SUPPORTS_MXFP4_NATIVE,
+        "Grouped MXFP4 is native-only (tl.dot_scaled); no gfx942 dequant fallback",
+    )
+    def test_grouped_stacked_gemm(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        """f4f4bf16_grouped_stacked: WQ is [G, N, K//2] (not pre-transposed) and
+        M_sizes is per-expert counts (int64), not cumulative offsets."""
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        M_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)  # [G, N, K//2]
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+        offsets_for_ref = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets_for_ref, out_dtype=torch.bfloat16
+        )
+
+        out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
+            xq, wq, x_scale, w_scale, M_sizes
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @unittest.skipIf(
+        torch.version.hip is None or not SUPPORTS_MXFP4_NATIVE,
+        "AMD grouped MXFP4 grid regression guard (gfx950 only)",
+    )
+    def test_grouped_stacked_gemm_uneven(self) -> None:
+        # Uneven expert row counts: the grid must size the M-tile axis from
+        # total_M, not the average, or the largest expert's tail rows are dropped.
+        m_sizes_list = [64, 232, 600]
+        G = len(m_sizes_list)
+        N, K = 512, 2048
+
+        XS = [
+            torch.randn((m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for m in m_sizes_list
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        M_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)  # [total_M, K//2]
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)  # [G, N, K//2]
+        x_scale = torch.cat(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+        offsets = torch.cumsum(M_sizes, dim=0).to(torch.int32)
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+
+        out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
+            xq, wq, x_scale, w_scale, M_sizes
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    # MX8×MX4 grouped GEMM is CUDA-only (no ROCm impl; SM100-only _to_blocked).
+    @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small
             (4, 500, 1024, 2048),  # medium
@@ -2727,6 +2906,7 @@ class MXFP4Tests(unittest.TestCase):
             (64, 3500, 6144, 3584),  # large G
         ]
     )
+    @unittest.skipIf(not torch.version.cuda, "MX8xMX4 grouped GEMM is CUDA-only")
     def test_mx8mx4_grouped_gemm_2d_3d(
         self,
         G: int,
@@ -2786,6 +2966,7 @@ class MXFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
+    @unittest.skipIf(not torch.version.cuda, "MX8xMX4 grouped GEMM is CUDA-only")
     def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
         from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
