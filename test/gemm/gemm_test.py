@@ -3001,6 +3001,10 @@ class MXFP4Tests(unittest.TestCase):
             (16, 3500, 6144, 3584),  # large
         ]
     )
+    @unittest.skipIf(
+        torch.version.hip is not None,
+        "ROCm grouped MXFP4 only supports 2D-3D (MoE) layout; 2D-2D K-grouped is CUDA-only",
+    )
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
