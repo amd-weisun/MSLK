@@ -109,14 +109,8 @@ def support_fp8_int4():
 
 
 def supports_nvfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-        if torch.version.hip is not None:
-            # AMD runs NVFP4 via dequant→FP8 (no native FP4 needed); gfx942/gfx950.
-            props = torch.cuda.get_device_properties(0)
-            arch = (getattr(props, "gcnArchName", "") or "").lower()
-            return "gfx942" in arch or "gfx950" in arch
+    if torch.cuda.is_available() and torch.version.cuda:
+        return evaluate_cuda_compute_capability(10)
     return False
 
 
@@ -141,14 +135,8 @@ def supports_mxfp4_native():
 
 
 def supports_mxfp4():
-    # Dense MXFP4: native MFMA, plus gfx942 via the dequant→FP8 fallback.
-    if supports_mxfp4_native():
-        return True
-    if torch.cuda.is_available() and torch.version.hip is not None:
-        props = torch.cuda.get_device_properties(0)
-        arch = (getattr(props, "gcnArchName", "") or "").lower()
-        return "gfx942" in arch
-    return False
+    # Dense MXFP4: native MFMA on SM100 / gfx950 only (no gfx942 emulation).
+    return supports_mxfp4_native()
 
 
 SUPPORTS_BF16 = supports_bf16()
@@ -2489,32 +2477,20 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        if torch.version.hip is not None:
-            # AMD consumes NVFP4 via dequant→FP8. main's triton_quantize_nvfp4
-            # is NVIDIA-PTX-only, so quantize here in plain [M, K//16] layout.
-            aq, a_scale, a_global = _nvfp4_quantize_plain(A)
-            bq, b_scale, b_global = _nvfp4_quantize_plain(B)
-            global_scale = torch.stack([a_global, b_global])
-            out_nvfp4 = torch.ops.mslk.f4f4bf16(
-                aq, bq, a_scale, b_scale, None, global_scale, mxfp4_block_size=16
-            )
-            rtol = atol = 8e-2
-        else:
-            global_scales, a_global_scales, b_global_scales = (
-                get_nvfp4_global_scales_naive([A], [B])
-            )
-            aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-            bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
-            out_nvfp4 = torch.ops.mslk.f4f4bf16(
-                aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
-            )
-            rtol = atol = 5e-2
+        global_scales, a_global_scales, b_global_scales = (
+            get_nvfp4_global_scales_naive([A], [B])
+        )
+        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
+        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+        out_nvfp4 = torch.ops.mslk.f4f4bf16(
+            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+        )
+        rtol = atol = 5e-2
         out_bf16 = A @ B.t()
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=atol, rtol=rtol)
 
-    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel);
-    # the ROCm path only implements dense NVFP4.
+    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel).
     @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small
@@ -3076,6 +3052,7 @@ class MXFP4Tests(unittest.TestCase):
 
 
 @unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@unittest.skipIf(torch.version.hip is not None, "MXFP4_16 is CUDA-only")
 class MXFP4BlockSize16Tests(unittest.TestCase):
     """
     Tests for MXFP4_16 format: MXFP4 with 1x16 block size
