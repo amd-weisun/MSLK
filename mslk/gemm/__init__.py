@@ -35,3 +35,7 @@ if torch.version.hip is not None:
     # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
     # kernel on AMD.
     from .triton import mx8mx4_gemm  # noqa: F401
+    # Register the FlyDSL parallel implementation of f8f8bf16_rowwise_flydsl.
+    # Importing this module triggers the @torch.library.impl registration so
+    # torch.ops.mslk.f8f8bf16_rowwise_flydsl dispatches to FlyDSL on AMD.
+    from .flydsl import fp8_rowwise  # noqa: F401

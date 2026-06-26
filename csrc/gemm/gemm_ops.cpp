@@ -44,6 +44,10 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
 #ifdef USE_ROCM
+  // FP8 rowwise GEMM — FlyDSL parallel implementation (sibling op for development;
+  // same schema as f8f8bf16_rowwise, registered from mslk.gemm.flydsl.fp8_rowwise).
+  m.def(
+      "f8f8bf16_rowwise_flydsl(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(
