@@ -21,7 +21,7 @@ import math as _math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith, buffer_ops, range_constexpr
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.vector import ReductionOp
@@ -788,18 +788,19 @@ def compile_fmha_bwd_dqdkdv(
         dO_buf   = fx.rocdl.make_buffer_tensor(dO)
         dV_buf   = fx.rocdl.make_buffer_tensor(dV)
         dK_buf   = fx.rocdl.make_buffer_tensor(dK)
-        # dQ_f32: plain tensor (NOT buffer-wrapped) — UniversalAtomic requires generic memory
         LSE_buf  = fx.rocdl.make_buffer_tensor(LSE)
         Dvec_buf = fx.rocdl.make_buffer_tensor(D_vec)
+        # dQ_f32: plain tensor (not buffer-wrapped) for UniversalAtomic
+        # Divide the entire flat [B*M*H*D, 1] tensor into 1-element chunks
+        dQ_total_elems = B * D   # compile-time upper bound per (m, h) block; runtime: B*M*H*D
+        # Use logical_divide with (1, 1) for scalar element access
+        dQ_flat_div = fx.logical_divide(dQ_f32, fx.make_layout(1, 1))
 
         copy_16b  = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
         copy_f32  = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         store_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        # UniversalCopy/Atomic for dQ_f32 (plain tensor, not buffer descriptor)
-        ucopy_f32  = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-        atomic_add_f32 = fx.make_copy_atom(
-            fx.UniversalAtomic(fx.AtomicOp.Add, fx.Float32), fx.Float32
-        )
+        # UniversalAtomic for dQ_f32 (plain tensor)
+        atomic_f32 = fx.make_copy_atom(fx.UniversalAtomic(fx.AtomicOp.Add, fx.Float32), fx.Float32)
 
         def _load_elem_vec(raw_buf, row, col_vec):
             row_sl  = fx.slice(raw_buf, (row, None))
@@ -822,15 +823,18 @@ def compile_fmha_bwd_dqdkdv(
             fx.memref_store(val, r, 0)
             fx.copy_atom_call(store_f32, r, fx.slice(div_1, (None, 0)))
 
-        # dQ_f32 uses UniversalAtomic — divide the plain tensor directly (no make_buffer_tensor)
-        dQ_div = fx.logical_divide(dQ_f32, fx.make_layout(1, 1))
-
         def _atomic_add_dq(flat_row, val):
-            """Float32 atomic add into dQ_f32 at flat row index flat_row."""
+            """Float32 atomic add into dQ_f32[flat_row, 0].
+            Uses UniversalAtomic on the plain (non-buffer) dQ_f32 tensor.
+            dQ_flat_div is logical_divide(dQ_f32, (1,1)) — each element is a 1x1 chunk.
+            Slice (None, flat_row) selects element flat_row from the flat layout.
+            """
             r = fx.make_rmem_tensor(1, fx.Float32)
             fx.memref_store(val, r, 0)
-            fx.copy_atom_call(atomic_add_f32, r,
-                              fx.slice(dQ_div, (None, fx.Int32(flat_row))))
+            fx.copy_atom_call(
+                atomic_f32, r,
+                fx.slice(dQ_flat_div, (None, fx.Int32(flat_row)))
+            )
 
         def _q_row(q_pos):
             return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
@@ -1031,38 +1035,38 @@ def compile_fmha_bwd_convert_dq(
 
         q_row = fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + m_safe * n_heads_idx + head_idx)
 
-        # Use plain tensors with UniversalCopy for dQ_f32 (flat f32 buffer)
-        # Use buffer tensor + slice pattern for dQ output (int16)
-        dQ_buf = fx.rocdl.make_buffer_tensor(dQ)
-        copy_f32  = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-        store_16b = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_bits)
+        # Buffer tensors for both f32 source and int16 destination
+        dQ_f32_buf = fx.rocdl.make_buffer_tensor(dQ_f32)   # [B*M*H*D, 1] f32
+        dQ_buf     = fx.rocdl.make_buffer_tensor(dQ)        # [B*M*H, D]   int16
+        copy_f32   = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
-        # dQ_f32 divided into flat scalar elements: [B*M*H*D, 1]
-        dQ_f32_div = fx.logical_divide(dQ_f32, fx.make_layout(1, 1))
+        def _load_f32_flat(flat_row):
+            """Load one f32 from dQ_f32 at flat row index (row=flat_row, col=0)."""
+            row_sl = fx.slice(dQ_f32_buf, (flat_row, None))
+            div_1  = fx.logical_divide(row_sl, fx.make_layout(1, 1))
+            r = fx.make_rmem_tensor(1, fx.Float32)
+            fx.copy_atom_call(copy_f32, fx.slice(div_1, (None, 0)), r)
+            return fx.memref_load(r, 0)
 
         if m_valid:
             for cv in range_constexpr(N_COL_VECS_CVT):
-                # Load VEC_WIDTH consecutive f32 values and pack into one bf16 vec store
+                # Load VEC_WIDTH f32 values, convert to bf16, store as 128-bit vector
                 bf16_vals = []
                 for e in range_constexpr(VEC_WIDTH):
                     d = cv * VEC_WIDTH + e
                     flat_src = fx.Int32(q_row * D + d)
-                    r_f32 = fx.make_rmem_tensor(1, fx.Float32)
-                    fx.copy_atom_call(copy_f32, fx.slice(dQ_f32_div, (None, flat_src)), r_f32)
-                    val_f32 = fx.memref_load(r_f32, 0)
-                    # f32 -> bf16: take upper 16 bits of IEEE754 representation
-                    val_i32 = fx.Int32(Vec.from_elements([val_f32], fx.Float32).bitcast(fx.Int32)[0])
-                    val_i16 = fx.Int16(val_i32.shrui(fx.Int32(16)))
+                    val_f32  = _load_f32_flat(flat_src)
+                    # f32 -> bf16: keep upper 16 bits of IEEE754 f32
+                    val_i32  = fx.Int32(Vec.from_elements([val_f32], fx.Float32).bitcast(fx.Int32)[0])
+                    val_i16  = fx.Int16(val_i32.shrui(fx.Int32(16)))
                     bf16_vals.append(val_i16)
 
-                # Pack VEC_WIDTH bf16 values into a vector and store via 128-bit write
-                bf16_vec = Vec.from_elements(bf16_vals, fx.Int16)
-                r_vec = fx.make_rmem_tensor(VEC_WIDTH, fx.Int16)
+                # Pack into v8i16 and store as 128-bit write to dQ[q_row, cv*8..(cv+1)*8]
+                bf16_vec   = Vec.from_elements(bf16_vals, fx.Int16)
+                r_vec      = fx.make_rmem_tensor(VEC_WIDTH, fx.Int16)
                 fx.memref_store_vec(bf16_vec, r_vec)
-
-                # Store to dQ[q_row, cv*VEC_WIDTH .. (cv+1)*VEC_WIDTH]
-                row_sl  = fx.slice(dQ_buf, (q_row, None))
-                div_row = fx.logical_divide(row_sl, fx.make_layout(VEC_WIDTH, 1))
+                row_sl     = fx.slice(dQ_buf, (q_row, None))
+                div_row    = fx.logical_divide(row_sl, fx.make_layout(VEC_WIDTH, 1))
                 store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
                 fx.copy_atom_call(store_atom, r_vec, fx.slice(div_row, (None, cv)))
 
@@ -1081,6 +1085,230 @@ def compile_fmha_bwd_convert_dq(
         convert_dq_kernel(dQ_f32, dQ, M, H).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_M, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fn
+
+
+# ---------------------------------------------------------------------------
+# compile_fmha_bwd_dvdk — fused dV+dK kernel (no dQ, no atomics).
+#
+# Phase A practical workaround: since f32 atomics are unreliable, compute
+# dV and dK in one N-tile pass (no atomics needed), and compute dQ separately
+# in the standalone compile_fmha_bwd_dq (M-tile pass, also no atomics).
+#
+# This gives the same 3-kernel sequence as CK for correctness:
+#   Kernel 1: compile_fmha_bwd_preprocess  (D-vector)
+#   Kernel 2: compile_fmha_bwd_dvdk        (dV + dK, grid over N)
+#   Kernel 3: compile_fmha_bwd_dq          (dQ, grid over M)
+# Phase B will properly fuse all three when atomic correctness is resolved.
+# ---------------------------------------------------------------------------
+
+def compile_fmha_bwd_dvdk(
+    *,
+    D: int,
+    dtype_str: str = "bf16",
+    BLOCK_M: int = 64,
+    BLOCK_N: int = 64,
+    scale: float = None,
+):
+    """Compile the fused dV+dK backward kernel (grid over N-tiles, no atomics).
+
+    Returns:
+        launch_fn(Q, K, V, dO, dV, dK, LSE, D_vec, B, M, N, H, n_M_tiles, stream)
+    """
+    import math as _pymath
+    if scale is None:
+        scale = 1.0 / _pymath.sqrt(D)
+    assert D % 8 == 0
+
+    elem_dtype = dtype_to_elem_type(dtype_str)
+    elem_bits  = 16
+    VEC_WIDTH  = 128 // elem_bits
+    N_COL_VECS = D // VEC_WIDTH
+    fm = arith.FastMathFlags.fast
+
+    @flyc.kernel
+    def fmha_bwd_dvdk_kernel(
+        Q:     fx.Tensor,
+        K:     fx.Tensor,
+        V:     fx.Tensor,
+        dO:    fx.Tensor,
+        dV:    fx.Tensor,   # [B*N*H*D, 1] float32
+        dK:    fx.Tensor,   # [B*N*H*D, 1] float32
+        LSE:   fx.Tensor,
+        D_vec: fx.Tensor,
+        seq_M:     fx.Int32,
+        seq_N:     fx.Int32,
+        n_heads:   fx.Int32,
+        n_M_tiles: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        n_heads_idx   = fx.Index(n_heads)
+        seq_M_idx     = fx.Index(seq_M)
+        seq_N_idx     = fx.Index(seq_N)
+        n_M_tiles_idx = fx.Index(n_M_tiles)
+        num_N_tiles   = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
+
+        bid_idx   = fx.Index(bid)
+        n_tile    = bid_idx % num_N_tiles
+        bh_idx    = bid_idx // num_N_tiles
+        batch_idx = bh_idx // n_heads_idx
+        head_idx  = bh_idx % n_heads_idx
+
+        n_start   = n_tile * BLOCK_N
+        n_in_tile = fx.Index(tid)
+        n_global  = n_start + n_in_tile
+
+        Q_buf    = fx.rocdl.make_buffer_tensor(Q)
+        K_buf    = fx.rocdl.make_buffer_tensor(K)
+        V_buf    = fx.rocdl.make_buffer_tensor(V)
+        dO_buf   = fx.rocdl.make_buffer_tensor(dO)
+        dV_buf   = fx.rocdl.make_buffer_tensor(dV)
+        dK_buf   = fx.rocdl.make_buffer_tensor(dK)
+        LSE_buf  = fx.rocdl.make_buffer_tensor(LSE)
+        Dvec_buf = fx.rocdl.make_buffer_tensor(D_vec)
+
+        copy_16b  = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
+        copy_f32  = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        store_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+        def _load_elem_vec(raw_buf, row, col_vec):
+            row_sl  = fx.slice(raw_buf, (row, None))
+            div_row = fx.logical_divide(row_sl, fx.make_layout(VEC_WIDTH, 1))
+            r = fx.make_rmem_tensor(VEC_WIDTH, elem_dtype)
+            fx.copy_atom_call(copy_16b, fx.slice(div_row, (None, col_vec)), r)
+            return fx.memref_load_vec(r)
+
+        def _load_f32_row(buf, row_idx):
+            row_sl = fx.slice(buf, (row_idx, None))
+            div_1  = fx.logical_divide(row_sl, fx.make_layout(1, 1))
+            r = fx.make_rmem_tensor(1, fx.Float32)
+            fx.copy_atom_call(copy_f32, fx.slice(div_1, (None, 0)), r)
+            return fx.memref_load(r, 0)
+
+        def _store_f32_row(buf, row_idx, val):
+            row_sl = fx.slice(buf, (row_idx, None))
+            div_1  = fx.logical_divide(row_sl, fx.make_layout(1, 1))
+            r = fx.make_rmem_tensor(1, fx.Float32)
+            fx.memref_store(val, r, 0)
+            fx.copy_atom_call(store_f32, r, fx.slice(div_1, (None, 0)))
+
+        def _q_row(q_pos):
+            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
+
+        def _kv_row(kv_pos):
+            return fx.Int32(batch_idx * (seq_N_idx * n_heads_idx) + kv_pos * n_heads_idx + head_idx)
+
+        def _lse_flat(q_pos):
+            return fx.Int32(bh_idx * seq_M_idx + q_pos)
+
+        n_valid    = n_global < seq_N_idx
+        n_safe     = n_valid.select(n_global, seq_N_idx - fx.Index(1))
+        kv_row_idx = _kv_row(n_safe)
+
+        k_vecs = []
+        v_vecs = []
+        for cv in range_constexpr(N_COL_VECS):
+            k_vecs.append(_load_elem_vec(K_buf, kv_row_idx, cv))
+            v_vecs.append(_load_elem_vec(V_buf, kv_row_idx, cv))
+
+        init_all = [fx.Float32(0.0)] * (2 * D)
+
+        loop_results = init_all
+        for m_tile, iter_args in range(fx.Index(0), n_M_tiles_idx, fx.Index(1), init=init_all):
+            dv_acc = [iter_args[d]     for d in range(D)]
+            dk_acc = [iter_args[D + d] for d in range(D)]
+
+            for m_in_tile in range_constexpr(BLOCK_M):
+                m_global   = m_tile * BLOCK_M + m_in_tile
+                m_valid    = m_global < seq_M_idx
+                m_safe     = m_valid.select(m_global, seq_M_idx - fx.Index(1))
+                q_row_idx  = _q_row(m_safe)
+                do_row_idx = _q_row(m_safe)
+
+                s_acc = fx.Float32(0.0)
+                for cv in range_constexpr(N_COL_VECS):
+                    q_vec = _load_elem_vec(Q_buf, q_row_idx, cv)
+                    prod  = q_vec.to(fx.Float32) * k_vecs[cv].to(fx.Float32)
+                    s_acc = s_acc.addf(prod.reduce(ReductionOp.ADD, fastmath=fm), fastmath=fm)
+
+                scale_cst = fx.Float32(scale)
+                s_val = fx.Float32(arith.mulf(_raw(s_acc), _raw(scale_cst), fastmath=fm))
+
+                lse_val  = _load_f32_row(LSE_buf, _lse_flat(m_safe))
+                log2e    = fx.Float32(_LOG2E)
+                s_sub    = fx.Float32(arith.subf(_raw(s_val), _raw(lse_val), fastmath=fm))
+                p_arg    = fx.Float32(arith.mulf(_raw(s_sub), _raw(log2e), fastmath=fm))
+                p_val    = fx.Float32(fly_math.exp2(p_arg, fastmath=fm))
+                valid_mn = m_valid & n_valid
+                p_val    = valid_mn.select(p_val, fx.Float32(0.0))
+
+                dp_acc = fx.Float32(0.0)
+                for cv in range_constexpr(N_COL_VECS):
+                    do_vec = _load_elem_vec(dO_buf, do_row_idx, cv)
+                    prod   = do_vec.to(fx.Float32) * v_vecs[cv].to(fx.Float32)
+                    dp_acc = dp_acc.addf(prod.reduce(ReductionOp.ADD, fastmath=fm), fastmath=fm)
+
+                d_val = _load_f32_row(Dvec_buf, q_row_idx)
+                d_val = valid_mn.select(d_val, fx.Float32(0.0))
+
+                dp_sub = fx.Float32(arith.subf(_raw(dp_acc), _raw(d_val), fastmath=fm))
+                ds_val = fx.Float32(arith.mulf(_raw(scale_cst), _raw(p_val), fastmath=fm))
+                ds_val = fx.Float32(arith.mulf(_raw(ds_val), _raw(dp_sub), fastmath=fm))
+
+                for cv in range_constexpr(N_COL_VECS):
+                    do_vec = _load_elem_vec(dO_buf, do_row_idx, cv)
+                    do_f32 = do_vec.to(fx.Float32)
+                    for e in range_constexpr(VEC_WIDTH):
+                        d = cv * VEC_WIDTH + e
+                        contrib   = fx.Float32(arith.mulf(_raw(p_val), _raw(do_f32[e]), fastmath=fm))
+                        dv_acc[d] = dv_acc[d].addf(contrib, fastmath=fm)
+
+                for cv in range_constexpr(N_COL_VECS):
+                    q_vec = _load_elem_vec(Q_buf, q_row_idx, cv)
+                    q_f32 = q_vec.to(fx.Float32)
+                    for e in range_constexpr(VEC_WIDTH):
+                        d = cv * VEC_WIDTH + e
+                        contrib   = fx.Float32(arith.mulf(_raw(ds_val), _raw(q_f32[e]), fastmath=fm))
+                        dk_acc[d] = dk_acc[d].addf(contrib, fastmath=fm)
+
+            loop_results = yield dv_acc + dk_acc
+
+        if n_valid:
+            for d in range_constexpr(D):
+                flat_row = kv_row_idx * D + d
+                _store_f32_row(dV_buf, flat_row, loop_results[d])
+                _store_f32_row(dK_buf, flat_row, loop_results[D + d])
+
+    @flyc.jit
+    def launch_fn(
+        Q:         fx.Tensor,
+        K:         fx.Tensor,
+        V:         fx.Tensor,
+        dO:        fx.Tensor,
+        dV:        fx.Tensor,
+        dK:        fx.Tensor,
+        LSE:       fx.Tensor,
+        D_vec:     fx.Tensor,
+        B:         fx.Int32,
+        M:         fx.Int32,
+        N:         fx.Int32,
+        H:         fx.Int32,
+        n_M_tiles: fx.Int32,
+        stream:    fx.Stream,
+    ):
+        num_N_tiles = (fx.Index(N) + BLOCK_N - 1) // BLOCK_N
+        grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_N_tiles)
+        fmha_bwd_dvdk_kernel(
+            Q, K, V, dO, dV, dK, LSE, D_vec,
+            M, N, H, n_M_tiles,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(BLOCK_N, 1, 1),
             stream=stream,
         )
 

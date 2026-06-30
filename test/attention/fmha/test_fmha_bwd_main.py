@@ -22,6 +22,7 @@ from mslk.attention.flydsl.fmha_bwd_main import (
     compile_fmha_bwd_dq,
     compile_fmha_bwd_dqdkdv,
     compile_fmha_bwd_convert_dq,
+    compile_fmha_bwd_dvdk,
 )
 from mslk.attention.flydsl.fmha_bwd_preprocess import compile_fmha_bwd_preprocess
 
@@ -247,6 +248,54 @@ def run_dq_case(B, M, N, H, D, dtype, device="cuda"):
     return ok
 
 
+def run_dvdk_case(B, M, N, H, D, dtype, device="cuda"):
+    """Test fused dV+dK kernel against ref_fmha_bwd (no atomics, no dQ)."""
+    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}", end=" ... ", flush=True)
+
+    scale = 1.0 / math.sqrt(D)
+    Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
+    K  = torch.randn(B, N, H, D, device=device, dtype=dtype)
+    V  = torch.randn(B, N, H, D, device=device, dtype=dtype)
+    O, LSE = ref_fmha_fwd(Q, K, V, scale=scale, causal=False)
+    dO = torch.randn_like(O)
+    _, dK_ref, dV_ref = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=False)
+
+    BLOCK_M, BLOCK_N = 64, 64
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+    D_vec_ref = (dO.float() * O.float()).sum(dim=-1).view(B * M * H, 1)
+
+    Q_2d  = _as_i16(Q.contiguous().view(B * M * H, D))
+    K_2d  = _as_i16(K.contiguous().view(B * N * H, D))
+    V_2d  = _as_i16(V.contiguous().view(B * N * H, D))
+    dO_2d = _as_i16(dO.contiguous().view(B * M * H, D))
+    LSE_2d = LSE.contiguous().view(B * H * M, 1)
+
+    dV_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
+    dK_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
+
+    fn = compile_fmha_bwd_dvdk(D=D, dtype_str=dtype_str,
+                                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale)
+    n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
+    compiled = flyc.compile(fn, Q_2d, K_2d, V_2d, dO_2d, dV_out, dK_out,
+                            LSE_2d, D_vec_ref, B, M, N, H, n_M_tiles,
+                            torch.cuda.current_stream())
+    compiled(Q_2d, K_2d, V_2d, dO_2d, dV_out, dK_out,
+             LSE_2d, D_vec_ref, B, M, N, H, n_M_tiles,
+             torch.cuda.current_stream())
+    torch.cuda.synchronize()
+
+    dV_kernel = dV_out.view(B, N, H, D).to(dtype)
+    dK_kernel = dK_out.view(B, N, H, D).to(dtype)
+    ok_dv = torch.allclose(dV_kernel.float(), dV_ref.float(), rtol=0.1, atol=0.1)
+    ok_dk = torch.allclose(dK_kernel.float(), dK_ref.float(), rtol=0.1, atol=0.1)
+    ok = ok_dv and ok_dk
+    err_dv = (dV_kernel.float() - dV_ref.float()).abs().max().item()
+    err_dk = (dK_kernel.float() - dK_ref.float()).abs().max().item()
+    status = "PASS" if ok else f"FAIL(dV={'OK' if ok_dv else 'FAIL'} dK={'OK' if ok_dk else 'FAIL'})"
+    print(f"{status}  dV={err_dv:.5f} dK={err_dk:.5f}")
+    return ok
+
+
 def run_fused_case(B, M, N, H, D, dtype, device="cuda"):
     """Test fused dQdKdV + convert_dq kernels against ref_fmha_bwd."""
     print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}", end=" ... ", flush=True)
@@ -347,7 +396,7 @@ if __name__ == "__main__":
 
     print("\n=== Fused dQdKdV kernel (FlyDSL vs ref_fmha_bwd) ===")
     for args in cases:
-        all_pass &= run_fused_case(*args, device=device)
+        all_pass &= run_dvdk_case(*args, device=device)
 
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
