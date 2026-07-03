@@ -21,8 +21,9 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda"):
-    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}", end=" ... ", flush=True)
+def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False):
+    tag = " [trload]" if use_trload else ""
+    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     scale = 1.0 / math.sqrt(D)
 
     Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
@@ -45,7 +46,8 @@ def run_case(B, M, N, H, D, dtype, device="cuda"):
     dK_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
 
     launch_fn = compile_fmha_bwd_dvdk_mfma(D=D, dtype_str=dtype_str,
-                                            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale)
+                                            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
+                                            use_trload=use_trload)
     n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
     args = (Q_2d, K_2d, V_2d, dO_2d, dV_out, dK_out, LSE_2d, D_vec,
             B, M, N, H, n_M_tiles, torch.cuda.current_stream())
@@ -78,5 +80,10 @@ if __name__ == "__main__":
     ]
     for args in cases:
         all_pass &= run_case(*args, device=device)
+    trload = "--trload" in sys.argv or "--all" in sys.argv
+    if trload:
+        print("\n=== trload (ds_read_tr) variant ===")
+        for args in cases:
+            all_pass &= run_case(*args, device=device, use_trload=True)
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

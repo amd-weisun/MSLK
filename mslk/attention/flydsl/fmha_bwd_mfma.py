@@ -71,7 +71,7 @@ import math as _math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
@@ -81,6 +81,17 @@ from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
 WARP_SIZE = get_warp_size()  # 64 on CDNA4
 _LOG2E   = _math.log2(_math.e)
+
+
+def _ds_read_tr_v4(v4_type, lds_elem_idx, lds_byte_base):
+    """gfx950 hardware-transpose LDS read (ds_read_b64_tr_b16), rocdl wrapper.
+
+    Reads a 4x16 bf16 tile cooperatively across a 16-lane group and returns the
+    transposed 16x4 (4 bf16 per lane). Pair two calls + shuffle for a v8 operand.
+    """
+    byte_i64 = fx.Int64(lds_elem_idx * 2 + lds_byte_base)
+    ptr = buffer_ops.create_llvm_ptr(byte_i64, address_space=3)
+    return rocdl.ds_read_tr16_b64(v4_type, ptr).result
 
 
 def compile_fmha_bwd_dv_mfma(
@@ -795,8 +806,14 @@ def compile_fmha_bwd_dvdk_mfma(
     BLOCK_M: int = 64,
     BLOCK_N: int = 64,
     scale: float = None,
+    use_trload: bool = False,
 ):
     """Phase B.4: FUSED dV + dK with MFMA (matches CK's dV/dK fusion).
+
+    use_trload=True: GEMM2 B-operand (dO/Q) is read via the hardware LDS-transpose
+    ds_read_b64_tr_b16 instead of the 8x scalar gather. Requires EVEN LDS_Q_STRIDE
+    (odd stride breaks the tr 64-bit column alignment). The A-operand (P^T/dS^T) is
+    re-ordered to the transpose's P8 k-permutation so contraction stays aligned.
 
     Both dV and dK grid over N-tiles and share S, dP, P, dS. Computing them in
     one kernel eliminates a redundant S/dP GEMM pass vs running dv+dk separately.
@@ -840,7 +857,9 @@ def compile_fmha_bwd_dvdk_mfma(
     # S=D+2=66: 16 consecutive m-rows map to 16 distinct banks — zero conflicts.
     # S=66 is 4-byte aligned (m*132%4=0), enabling ds_read_b64 (v4 f16) for GEMM1.
     LDS_MPAD      = BLOCK_M + 8   # P/dS transposed stride padding
-    LDS_Q_STRIDE  = D + 2          # padded row stride for Q/dO (bank-conflict-free scatter)
+    # Q/dO row stride: baseline uses D+2 (odd for D=64) for bank-conflict-free scalar scatter;
+    # trload needs EVEN stride (D+8) so ds_read_b64_tr keeps 64-bit column alignment.
+    LDS_Q_STRIDE  = (D + 8) if use_trload else (D + 2)
     LDS_Q_ELEMS   = BLOCK_M * LDS_Q_STRIDE
     LDS_DO_ELEMS  = BLOCK_M * LDS_Q_STRIDE
     LDS_DS_ELEMS  = BLOCK_N * LDS_MPAD
@@ -1080,21 +1099,52 @@ def compile_fmha_bwd_dvdk_mfma(
                 n_local_g = lane_mod_32 + wave_n_sub * 32
                 for ks in range_constexpr(MFMA_KS):
                     n_local = lane_mod_32 + wave_n_sub * 32
-                    base_m  = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K)
-                    p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
-                    ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
-                    # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
-                    # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
-                    do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                    q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                    for e in range_constexpr(MFMA_LK):
-                        m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
-                        do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
-                        q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
-                        fx.memref_store(do_sc, do_r,  e)
-                        fx.memref_store(q_sc,  q_r,   e)
-                    dv_acc = mfma(p_pack,  fx.memref_load_vec(do_r), dv_acc)
-                    dk_acc = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_acc)
+                    if use_trload:
+                        # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
+                        # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row base),
+                        # free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
+                        # tr lane decomposition:
+                        tr_k_group  = (lane_mod_32 % 16) // 4   # lane%16 //4 within 32-lane half
+                        tr_col_sub  = lane % 4
+                        tr_col_half = lane_mod_32 // 16
+                        d_col = wave_d_sub * 32 + tr_col_half * 16 + tr_col_sub * 4
+                        m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
+                        lo = m_base * LDS_Q_STRIDE + d_col
+                        hi = lo + 8 * LDS_Q_STRIDE
+                        do_a = _ds_read_tr_v4(v4elem_type, lo, lds_do_off)
+                        do_b = _ds_read_tr_v4(v4elem_type, hi, lds_do_off)
+                        do_pack = Vec(do_a).shuffle(Vec(do_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                        q_a = _ds_read_tr_v4(v4elem_type, lo, lds_q_off)
+                        q_b = _ds_read_tr_v4(v4elem_type, hi, lds_q_off)
+                        q_pack = Vec(q_a).shuffle(Vec(q_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                        # A-operand (P^T/dS^T): must hold the SAME m as B at each hardware slot.
+                        # B (tr) gives m = (m_sub*32+ks*16) + lane_div_32*4 + P8[e], P8={0,1,2,3,8,9,10,11}.
+                        # So load P^T[n, base_a + {0,1,2,3}] ++ P^T[n, base_a + {8,9,10,11}].
+                        base_a = lane_div_32 * 4 + (m_sub * 32 + ks * MFMA_K)
+                        p_lo  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a])
+                        p_hi  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a + 8])
+                        p_pack = Vec(p_lo).shuffle(Vec(p_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                        ds_lo = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a])
+                        ds_hi = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a + 8])
+                        ds_pack = Vec(ds_lo).shuffle(Vec(ds_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                        dv_acc = mfma(p_pack,  do_pack, dv_acc)
+                        dk_acc = mfma(ds_pack, q_pack,  dk_acc)
+                    else:
+                        base_m  = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K)
+                        p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
+                        ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
+                        # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
+                        # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
+                        do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                        q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                        for e in range_constexpr(MFMA_LK):
+                            m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
+                            do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
+                            q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
+                            fx.memref_store(do_sc, do_r,  e)
+                            fx.memref_store(q_sc,  q_r,   e)
+                        dv_acc = mfma(p_pack,  fx.memref_load_vec(do_r), dv_acc)
+                        dk_acc = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_acc)
 
                 gpu.barrier()
 
