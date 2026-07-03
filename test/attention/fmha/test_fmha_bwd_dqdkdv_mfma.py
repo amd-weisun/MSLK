@@ -23,8 +23,9 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda"):
-    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}", end=" ... ", flush=True)
+def run_case(B, M, N, H, D, dtype, device="cuda", use_lds_reduce=False):
+    tag = " [lds_reduce]" if use_lds_reduce else ""
+    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     scale = 1.0 / math.sqrt(D)
 
     Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
@@ -48,7 +49,8 @@ def run_case(B, M, N, H, D, dtype, device="cuda"):
     dQ_out = torch.zeros(B * M * H * D, 1, device=device, dtype=torch.float32)
 
     launch_fn = compile_fmha_bwd_dqdkdv_mfma(D=D, dtype_str=dtype_str,
-                                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale)
+                                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
+                                             use_lds_reduce=use_lds_reduce)
     n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
     # NOTE: flyc.compile executes the kernel once (JIT warm run) -> it mutates
     # dQ_out via atomic-add. Compile against THROWAWAY buffers, run on fresh zeros.
@@ -90,5 +92,9 @@ if __name__ == "__main__":
     ]
     for args in cases:
         all_pass &= run_case(*args, device=device)
+    if "--lds-reduce" in sys.argv or "--all" in sys.argv:
+        print("\n=== lds_reduce (1 atomic per (m,d) per block) variant ===")
+        for args in cases:
+            all_pass &= run_case(*args, device=device, use_lds_reduce=True)
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

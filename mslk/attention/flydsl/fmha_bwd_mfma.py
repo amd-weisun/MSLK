@@ -1587,6 +1587,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
     BLOCK_N: int = 64,
     scale: float = None,
     use_pipeline: bool = True,
+    use_lds_reduce: bool = False,
 ):
     """Phase B.5: FUSED dQ + dV + dK in one N-tile-gridded kernel (matches CK).
 
@@ -1612,10 +1613,16 @@ def compile_fmha_bwd_dqdkdv_mfma(
           dQ_f32 : [B*M*H*D, 1] float32 scratch (zero it before launch; convert after)
     """
     import math as _pm
+    import os as _os
     if scale is None:
         scale = 1.0 / _pm.sqrt(D)
     assert D == BLOCK_N, f"requires D == BLOCK_N, got D={D}, BLOCK_N={BLOCK_N}"
     assert D % 16 == 0
+
+    # ABLATION ONLY (perf profiling): skip the dQ atomic-add to isolate its cost.
+    # Keeps the dQ GEMM so VALU/LDS are identical; dQ output is then wrong (do NOT
+    # use for correctness). Set FMHA_ABLATE_DQ_ATOMIC=1.
+    _ablate_atomic = _os.environ.get("FMHA_ABLATE_DQ_ATOMIC", "0") == "1"
 
     elem_dtype = dtype_to_elem_type(dtype_str)
     MFMA_K     = 16
@@ -1638,6 +1645,10 @@ def compile_fmha_bwd_dqdkdv_mfma(
     LDS_K_ELEMS   = BLOCK_N * D       # K in [n,d] layout for the dQ contraction
     LDS_LSE_ELEMS = BLOCK_M
     LDS_DM_ELEMS  = BLOCK_M
+    # dQ LDS-reduce buffer: the two same-d_sub waves (n_sub 0,1) sum their dQ
+    # partial here so only ONE atomic per (m,d) address fires per block (halves
+    # atomic traffic). Slot by d_sub; within slot index by lane*16+r (f32).
+    LDS_DQR_ELEMS = (WAVE_D_TILES * WARP_SIZE * 16) if use_lds_reduce else 0
 
     gpu_arch = "gfx950"
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="fmha_bwd_dqdkdv_mfma_smem")
@@ -1655,6 +1666,8 @@ def compile_fmha_bwd_dqdkdv_mfma(
     allocator.ptr = lds_lse_off + LDS_LSE_ELEMS * 4
     lds_dm_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_dm_off + LDS_DM_ELEMS * 4
+    lds_dqr_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_dqr_off + max(LDS_DQR_ELEMS, 1) * 4
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_bwd_dqdkdv_mfma_kernel(  # noqa: F811
@@ -1715,6 +1728,10 @@ def compile_fmha_bwd_dqdkdv_mfma(
         lds_k   = SmemPtr(base_ptr, lds_k_off,   elem_dtype.ir_type, shape=(LDS_K_ELEMS,)).get()
         lds_lse = SmemPtr(base_ptr, lds_lse_off, fx.Float32.ir_type, shape=(LDS_LSE_ELEMS,)).get()
         lds_dm  = SmemPtr(base_ptr, lds_dm_off,  fx.Float32.ir_type, shape=(LDS_DM_ELEMS,)).get()
+        # Always materialize the view (FlyDSL closures can't capture a conditionally
+        # defined var); only USED when use_lds_reduce.
+        lds_dqr = SmemPtr(base_ptr, lds_dqr_off, fx.Float32.ir_type,
+                          shape=(max(LDS_DQR_ELEMS, 1),)).get()
 
         def _q_row(q_pos):
             return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
@@ -1956,16 +1973,45 @@ def compile_fmha_bwd_dqdkdv_mfma(
                         fx.memref_store(k_sc,  k_r,  e)
                     dq_acc = mfma(fx.memref_load_vec(ds_r), fx.memref_load_vec(k_r), dq_acc)
 
-                # atomic-add dQ partial (m varies with r; d=lane%32 fixed per wave_d_sub)
+                # ---- dQ combine + store ----
+                # The two waves sharing this wave_d_sub (wave_n_sub 0 and 1) have an
+                # IDENTICAL (lane,r)->(m,d) output map; their dq_acc are partial sums
+                # over complementary n-halves. Options:
+                #   use_lds_reduce: n_sub==1 wave writes its partial to LDS, barrier,
+                #     n_sub==0 wave adds both and fires ONE atomic -> halves atomic
+                #     traffic (the M2048 bottleneck).
+                #   else: each wave atomic-adds its own partial (2 atomics per (m,d)).
                 d_col_abs_dq = lane_mod_32 + wave_d_sub * 32
-                for r in range_constexpr(16):
-                    m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
-                    m_row_abs = m_within + (m_sub * 32) + m_start
-                    m_ok      = m_row_abs < seq_M_idx
-                    if m_ok:
-                        q_row_g = _q_row(m_row_abs)
-                        flat_dq = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs_dq)
-                        _atomic_add_dq(flat_dq, Vec(dq_acc)[r])
+                if use_lds_reduce:
+                    dqr_slot  = wave_d_sub * (WARP_SIZE * 16) + lane * 16
+                    is_writer = wave_n_sub == fx.Index(1)
+                    if is_writer:
+                        for r in range_constexpr(16):
+                            Vec.from_elements([Vec(dq_acc)[r]], fx.Float32).store(lds_dqr, [dqr_slot + r])
+                    gpu.barrier()
+                    is_reader = wave_n_sub == fx.Index(0)
+                    if is_reader:
+                        for r in range_constexpr(16):
+                            other_v = Vec.load(Vec.make_type(1, fx.Float32), lds_dqr, [dqr_slot + r])[0]
+                            summed  = fx.Float32(arith.addf(_raw(Vec(dq_acc)[r]), _raw(other_v), fastmath=fm))
+                            m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
+                            m_row_abs = m_within + (m_sub * 32) + m_start
+                            m_ok      = m_row_abs < seq_M_idx
+                            if m_ok:
+                                if not _ablate_atomic:
+                                    q_row_g = _q_row(m_row_abs)
+                                    flat_dq = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs_dq)
+                                    _atomic_add_dq(flat_dq, summed)
+                else:
+                    if not _ablate_atomic:
+                        for r in range_constexpr(16):
+                            m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
+                            m_row_abs = m_within + (m_sub * 32) + m_start
+                            m_ok      = m_row_abs < seq_M_idx
+                            if m_ok:
+                                q_row_g = _q_row(m_row_abs)
+                                flat_dq = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs_dq)
+                                _atomic_add_dq(flat_dq, Vec(dq_acc)[r])
 
                 gpu.barrier()
 
