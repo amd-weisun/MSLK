@@ -51,8 +51,9 @@ def main():
     nN = (N + BN - 1) // BN
 
     _trload = os.environ.get("PROF_TRLOAD", "0") == "1"
+    _pipe = os.environ.get("PROF_PIPELINE", "0") == "1"
     dvdk = compile_fmha_bwd_dvdk_mfma(D=D, dtype_str="bf16", scale=scale, BLOCK_M=BM,
-                                      use_trload=_trload)
+                                      use_trload=_trload, use_pipeline=_pipe)
     dq = compile_fmha_bwd_dq_mfma(D=D, dtype_str="bf16", scale=scale)
     a_dvdk = (Q2, K2, V2, dO2, o_dv, o_dk, LSE2, Dv, B, M, N, H, nM, st)
     a_dq = (Q2, K2, V2, dO2, o_dq, LSE2, Dv, B, M, N, H, nN, st)
