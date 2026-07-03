@@ -22,8 +22,9 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda"):
-    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}", end=" ... ", flush=True)
+def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False):
+    tag = " [pipeline]" if use_pipeline else ""
+    print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     scale = 1.0 / math.sqrt(D)
 
     Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
@@ -45,7 +46,8 @@ def run_case(B, M, N, H, D, dtype, device="cuda"):
     dQ_out = torch.zeros(B * M * H * D, 1, device=device, dtype=torch.float32)
 
     launch_fn = compile_fmha_bwd_dq_mfma(D=D, dtype_str=dtype_str,
-                                          BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale)
+                                          BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
+                                          use_pipeline=use_pipeline)
     n_N_tiles = (N + BLOCK_N - 1) // BLOCK_N
     compiled = flyc.compile(launch_fn,
                             Q_2d, K_2d, V_2d, dO_2d, dQ_out, LSE_2d, D_vec,
@@ -87,6 +89,11 @@ if __name__ == "__main__":
     ]
     for args in cases:
         all_pass &= run_case(*args, device=device)
+
+    if "--pipeline" in sys.argv or "--all" in sys.argv:
+        print("\n=== pipeline (lane-distributed K/V load) variant ===")
+        for args in cases:
+            all_pass &= run_case(*args, device=device, use_pipeline=True)
 
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

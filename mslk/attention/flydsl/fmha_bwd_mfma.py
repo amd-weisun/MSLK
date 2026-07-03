@@ -1234,6 +1234,7 @@ def compile_fmha_bwd_dq_mfma(
     BLOCK_M: int = 64,
     BLOCK_N: int = 64,
     scale: float = None,
+    use_pipeline: bool = False,
 ):
     """Phase B.3: dQ with MFMA. Grid over M-tiles, runtime loop over N-tiles.
 
@@ -1426,19 +1427,45 @@ def compile_fmha_bwd_dq_mfma(
             # ---- Cooperative LDS load: K and V tiles [BLOCK_N, D] ----
             VEC_COLS         = D // MFMA_LK
             ROWS_PER_WAVE_LD = BLOCK_N // NUM_WAVES
-            for row_off in range_constexpr(ROWS_PER_WAVE_LD):
-                row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
-                n_global_ld = n_start + row_in_tile
-                n_valid_ld  = n_global_ld < seq_N_idx
-                n_safe_ld   = n_valid_ld.select(n_global_ld, seq_N_idx - fx.Index(1))
-                kv_row_g    = _kv_row(n_safe_ld)
-                for cv in range_constexpr(VEC_COLS):
-                    col_off_ld = fx.Index(cv * MFMA_LK)
+            if use_pipeline:
+                # Lane-distributed: spread (row_off, cv) items across the wave's 64
+                # lanes (baseline had every lane redundantly issue ALL items -> 64x
+                # redundant global loads + same-address LDS stores).
+                N_ITEMS_LD     = ROWS_PER_WAVE_LD * VEC_COLS
+                ITEMS_PER_LANE = N_ITEMS_LD // WARP_SIZE
+                if ITEMS_PER_LANE < 1:
+                    ITEMS_PER_LANE = 1
+                for it in range_constexpr(ITEMS_PER_LANE):
+                    item        = lane + fx.Index(it * WARP_SIZE)
+                    item_ok     = item < fx.Index(N_ITEMS_LD)
+                    item_s      = item_ok.select(item, fx.Index(0))
+                    row_off_i   = item_s // fx.Index(VEC_COLS)
+                    cv_i        = item_s % fx.Index(VEC_COLS)
+                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
+                    n_global_ld = n_start + row_in_tile
+                    n_valid_ld  = n_global_ld < seq_N_idx
+                    n_safe_ld   = n_valid_ld.select(n_global_ld, seq_N_idx - fx.Index(1))
+                    kv_row_g    = _kv_row(n_safe_ld)
+                    col_off_ld  = cv_i * fx.Index(MFMA_LK)
                     k_vec = _load_global_vec_cv(k_rsrc, kv_row_g, col_off_ld)
                     v_vec = _load_global_vec_cv(v_rsrc, kv_row_g, col_off_ld)
-                    lds_base = row_in_tile * D + cv * MFMA_LK
+                    lds_base = row_in_tile * D + col_off_ld
                     Vec(k_vec).store(lds_k, [lds_base])
                     Vec(v_vec).store(lds_v, [lds_base])
+            else:
+                for row_off in range_constexpr(ROWS_PER_WAVE_LD):
+                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
+                    n_global_ld = n_start + row_in_tile
+                    n_valid_ld  = n_global_ld < seq_N_idx
+                    n_safe_ld   = n_valid_ld.select(n_global_ld, seq_N_idx - fx.Index(1))
+                    kv_row_g    = _kv_row(n_safe_ld)
+                    for cv in range_constexpr(VEC_COLS):
+                        col_off_ld = fx.Index(cv * MFMA_LK)
+                        k_vec = _load_global_vec_cv(k_rsrc, kv_row_g, col_off_ld)
+                        v_vec = _load_global_vec_cv(v_rsrc, kv_row_g, col_off_ld)
+                        lds_base = row_in_tile * D + cv * MFMA_LK
+                        Vec(k_vec).store(lds_k, [lds_base])
+                        Vec(v_vec).store(lds_v, [lds_base])
 
             gpu.barrier()
 
