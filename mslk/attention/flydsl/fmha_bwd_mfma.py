@@ -807,6 +807,7 @@ def compile_fmha_bwd_dvdk_mfma(
     BLOCK_N: int = 64,
     scale: float = None,
     use_trload: bool = False,
+    use_pipeline: bool = False,
 ):
     """Phase B.4: FUSED dV + dK with MFMA (matches CK's dV/dK fusion).
 
@@ -1022,19 +1023,42 @@ def compile_fmha_bwd_dvdk_mfma(
             # ---- Cooperative LDS load: Q and dO tiles ----
             VEC_COLS         = D // MFMA_LK
             ROWS_PER_WAVE_LD = BLOCK_M // NUM_WAVES
-            for row_off in range_constexpr(ROWS_PER_WAVE_LD):
-                row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
-                m_global_ld = m_start + row_in_tile
-                m_valid_ld  = m_global_ld < seq_M_idx
-                m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
-                q_row_g     = _q_row(m_safe_ld)
-                for cv in range_constexpr(VEC_COLS):
-                    col_off_ld = fx.Index(cv * MFMA_LK)
+            if use_pipeline:
+                # Lane-distributed cooperative load: the (row_off, cv) work items of
+                # this wave are spread across its 64 lanes (baseline had every lane
+                # redundantly issue ALL items -> 64x redundant global loads + same-
+                # address LDS stores). 32 rows * 8 cvs = 256 items / 64 lanes = 4/lane.
+                N_ITEMS_LD     = ROWS_PER_WAVE_LD * VEC_COLS
+                ITEMS_PER_LANE = N_ITEMS_LD // WARP_SIZE
+                for it in range_constexpr(ITEMS_PER_LANE):
+                    item        = lane + fx.Index(it * WARP_SIZE)
+                    row_off_i   = item // fx.Index(VEC_COLS)
+                    cv_i        = item % fx.Index(VEC_COLS)
+                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
+                    m_global_ld = m_start + row_in_tile
+                    m_valid_ld  = m_global_ld < seq_M_idx
+                    m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                    q_row_g     = _q_row(m_safe_ld)
+                    col_off_ld  = cv_i * fx.Index(MFMA_LK)
                     q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
                     do_vec = _load_global_vec_cv(do_rsrc, q_row_g, col_off_ld)
-                    lds_base = row_in_tile * LDS_Q_STRIDE + cv * MFMA_LK
+                    lds_base = row_in_tile * LDS_Q_STRIDE + col_off_ld
                     Vec(q_vec).store(lds_q,  [lds_base])
                     Vec(do_vec).store(lds_do, [lds_base])
+            else:
+                for row_off in range_constexpr(ROWS_PER_WAVE_LD):
+                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
+                    m_global_ld = m_start + row_in_tile
+                    m_valid_ld  = m_global_ld < seq_M_idx
+                    m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                    q_row_g     = _q_row(m_safe_ld)
+                    for cv in range_constexpr(VEC_COLS):
+                        col_off_ld = fx.Index(cv * MFMA_LK)
+                        q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
+                        do_vec = _load_global_vec_cv(do_rsrc, q_row_g, col_off_ld)
+                        lds_base = row_in_tile * LDS_Q_STRIDE + cv * MFMA_LK
+                        Vec(q_vec).store(lds_q,  [lds_base])
+                        Vec(do_vec).store(lds_do, [lds_base])
 
             # ---- Cooperative LSE + D_vec tile stage ----
             tid_idx = fx.Index(tid)

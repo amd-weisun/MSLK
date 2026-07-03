@@ -38,7 +38,7 @@ def _bench(fn):
     return (time.perf_counter() - t0) / 50 * 1e3
 
 
-def run(B, M, N, H, D, dtype, use_trload, device="cuda"):
+def run(B, M, N, H, D, dtype, use_trload, use_pipeline=False, device="cuda"):
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
     scale = 1.0 / math.sqrt(D)
     Q = torch.randn(B, M, H, D, device=device, dtype=dtype)
@@ -61,7 +61,8 @@ def run(B, M, N, H, D, dtype, use_trload, device="cuda"):
     nM = (M + BM - 1) // BM
 
     dvdk = compile_fmha_bwd_dvdk_mfma(D=D, dtype_str=dtype_str, scale=scale,
-                                      BLOCK_M=BM, use_trload=use_trload)
+                                      BLOCK_M=BM, use_trload=use_trload,
+                                      use_pipeline=use_pipeline)
     a = (Q2, K2, V2, dO2, o_dv, o_dk, LSE2, Dv, B, M, N, H, nM, st)
     c = flyc.compile(dvdk, *a)
     c(*a)
@@ -78,10 +79,17 @@ if __name__ == "__main__":
         (1, 1024, 1024, 8, 64, torch.bfloat16),
         (2, 2048, 2048, 16, 64, torch.bfloat16),
     ]
-    print(f"{'shape':>22} | {'base_ms':>9} {'trload_ms':>9} {'speedup':>8} | ok")
+    hdr = (f"{'shape':>22} | {'base_ms':>9} {'trload':>9} {'pipe':>9} "
+           f"{'pipe+tr':>9} | {'best_x':>7} | ok")
+    print(hdr)
     for B, M, N, H, D, dt in cases:
         base_ms, ok0 = run(B, M, N, H, D, dt, use_trload=False)
         tr_ms, ok1 = run(B, M, N, H, D, dt, use_trload=True)
+        pp_ms, ok2 = run(B, M, N, H, D, dt, use_trload=False, use_pipeline=True)
+        pt_ms, ok3 = run(B, M, N, H, D, dt, use_trload=True, use_pipeline=True)
         tag = f"B{B} M{M} N{N} H{H}"
-        spd = base_ms / tr_ms if tr_ms else 0
-        print(f"{tag:>22} | {base_ms:9.4f} {tr_ms:9.4f} {spd:7.2f}x | {ok0 and ok1}")
+        best = min(tr_ms, pp_ms, pt_ms)
+        spd = base_ms / best if best else 0
+        ok = ok0 and ok1 and ok2 and ok3
+        print(f"{tag:>22} | {base_ms:9.4f} {tr_ms:9.4f} {pp_ms:9.4f} "
+              f"{pt_ms:9.4f} | {spd:6.2f}x | {ok}")

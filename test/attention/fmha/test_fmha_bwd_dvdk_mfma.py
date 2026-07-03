@@ -21,8 +21,12 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False):
-    tag = " [trload]" if use_trload else ""
+def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline=False):
+    tag = ""
+    if use_trload:
+        tag += " [trload]"
+    if use_pipeline:
+        tag += " [pipeline]"
     print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     scale = 1.0 / math.sqrt(D)
 
@@ -47,7 +51,7 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False):
 
     launch_fn = compile_fmha_bwd_dvdk_mfma(D=D, dtype_str=dtype_str,
                                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
-                                            use_trload=use_trload)
+                                            use_trload=use_trload, use_pipeline=use_pipeline)
     n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
     args = (Q_2d, K_2d, V_2d, dO_2d, dV_out, dK_out, LSE_2d, D_vec,
             B, M, N, H, n_M_tiles, torch.cuda.current_stream())
@@ -85,5 +89,13 @@ if __name__ == "__main__":
         print("\n=== trload (ds_read_tr) variant ===")
         for args in cases:
             all_pass &= run_case(*args, device=device, use_trload=True)
+    pipeline = "--pipeline" in sys.argv or "--all" in sys.argv
+    if pipeline:
+        print("\n=== pipeline (lane-distributed coop load) variant ===")
+        for args in cases:
+            all_pass &= run_case(*args, device=device, use_pipeline=True)
+        print("\n=== pipeline + trload variant ===")
+        for args in cases:
+            all_pass &= run_case(*args, device=device, use_trload=True, use_pipeline=True)
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
