@@ -82,7 +82,10 @@ file(GLOB_RECURSE mslk_hip_fmha_sources
   csrc/attention/ck/fmha/hip_fmha/*.cpp)
 
 ################################################################################
-# Build FMHA Static Library (gfx942 only, ROCm 7.x+)
+# Build FMHA Static Library (single arch, ROCm 7.x+ — arch picked via
+# MSLK_HIP_FMHA_ARCH env var, default gfx950; NOTE this is a single-arch build,
+# NOT multi-arch — a build targeting gfx950 will not run FMHA on gfx942 or vice
+# versa. Set MSLK_HIP_FMHA_ARCH=gfx942 when building for a gfx942 node.)
 ################################################################################
 
 set(mslk_hip_fmha_built FALSE)
@@ -90,15 +93,21 @@ if(NOT DEFINED ENV{MSLK_BUILD_HIP_FMHA} OR NOT "$ENV{MSLK_BUILD_HIP_FMHA}" STREQ
   if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM
       AND mslk_hip_fmha_sources
       AND HIP_VERSION VERSION_GREATER_EQUAL "7.0")
-    # Build HIP flags for FMHA targeting only gfx942
+    if(DEFINED ENV{MSLK_HIP_FMHA_ARCH} AND NOT "$ENV{MSLK_HIP_FMHA_ARCH}" STREQUAL "")
+      set(MSLK_HIP_FMHA_ARCH "$ENV{MSLK_HIP_FMHA_ARCH}")
+    else()
+      set(MSLK_HIP_FMHA_ARCH "gfx950")
+    endif()
+
+    # Build HIP flags for FMHA targeting only ${MSLK_HIP_FMHA_ARCH}
     set(HIP_HCC_FLAGS_FMHA ${HIP_HCC_FLAGS})
     list(FILTER HIP_HCC_FLAGS_FMHA EXCLUDE REGEX "--offload-arch=")
     list(APPEND HIP_HCC_FLAGS_FMHA
-      --offload-arch=gfx942
+      --offload-arch=${MSLK_HIP_FMHA_ARCH}
       -fPIC
       -DFMHA_LIMIT_MAX_HEADDIM_TO_256=1)
 
-    message("Building FMHA for arch: gfx942 (HIP_VERSION=${HIP_VERSION})")
+    message("Building FMHA for arch: ${MSLK_HIP_FMHA_ARCH} (HIP_VERSION=${HIP_VERSION})")
 
     # Exclude any pre-existing _hip.cpp files the glob may have picked up
     # from a prior hipify run, to avoid duplicate compilation targets.
