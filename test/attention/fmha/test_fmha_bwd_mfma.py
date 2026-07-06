@@ -4,10 +4,11 @@ Usage (inside container):
     cd /workspace/MSLK
     HIP_VISIBLE_DEVICES=3 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
     PYTHONPATH=/workspace/FlyDSL:$PYTHONPATH \
-    python test/attention/fmha/test_fmha_bwd_mfma.py
+    python -m pytest test/attention/fmha/test_fmha_bwd_mfma.py -v
 """
 import math
 import sys
+import pytest
 import torch
 import flydsl.compiler as flyc
 
@@ -15,6 +16,10 @@ sys.path.insert(0, ".")
 from mslk.attention.flydsl.fmha_bwd_mfma import compile_fmha_bwd_dv_mfma
 sys.path.insert(0, "test/attention/fmha")
 from test_fmha_bwd_reference import ref_fmha_bwd, ref_fmha_fwd
+
+rocm_only = pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.version.hip, reason="requires ROCm GPU"
+)
 
 
 def _as_i16(t):
@@ -70,21 +75,29 @@ def run_case(B, M, N, H, D, dtype, device="cuda"):
     return ok
 
 
+CASES = [
+    # B    M    N    H    D    dtype            (D must == BLOCK_N=64)
+    (1,   64,  64,  1,  64,  torch.bfloat16),
+    (1,  128,  64,  1,  64,  torch.bfloat16),
+    (1,   64, 128,  1,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  64,  torch.bfloat16),
+    (2,  256, 128,  8,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  64,  torch.float16),
+]
+
+
+@rocm_only
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
+def test_dv_mfma(B, M, N, H, D, dtype):
+    assert run_case(B, M, N, H, D, dtype, device="cuda")
+
+
 if __name__ == "__main__":
     device = "cuda"
     all_pass = True
 
     print("=== dV MFMA kernel (Phase B.1) vs ref_fmha_bwd ===")
-    cases = [
-        # B    M    N    H    D    dtype            (D must == BLOCK_N=64)
-        (1,   64,  64,  1,  64,  torch.bfloat16),
-        (1,  128,  64,  1,  64,  torch.bfloat16),
-        (1,   64, 128,  1,  64,  torch.bfloat16),
-        (1,  128, 128,  8,  64,  torch.bfloat16),
-        (2,  256, 128,  8,  64,  torch.bfloat16),
-        (1,  128, 128,  8,  64,  torch.float16),
-    ]
-    for args in cases:
+    for args in CASES:
         all_pass &= run_case(*args, device=device)
 
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")

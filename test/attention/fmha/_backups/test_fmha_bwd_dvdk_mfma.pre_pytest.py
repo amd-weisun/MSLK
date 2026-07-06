@@ -4,11 +4,10 @@ Usage (inside container):
     cd /workspace/MSLK
     HIP_VISIBLE_DEVICES=3 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
     PYTHONPATH=/workspace/FlyDSL:$PYTHONPATH \
-    python -m pytest test/attention/fmha/test_fmha_bwd_dvdk_mfma.py -v
+    python test/attention/fmha/test_fmha_bwd_dvdk_mfma.py
 """
 import math
 import sys
-import pytest
 import torch
 import flydsl.compiler as flyc
 
@@ -16,10 +15,6 @@ sys.path.insert(0, ".")
 from mslk.attention.flydsl.fmha_bwd_mfma import compile_fmha_bwd_dvdk_mfma
 sys.path.insert(0, "test/attention/fmha")
 from test_fmha_bwd_reference import ref_fmha_bwd, ref_fmha_fwd
-
-rocm_only = pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.version.hip, reason="requires ROCm GPU"
-)
 
 
 def _as_i16(t):
@@ -75,41 +70,32 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
     return ok
 
 
-CASES = [
-    (1,  128,  64,  1,  64,  torch.bfloat16),   # M=BLOCK_M
-    (1,  256,  64,  1,  64,  torch.bfloat16),   # M=2*BLOCK_M
-    (1,  128, 128,  1,  64,  torch.bfloat16),
-    (1,  256, 128,  8,  64,  torch.bfloat16),
-    (2,  512, 128,  8,  64,  torch.bfloat16),
-    (1,  256, 128,  8,  64,  torch.float16),
-]
-
-
-@rocm_only
-@pytest.mark.parametrize("use_trload,use_pipeline", [(False, False), (True, False), (False, True), (True, True)])
-@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
-def test_dvdk_mfma(B, M, N, H, D, dtype, use_trload, use_pipeline):
-    assert run_case(B, M, N, H, D, dtype, device="cuda", use_trload=use_trload, use_pipeline=use_pipeline)
-
-
 if __name__ == "__main__":
     device = "cuda"
     all_pass = True
     print("=== FUSED dV+dK MFMA kernel (Phase B.4) vs ref_fmha_bwd ===")
-    for args in CASES:
+    cases = [
+        (1,  128,  64,  1,  64,  torch.bfloat16),   # M=BLOCK_M
+        (1,  256,  64,  1,  64,  torch.bfloat16),   # M=2*BLOCK_M
+        (1,  128, 128,  1,  64,  torch.bfloat16),
+        (1,  256, 128,  8,  64,  torch.bfloat16),
+        (2,  512, 128,  8,  64,  torch.bfloat16),
+        (1,  256, 128,  8,  64,  torch.float16),
+    ]
+    for args in cases:
         all_pass &= run_case(*args, device=device)
     trload = "--trload" in sys.argv or "--all" in sys.argv
     if trload:
         print("\n=== trload (ds_read_tr) variant ===")
-        for args in CASES:
+        for args in cases:
             all_pass &= run_case(*args, device=device, use_trload=True)
     pipeline = "--pipeline" in sys.argv or "--all" in sys.argv
     if pipeline:
         print("\n=== pipeline (lane-distributed coop load) variant ===")
-        for args in CASES:
+        for args in cases:
             all_pass &= run_case(*args, device=device, use_pipeline=True)
         print("\n=== pipeline + trload variant ===")
-        for args in CASES:
+        for args in cases:
             all_pass &= run_case(*args, device=device, use_trload=True, use_pipeline=True)
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

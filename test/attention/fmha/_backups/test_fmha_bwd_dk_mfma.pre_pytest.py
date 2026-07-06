@@ -4,11 +4,10 @@ Usage (inside container):
     cd /workspace/MSLK
     HIP_VISIBLE_DEVICES=3 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
     PYTHONPATH=/workspace/FlyDSL:$PYTHONPATH \
-    python -m pytest test/attention/fmha/test_fmha_bwd_dk_mfma.py -v
+    python test/attention/fmha/test_fmha_bwd_dk_mfma.py
 """
 import math
 import sys
-import pytest
 import torch
 import flydsl.compiler as flyc
 
@@ -16,10 +15,6 @@ sys.path.insert(0, ".")
 from mslk.attention.flydsl.fmha_bwd_mfma import compile_fmha_bwd_dk_mfma
 sys.path.insert(0, "test/attention/fmha")
 from test_fmha_bwd_reference import ref_fmha_bwd, ref_fmha_fwd
-
-rocm_only = pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.version.hip, reason="requires ROCm GPU"
-)
 
 
 def _as_i16(t):
@@ -77,28 +72,20 @@ def run_case(B, M, N, H, D, dtype, device="cuda"):
     return ok
 
 
-CASES = [
-    (1,   64,  64,  1,  64,  torch.bfloat16),
-    (1,  128,  64,  1,  64,  torch.bfloat16),
-    (1,   64, 128,  1,  64,  torch.bfloat16),
-    (1,  128, 128,  8,  64,  torch.bfloat16),
-    (2,  256, 128,  8,  64,  torch.bfloat16),
-    (1,  128, 128,  8,  64,  torch.float16),
-]
-
-
-@rocm_only
-@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
-def test_dk_mfma(B, M, N, H, D, dtype):
-    assert run_case(B, M, N, H, D, dtype, device="cuda")
-
-
 if __name__ == "__main__":
     device = "cuda"
     all_pass = True
 
     print("=== dK MFMA kernel (Phase B.2) vs ref_fmha_bwd ===")
-    for args in CASES:
+    cases = [
+        (1,   64,  64,  1,  64,  torch.bfloat16),
+        (1,  128,  64,  1,  64,  torch.bfloat16),
+        (1,   64, 128,  1,  64,  torch.bfloat16),
+        (1,  128, 128,  8,  64,  torch.bfloat16),
+        (2,  256, 128,  8,  64,  torch.bfloat16),
+        (1,  128, 128,  8,  64,  torch.float16),
+    ]
+    for args in cases:
         all_pass &= run_case(*args, device=device)
 
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")

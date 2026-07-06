@@ -6,11 +6,10 @@ Usage (inside container):
     cd /workspace/MSLK
     HIP_VISIBLE_DEVICES=3 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
     PYTHONPATH=/workspace/FlyDSL:$PYTHONPATH \
-    python -m pytest test/attention/fmha/test_fmha_bwd_dqdkdv_mfma.py -v
+    python test/attention/fmha/test_fmha_bwd_dqdkdv_mfma.py
 """
 import math
 import sys
-import pytest
 import torch
 import flydsl.compiler as flyc
 
@@ -18,10 +17,6 @@ sys.path.insert(0, ".")
 from mslk.attention.flydsl.fmha_bwd_mfma import compile_fmha_bwd_dqdkdv_mfma
 sys.path.insert(0, "test/attention/fmha")
 from test_fmha_bwd_reference import ref_fmha_bwd, ref_fmha_fwd
-
-rocm_only = pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.version.hip, reason="requires ROCm GPU"
-)
 
 
 def _as_i16(t):
@@ -83,32 +78,23 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_lds_reduce=False):
     return ok
 
 
-CASES = [
-    (1,  128,  64,  1,  64,  torch.bfloat16),
-    (1,  256,  64,  1,  64,  torch.bfloat16),
-    (1,  128, 128,  1,  64,  torch.bfloat16),
-    (1,  256, 128,  8,  64,  torch.bfloat16),
-    (2,  512, 128,  8,  64,  torch.bfloat16),
-    (1,  256, 128,  8,  64,  torch.float16),
-]
-
-
-@rocm_only
-@pytest.mark.parametrize("use_lds_reduce", [False, True])
-@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
-def test_dqdkdv_mfma(B, M, N, H, D, dtype, use_lds_reduce):
-    assert run_case(B, M, N, H, D, dtype, device="cuda", use_lds_reduce=use_lds_reduce)
-
-
 if __name__ == "__main__":
     device = "cuda"
     all_pass = True
     print("=== FULLY FUSED dQ+dV+dK MFMA kernel (Phase B.5) vs ref_fmha_bwd ===")
-    for args in CASES:
+    cases = [
+        (1,  128,  64,  1,  64,  torch.bfloat16),
+        (1,  256,  64,  1,  64,  torch.bfloat16),
+        (1,  128, 128,  1,  64,  torch.bfloat16),
+        (1,  256, 128,  8,  64,  torch.bfloat16),
+        (2,  512, 128,  8,  64,  torch.bfloat16),
+        (1,  256, 128,  8,  64,  torch.float16),
+    ]
+    for args in cases:
         all_pass &= run_case(*args, device=device)
     if "--lds-reduce" in sys.argv or "--all" in sys.argv:
         print("\n=== lds_reduce (1 atomic per (m,d) per block) variant ===")
-        for args in CASES:
+        for args in cases:
             all_pass &= run_case(*args, device=device, use_lds_reduce=True)
     print(f"\n{'ALL PASSED' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
