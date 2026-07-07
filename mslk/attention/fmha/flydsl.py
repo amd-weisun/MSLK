@@ -27,6 +27,7 @@ from typing import List, Set, Tuple
 
 import torch
 
+from .attn_bias import LowerTriangularMask
 from .common import AttentionBwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
 
@@ -44,6 +45,7 @@ def _flydsl_bwd(
     lse: torch.Tensor,
     grad: torch.Tensor,
     scale: float,
+    causal: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import flydsl.compiler as flyc
 
@@ -87,16 +89,18 @@ def _flydsl_bwd(
     # dvdk's Q/dO/P/dS LDS footprint at BLOCK_M=128 is 68/100/164 KB for D=64/128/256
     # -- fits gfx950's 160KB LDS everywhere except D=256, but EXCEEDS gfx942's 64KB
     # LDS at every D we support (even D=64). Drop to BLOCK_M=64 (35/52/83 KB) on
-    # gfx942 always, and on gfx950 only at D=256 — same mitigation CK's own codegen
-    # uses (shrinks its M-tile at D>=128, see
-    # external/composable_kernel/.../fmha_bwd.py get_dq_dk_dv_tiles()).
-    # NOTE: gfx942 branch is LDS-math-derived, NOT yet verified on real gfx942
-    # hardware (that node had no usable docker env as of this change).
-    _is_gfx950 = "gfx950" in torch.cuda.get_device_properties(device).gcnArchName
+    # gfx942, and on gfx950 only at D=256 — same mitigation CK's own codegen uses
+    # (shrinks its M-tile at D>=128, see
+    # external/composable_kernel/.../fmha_bwd.py get_dq_dk_dv_tiles()). gfx942 D=256
+    # still overflows at BLOCK_M=64 (83KB > 64KB) -- verified via a real LLVM
+    # "local memory exceeds limit" error on gfx942 hardware -- drop to BLOCK_M=32
+    # there (42.5KB).
+    gpu_arch = torch.cuda.get_device_properties(device).gcnArchName
+    _is_gfx950 = "gfx950" in gpu_arch
     if _is_gfx950:
         BLOCK_M_DVDK = 64 if D >= 256 else 128
     else:
-        BLOCK_M_DVDK = 64
+        BLOCK_M_DVDK = 32 if D >= 256 else 64
     BLOCK_N_DVDK = 64
     launch_dvdk = compile_fmha_bwd_dvdk_mfma(
         D=D,
@@ -105,6 +109,8 @@ def _flydsl_bwd(
         BLOCK_N=BLOCK_N_DVDK,
         scale=scale,
         use_pipeline=True,
+        gpu_arch=gpu_arch,
+        causal=causal,
     )
     n_M_tiles = (M + BLOCK_M_DVDK - 1) // BLOCK_M_DVDK
     args_dvdk = (
@@ -114,13 +120,19 @@ def _flydsl_bwd(
     compiled_dvdk = flyc.compile(launch_dvdk, *args_dvdk)
     compiled_dvdk(*args_dvdk)
 
-    BLOCK_M_DQ, BLOCK_N_DQ = 64, 64
+    # dq's K/V/dS LDS footprint at BLOCK_N=64 is 24/40/72 KB for D=64/128/256 -- fits
+    # gfx950's 160KB everywhere but EXCEEDS gfx942's 64KB at D=256 (72KB); drop to
+    # BLOCK_N=32 (36KB) there, same style of mitigation as dvdk's BLOCK_M above.
+    BLOCK_M_DQ = 64
+    BLOCK_N_DQ = 32 if (not _is_gfx950 and D >= 256) else 64
     launch_dq = compile_fmha_bwd_dq_mfma(
         D=D,
         dtype_str=dtype_str,
         BLOCK_M=BLOCK_M_DQ,
         BLOCK_N=BLOCK_N_DQ,
         scale=scale,
+        gpu_arch=gpu_arch,
+        causal=causal,
     )
     n_N_tiles = (N + BLOCK_N_DQ - 1) // BLOCK_N_DQ
     args_dq = (
@@ -145,6 +157,7 @@ def _flydsl_bwd_abstract(
     lse: torch.Tensor,
     grad: torch.Tensor,
     scale: float,
+    causal: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(query),
@@ -164,18 +177,25 @@ class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
-    # Kernel wave-tiling requires D a multiple of 64 (sequencing-plan step 2: D=64/128/256
-    # done; D=32/96, non-multiples of 64, are a deferred follow-up — see
-    # fmha_bwd_mfma.py's `D % 64 == 0` asserts and not_supported_reasons below).
+    # Kernel wave-tiling requires D a multiple of 32 (sequencing-plan step 2: D=64/128/256
+    # done; D=32/96 done via ceil-div wave assignment + out-of-range guards, see
+    # fmha_bwd_mfma.py's D_SUBS_PER_WAVE comment).
     SUPPORTED_MAX_K = 256
-    SUPPORTED_MIN_K = 64
+    SUPPORTED_MIN_K = 32
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     SUPPORTS_BMGHK = False  # no GQA yet (sequencing-plan item 4)
     IS_DETERMINISTIC = True  # split dvdk+dq path, no atomics
-    # Base default (type(None),) — no causal/bias yet (sequencing-plan item 3).
-    _TEST_K: List[int] = [64, 128, 256]
+    # Non-causal + simple top-left causal (single fixed-length sequence per batch)
+    # only so far (sequencing-plan item 3). NOT `BlockDiagonalCausalMask` or other
+    # block-diagonal/varlen variants: those pack multiple variable-length sequences
+    # per batch row with PER-BLOCK causal masking, which this kernel's flat `n<=m`
+    # comparison does not implement (confirmed via a real correctness failure —
+    # garbage-magnitude gradients, not the usual bf16 precision tail). Real varlen
+    # support is sequencing-plan item 6, separately scoped.
+    SUPPORTED_ATTN_BIAS_TYPES = (type(None), LowerTriangularMask)
+    _TEST_K: List[int] = [32, 64, 96, 128, 256]
     NAME = "flydslB"
 
     @classmethod
@@ -187,15 +207,13 @@ class BwOp(AttentionBwOpBase):
                     f"{name} is not contiguous in BMHK order — FlyDSL kernel "
                     "addressing is not stride-aware yet (sequencing-plan item 7)"
                 )
-        if d.query.shape[-1] % 64 != 0:
-            reasons.append(
-                "head_dim must be a multiple of 64 — D=32/96 not supported yet "
-                "(sequencing-plan step 2 follow-up)"
-            )
+        if d.query.shape[-1] % 32 != 0:
+            reasons.append("head_dim must be a multiple of 32")
         return reasons
 
     @classmethod
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
+        causal = isinstance(inp.attn_bias, LowerTriangularMask)
         dq, dk, dv = cls.OPERATOR(
             inp.query,
             inp.key,
@@ -204,5 +222,6 @@ class BwOp(AttentionBwOpBase):
             ctx.lse,
             grad,
             inp.scale_float,
+            causal,
         )
         return Gradients(dq=dq, dk=dk, dv=dv)

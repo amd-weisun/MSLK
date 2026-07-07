@@ -71,7 +71,7 @@ import math as _math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
@@ -828,6 +828,8 @@ def compile_fmha_bwd_dvdk_mfma(
     scale: float = None,
     use_trload: bool = False,
     use_pipeline: bool = False,
+    gpu_arch: str = "gfx950",
+    causal: bool = False,
 ):
     """Phase B.4: FUSED dV + dK with MFMA (matches CK's dV/dK fusion).
 
@@ -856,12 +858,21 @@ def compile_fmha_bwd_dvdk_mfma(
     if scale is None:
         scale = 1.0 / _pm.sqrt(D)
     assert BLOCK_N == 64, f"Phase B.4 requires BLOCK_N == 64 (wave-tiling fixed), got {BLOCK_N}"
-    assert D % 64 == 0, f"Phase B.4 (generalized) requires D a multiple of 64, got D={D}"
+    assert D % 32 == 0, f"Phase B.4 requires D a multiple of 32 (wave D-subtile width), got D={D}"
     assert D % 16 == 0
 
+    # gfx950 (CDNA4) has native K16 MFMA; gfx942 (CDNA3) only has native K8 -- same
+    # K_STEPS/MFMA_LK-parameterized dispatch as FlyDSL's own flash_attn_generic.py
+    # forward kernel (mfma_acc()), not a "call K8 twice into one K16 slot" wrapper.
+    USE_K16 = gpu_arch.startswith("gfx950")
+    # ds_read_tr16_b64 (used by use_trload) is a gfx950(CDNA4)-only HW-transpose LDS
+    # read (lib/Dialect/FlyROCDL/CDNA4/CopyAtom.cpp) -- unrelated to the MFMA K-width
+    # gap but also unavailable on gfx942.
+    assert not (use_trload and not USE_K16), "use_trload requires gfx950 (ds_read_tr16_b64 is CDNA4-only)"
+
     elem_dtype = dtype_to_elem_type(dtype_str)
-    MFMA_K     = 16
-    MFMA_LK    = 8
+    MFMA_K     = 16 if USE_K16 else 8
+    MFMA_LK    = 8 if USE_K16 else 4
     K_STEPS    = D // MFMA_K
     fm         = arith.FastMathFlags.fast
 
@@ -869,9 +880,17 @@ def compile_fmha_bwd_dvdk_mfma(
     NUM_WAVES  = BLOCK_SIZE // WARP_SIZE          # 4
     WAVE_N_TILES = BLOCK_N // 32                  # 2 (BLOCK_N=64 fixed)
     WAVES_PER_N_GROUP = NUM_WAVES // WAVE_N_TILES  # 2
-    D_TOTAL_SUBS = D // 32                         # 2,4,8 for D=64,128,256
-    assert D_TOTAL_SUBS % WAVES_PER_N_GROUP == 0
-    D_SUBS_PER_WAVE = D_TOTAL_SUBS // WAVES_PER_N_GROUP  # 1,2,4 for D=64,128,256 -- each
+    D_TOTAL_SUBS = D // 32                         # 1,2,3,4,8 for D=32,64,96,128,256
+    # D_SUBS_PER_WAVE = ceil(D_TOTAL_SUBS / WAVES_PER_N_GROUP): D=64/128/256 divide evenly
+    # (1/2/4, unchanged from before). D=32/96 don't divide evenly across the 2 waves in a
+    # D-group -- the last wave's nominal subtile range can run past D_TOTAL_SUBS (D=96: wave
+    # group 0 covers real subtiles {0,1}, group 1 covers {2, <3-doesn't-exist>}; D=32: group 0
+    # covers real subtile {0}, group 1's nominal {1} doesn't exist at all). Rather than a new
+    # warp-partition per head-dim (CK's approach), this kernel keeps the existing wave-tiling
+    # and lets excess waves compute a redundant/garbage out-of-range subtile that is simply
+    # never stored (guarded by `wave_d_sub_i < D_TOTAL_SUBS` at the store site below) --
+    # correct, not maximally efficient, acceptable since D=32/96 aren't the perf-critical shapes.
+    D_SUBS_PER_WAVE = -(-D_TOTAL_SUBS // WAVES_PER_N_GROUP)
     # wave sequentially covers D_SUBS_PER_WAVE contiguous 32-col D-subtiles (was hardcoded
     # to exactly 1, forcing D==BLOCK_N==64; see module docstring for the wave-tiling rationale).
 
@@ -893,7 +912,6 @@ def compile_fmha_bwd_dvdk_mfma(
     LDS_LSE_ELEMS = BLOCK_M
     LDS_DM_ELEMS  = BLOCK_M
 
-    gpu_arch = "gfx950"
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="fmha_bwd_dvdk_mfma_smem")
     lds_q_off  = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_q_off + LDS_Q_ELEMS * 2
@@ -1013,13 +1031,18 @@ def compile_fmha_bwd_dvdk_mfma(
             lds_col_hi = lds_col_lo + fx.Index(MFMA_LK // 2)
             lo = Vec.load(v4elem_type, lds_arr, [lds_row * LDS_Q_STRIDE + lds_col_lo])
             hi = Vec.load(v4elem_type, lds_arr, [lds_row * LDS_Q_STRIDE + lds_col_hi])
-            return Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-
-        _mfma_fn = fx.rocdl.mfma_f32_32x32x16_bf16 if dtype_str == "bf16" \
-                   else fx.rocdl.mfma_f32_32x32x16_f16
+            return Vec(lo).shuffle(Vec(hi), list(range(MFMA_LK))).ir_value()
 
         def mfma(a_pack, b_pack, c_acc):
-            return _mfma_fn(v16f32_type, [a_pack, b_pack, c_acc])
+            if const_expr(dtype_str == "bf16"):
+                if const_expr(USE_K16):
+                    return rocdl.mfma_f32_32x32x16_bf16(v16f32_type, [a_pack, b_pack, c_acc])
+                a_pack = Vec(a_pack).bitcast(fx.Int16)
+                b_pack = Vec(b_pack).bitcast(fx.Int16)
+                return rocdl.mfma_f32_32x32x8bf16_1k(v16f32_type, [a_pack, b_pack, c_acc])
+            if const_expr(USE_K16):
+                return rocdl.mfma_f32_32x32x16_f16(v16f32_type, [a_pack, b_pack, c_acc])
+            return rocdl.mfma_f32_32x32x8f16(v16f32_type, [a_pack, b_pack, c_acc])
 
         # ---- Pre-load K and V packs for this wave's N sub-tile ----
         n_global_wave_base = n_start + wave_n_sub * 32
@@ -1133,6 +1156,8 @@ def compile_fmha_bwd_dvdk_mfma(
                     p_arg     = fx.Float32(arith.mulf(_raw(s_sub_lse), _raw(log2e_cst), fastmath=fm))
                     p_val     = fx.Float32(fly_math.exp2(p_arg, fastmath=fm))
                     valid_mn  = m_valid & n_ok
+                    if const_expr(causal):
+                        valid_mn = valid_mn & (n_row_abs <= m_row_abs)
                     p_val     = valid_mn.select(p_val, fx.Float32(0.0))
                     dp_sub    = fx.Float32(arith.subf(_raw(dp_val), _raw(dm_val), fastmath=fm))
                     ds_val    = fx.Float32(arith.mulf(_raw(scale_cst), _raw(p_val), fastmath=fm))
@@ -1172,7 +1197,14 @@ def compile_fmha_bwd_dvdk_mfma(
                         tr_col_half = lane_mod_32 // 16
                         m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
                         for d_iter in range_constexpr(D_SUBS_PER_WAVE):
-                            wave_d_sub_i = wave_d_sub_base + d_iter
+                            wave_d_sub_i_raw = wave_d_sub_base + d_iter
+                            # D=32/96 (D_TOTAL_SUBS not evenly divisible by WAVES_PER_N_GROUP):
+                            # the last wave-group's nominal D-subtile range can run past
+                            # D_TOTAL_SUBS. Clamp the address to subtile 0 (always in-bounds)
+                            # for out-of-range iterations; the result is discarded at the store
+                            # site below via d_in_range, so the clamped value is never observed.
+                            d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
+                            wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
                             # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
                             # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row
                             # base), free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
@@ -1192,7 +1224,12 @@ def compile_fmha_bwd_dvdk_mfma(
                         p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
                         ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
                         for d_iter in range_constexpr(D_SUBS_PER_WAVE):
-                            wave_d_sub_i = wave_d_sub_base + d_iter
+                            wave_d_sub_i_raw = wave_d_sub_base + d_iter
+                            # See the use_trload branch above for why out-of-range D-subtiles
+                            # (D=32/96) are clamped rather than skipped: the LDS address must
+                            # stay in-bounds even though the result is discarded at store time.
+                            d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
+                            wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
                             d_local = lane_mod_32 + wave_d_sub_i * 32
                             # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
                             # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
@@ -1223,8 +1260,11 @@ def compile_fmha_bwd_dvdk_mfma(
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
                 d_col_abs = lane_mod_32 + wave_d_sub_i * 32
+                # D=32/96: this wave's nominal D-subtile range can run past D (see
+                # D_SUBS_PER_WAVE comment above) -- skip the store for out-of-range columns.
+                d_ok      = d_col_abs < fx.Index(D)
                 flat_col  = fx.Int32(fx.Index(kv_row_g) * fx.Index(D) + d_col_abs)
-                if n_ok:
+                if n_ok & d_ok:
                     _store_f32_row(dV_buf, flat_col, Vec(dv_finals[d_iter])[r])
                     _store_f32_row(dK_buf, flat_col, Vec(dk_finals[d_iter])[r])
 
@@ -1274,6 +1314,8 @@ def compile_fmha_bwd_dq_mfma(
     BLOCK_N: int = 64,
     scale: float = None,
     use_pipeline: bool = False,
+    gpu_arch: str = "gfx950",
+    causal: bool = False,
 ):
     """Phase B.3: dQ with MFMA. Grid over M-tiles, runtime loop over N-tiles.
 
@@ -1295,12 +1337,15 @@ def compile_fmha_bwd_dq_mfma(
     if scale is None:
         scale = 1.0 / _pm.sqrt(D)
     assert BLOCK_M == 64, f"Phase B.3 requires BLOCK_M == 64 (wave-tiling fixed), got {BLOCK_M}"
-    assert D % 64 == 0, f"Phase B.3 (generalized) requires D a multiple of 64, got D={D}"
+    assert D % 32 == 0, f"Phase B.3 requires D a multiple of 32 (wave D-subtile width), got D={D}"
     assert D % 16 == 0
 
+    # See compile_fmha_bwd_dvdk_mfma for the K16-vs-K8 dispatch rationale.
+    USE_K16 = gpu_arch.startswith("gfx950")
+
     elem_dtype = dtype_to_elem_type(dtype_str)
-    MFMA_K     = 16
-    MFMA_LK    = 8
+    MFMA_K     = 16 if USE_K16 else 8
+    MFMA_LK    = 8 if USE_K16 else 4
     K_STEPS    = D // MFMA_K
     fm         = arith.FastMathFlags.fast
 
@@ -1308,9 +1353,10 @@ def compile_fmha_bwd_dq_mfma(
     NUM_WAVES  = BLOCK_SIZE // WARP_SIZE           # 4
     WAVE_M_TILES = BLOCK_M // 32                   # 2 (BLOCK_M=64 fixed)
     WAVES_PER_M_GROUP = NUM_WAVES // WAVE_M_TILES  # 2
-    D_TOTAL_SUBS = D // 32                          # 2,4,8 for D=64,128,256
-    assert D_TOTAL_SUBS % WAVES_PER_M_GROUP == 0
-    D_SUBS_PER_WAVE = D_TOTAL_SUBS // WAVES_PER_M_GROUP  # 1,2,4 for D=64,128,256 -- each
+    D_TOTAL_SUBS = D // 32                          # 1,2,3,4,8 for D=32,64,96,128,256
+    # ceil-div + out-of-range clamp/guard for D=32/96 (not evenly divisible by
+    # WAVES_PER_M_GROUP); see compile_fmha_bwd_dvdk_mfma for the full rationale.
+    D_SUBS_PER_WAVE = -(-D_TOTAL_SUBS // WAVES_PER_M_GROUP)
     # wave sequentially covers D_SUBS_PER_WAVE contiguous 32-col D-subtiles (mirrors dvdk's
     # generalization; see compile_fmha_bwd_dvdk_mfma for the full rationale).
 
@@ -1319,7 +1365,6 @@ def compile_fmha_bwd_dq_mfma(
     LDS_V_ELEMS  = BLOCK_N * D
     LDS_DS_ELEMS = BLOCK_M * BLOCK_N
 
-    gpu_arch = "gfx950"
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="fmha_bwd_dq_mfma_smem")
     lds_k_off  = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_off + LDS_K_ELEMS * 2
@@ -1423,11 +1468,16 @@ def compile_fmha_bwd_dq_mfma(
             lds_col = fx.Index(k_step * MFMA_K) + lane_div_32 * MFMA_LK
             return Vec.load(v8elem_type, lds_arr, [lds_row * D + lds_col]).ir_value()
 
-        _mfma_fn = fx.rocdl.mfma_f32_32x32x16_bf16 if dtype_str == "bf16" \
-                   else fx.rocdl.mfma_f32_32x32x16_f16
-
         def mfma(a_pack, b_pack, c_acc):
-            return _mfma_fn(v16f32_type, [a_pack, b_pack, c_acc])
+            if const_expr(dtype_str == "bf16"):
+                if const_expr(USE_K16):
+                    return rocdl.mfma_f32_32x32x16_bf16(v16f32_type, [a_pack, b_pack, c_acc])
+                a_pack = Vec(a_pack).bitcast(fx.Int16)
+                b_pack = Vec(b_pack).bitcast(fx.Int16)
+                return rocdl.mfma_f32_32x32x8bf16_1k(v16f32_type, [a_pack, b_pack, c_acc])
+            if const_expr(USE_K16):
+                return rocdl.mfma_f32_32x32x16_f16(v16f32_type, [a_pack, b_pack, c_acc])
+            return rocdl.mfma_f32_32x32x8f16(v16f32_type, [a_pack, b_pack, c_acc])
 
         # ---- Pre-load Q, dO A-packs for this wave's M sub-tile (constant across N-loop) ----
         # A-operand of S=Q@K^T and dP=dO@V^T: free=m=wave_m_sub*32+lane%32, contract=d.
@@ -1445,9 +1495,10 @@ def compile_fmha_bwd_dq_mfma(
             do_packs.append(_load_global_vec_cv(do_rsrc, q_row_g_pre, col_off))
 
         # ---- Pre-load per-r LSE, D_vec, m-validity (m varies with r, const across N) ----
-        lse_vals   = []
-        dvec_vals  = []
-        m_valids   = []
+        lse_vals    = []
+        dvec_vals   = []
+        m_valids    = []
+        m_row_abss  = []
         for r in range_constexpr(16):
             m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             m_row_abs = m_within + wave_m_sub * 32 + m_start
@@ -1456,6 +1507,7 @@ def compile_fmha_bwd_dq_mfma(
             lse_vals.append(_load_f32_row(LSE_buf, _lse_row(m_safe)))
             dvec_vals.append(_load_f32_row(Dvec_buf, _dvec_row(m_safe)))
             m_valids.append(m_valid)
+            m_row_abss.append(m_row_abs)
 
         scale_cst = fx.Float32(scale)
         log2e_cst = fx.Float32(_LOG2E)
@@ -1543,6 +1595,8 @@ def compile_fmha_bwd_dq_mfma(
                     p_arg     = fx.Float32(arith.mulf(_raw(s_sub_lse), _raw(log2e_cst), fastmath=fm))
                     p_val     = fx.Float32(fly_math.exp2(p_arg, fastmath=fm))
                     valid_mn  = m_valids[r] & n_ok
+                    if const_expr(causal):
+                        valid_mn = valid_mn & (n_row_abs <= m_row_abss[r])
                     p_val     = valid_mn.select(p_val, fx.Float32(0.0))
                     dp_sub    = fx.Float32(arith.subf(_raw(dp_val), _raw(dm_val), fastmath=fm))
                     ds_val    = fx.Float32(arith.mulf(_raw(scale_cst), _raw(p_val), fastmath=fm))
@@ -1567,7 +1621,12 @@ def compile_fmha_bwd_dq_mfma(
                         ds_sc   = Vec.load(Vec.make_type(1, elem_dtype), lds_ds, [m_local * BLOCK_N + n_local])[0]
                         fx.memref_store(ds_sc, dst_r, e)
                     for d_iter in range_constexpr(D_SUBS_PER_WAVE):
-                        wave_d_sub_i = wave_d_sub_base + d_iter
+                        wave_d_sub_i_raw = wave_d_sub_base + d_iter
+                        # D=32/96 (D_TOTAL_SUBS not evenly divisible by WAVES_PER_M_GROUP):
+                        # clamp out-of-range D-subtiles to subtile 0 to keep the LDS address
+                        # in-bounds; the store site below discards this iteration's result.
+                        d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
+                        wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
                         d_local = lane_mod_32 + wave_d_sub_i * 32
                         k_r = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
                         for e in range_constexpr(MFMA_LK):
@@ -1591,9 +1650,12 @@ def compile_fmha_bwd_dq_mfma(
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
                 d_col_abs = lane_mod_32 + wave_d_sub_i * 32
+                # D=32/96: this wave's nominal D-subtile range can run past D -- skip the
+                # store for out-of-range columns (see D_SUBS_PER_WAVE comment above).
+                d_ok      = d_col_abs < fx.Index(D)
                 flat_dq   = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs)
                 val_f32   = Vec(dq_finals[d_iter])[r]
-                if m_ok:
+                if m_ok & d_ok:
                     _store_f32_row(dQ_buf, flat_dq, val_f32)
 
     @flyc.jit
@@ -1858,7 +1920,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
             lds_col_hi = lds_col_lo + fx.Index(MFMA_LK // 2)
             lo = Vec.load(v4elem_type, lds_arr, [lds_row * LDS_Q_STRIDE + lds_col_lo])
             hi = Vec.load(v4elem_type, lds_arr, [lds_row * LDS_Q_STRIDE + lds_col_hi])
-            return Vec(lo).shuffle(Vec(hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+            return Vec(lo).shuffle(Vec(hi), list(range(MFMA_LK))).ir_value()
 
         _mfma_fn = fx.rocdl.mfma_f32_32x32x16_bf16 if dtype_str == "bf16" \
                    else fx.rocdl.mfma_f32_32x32x16_f16

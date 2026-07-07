@@ -27,19 +27,26 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False):
+def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=False):
     tag = " [pipeline]" if use_pipeline else ""
+    if causal:
+        tag += " [causal]"
     print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     scale = 1.0 / math.sqrt(D)
 
     Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
     K  = torch.randn(B, N, H, D, device=device, dtype=dtype)
     V  = torch.randn(B, N, H, D, device=device, dtype=dtype)
-    O, LSE = ref_fmha_fwd(Q, K, V, scale=scale, causal=False)
+    O, LSE = ref_fmha_fwd(Q, K, V, scale=scale, causal=causal)
     dO = torch.randn_like(O)
-    dQ_ref, _, _ = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=False)
+    dQ_ref, _, _ = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=causal)
 
-    BLOCK_M, BLOCK_N = 64, 64
+    gpu_arch = torch.cuda.get_device_properties(device).gcnArchName
+    # K/V/dS LDS footprint at BLOCK_N=64 is 24/40/72 KB for D=64/128/256 -- fits
+    # gfx950's 160KB everywhere but overflows gfx942's 64KB at D=256 (72KB); drop to
+    # BLOCK_N=32 (36KB) there, verified on real gfx942 hardware (see flydsl.py).
+    BLOCK_M = 64
+    BLOCK_N = 32 if ("gfx950" not in gpu_arch and D >= 256) else 64
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
 
     Q_2d   = _as_i16(Q.contiguous().view(B * M * H, D))
@@ -52,7 +59,8 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False):
 
     launch_fn = compile_fmha_bwd_dq_mfma(D=D, dtype_str=dtype_str,
                                           BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
-                                          use_pipeline=use_pipeline)
+                                          use_pipeline=use_pipeline,
+                                          gpu_arch=gpu_arch, causal=causal)
     n_N_tiles = (N + BLOCK_N - 1) // BLOCK_N
     compiled = flyc.compile(launch_fn,
                             Q_2d, K_2d, V_2d, dO_2d, dQ_out, LSE_2d, D_vec,
@@ -101,6 +109,28 @@ CASES_WIDE_D = [
     (1,  128, 128,  8,  256, torch.float16),
 ]
 
+# D=32/96 (sequencing-plan step 2 follow-up -- D a multiple of 32 but not 64;
+# ceil-div wave assignment + out-of-range guards, see fmha_bwd_mfma.py's
+# D_SUBS_PER_WAVE comment).
+CASES_ODD_D = [
+    (1,   64,  64,  1,  32,  torch.bfloat16),
+    (1,  128, 128,  8,  32,  torch.bfloat16),
+    (1,  128, 128,  8,  32,  torch.float16),
+    (1,   64,  64,  1,  96,  torch.bfloat16),
+    (1,  128, 128,  8,  96,  torch.bfloat16),
+    (1,  128, 128,  8,  96,  torch.float16),
+]
+
+# Causal masking (sequencing-plan item 3), across the D matrix.
+CASES_CAUSAL = [
+    (1,   64,  64,  1,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  128, torch.bfloat16),
+    (1,  128, 128,  8,  256, torch.bfloat16),
+    (1,  128, 128,  8,  32,  torch.bfloat16),
+    (1,  128, 128,  8,  96,  torch.bfloat16),
+]
+
 
 @rocm_only
 @pytest.mark.parametrize("use_pipeline", [False, True])
@@ -114,6 +144,20 @@ def test_dq_mfma(B, M, N, H, D, dtype, use_pipeline):
 @pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_WIDE_D)
 def test_dq_mfma_wide_d(B, M, N, H, D, dtype, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_ODD_D)
+def test_dq_mfma_odd_d(B, M, N, H, D, dtype, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_CAUSAL)
+def test_dq_mfma_causal(B, M, N, H, D, dtype, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, causal=True)
 
 
 if __name__ == "__main__":
