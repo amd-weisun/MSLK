@@ -77,9 +77,29 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
-WARP_SIZE = get_warp_size()  # 64 on CDNA4
+# Inlined (not imported from kernels.kernels_common / kernels.common.kernels_common):
+# that module's path has moved across FlyDSL checkouts on different nodes, so this
+# kernel is kept self-contained rather than depending on FlyDSL's internal layout.
+def dtype_to_elem_type(dtype_str: str):
+    """Map a dtype string to its FlyDSL numeric type ('f32', 'f16', 'bf16', 'fp8')."""
+    if dtype_str == "f32":
+        return fx.Float32
+    if dtype_str == "f16":
+        return fx.Float16
+    if dtype_str == "bf16":
+        return fx.BFloat16
+    if dtype_str == "fp8":
+        return fx.Float8E4M3FN
+    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', 'bf16', or 'fp8')")
+
+
+def get_warp_size() -> int:
+    """Wavefront size for the CDNA (gfx9xx) targets this kernel supports (gfx942/gfx950)."""
+    return 64
+
+
+WARP_SIZE = get_warp_size()  # 64 on CDNA3/CDNA4
 _LOG2E   = _math.log2(_math.e)
 
 
@@ -835,7 +855,8 @@ def compile_fmha_bwd_dvdk_mfma(
     import math as _pm
     if scale is None:
         scale = 1.0 / _pm.sqrt(D)
-    assert D == BLOCK_N, f"Phase B.4 requires D == BLOCK_N, got D={D}, BLOCK_N={BLOCK_N}"
+    assert BLOCK_N == 64, f"Phase B.4 requires BLOCK_N == 64 (wave-tiling fixed), got {BLOCK_N}"
+    assert D % 64 == 0, f"Phase B.4 (generalized) requires D a multiple of 64, got D={D}"
     assert D % 16 == 0
 
     elem_dtype = dtype_to_elem_type(dtype_str)
@@ -845,10 +866,14 @@ def compile_fmha_bwd_dvdk_mfma(
     fm         = arith.FastMathFlags.fast
 
     BLOCK_SIZE = 256
-    NUM_WAVES  = BLOCK_SIZE // WARP_SIZE
-    WAVE_N_TILES = BLOCK_N // 32
-    WAVE_D_TILES = D // 32
-    assert WAVE_N_TILES * WAVE_D_TILES == NUM_WAVES
+    NUM_WAVES  = BLOCK_SIZE // WARP_SIZE          # 4
+    WAVE_N_TILES = BLOCK_N // 32                  # 2 (BLOCK_N=64 fixed)
+    WAVES_PER_N_GROUP = NUM_WAVES // WAVE_N_TILES  # 2
+    D_TOTAL_SUBS = D // 32                         # 2,4,8 for D=64,128,256
+    assert D_TOTAL_SUBS % WAVES_PER_N_GROUP == 0
+    D_SUBS_PER_WAVE = D_TOTAL_SUBS // WAVES_PER_N_GROUP  # 1,2,4 for D=64,128,256 -- each
+    # wave sequentially covers D_SUBS_PER_WAVE contiguous 32-col D-subtiles (was hardcoded
+    # to exactly 1, forcing D==BLOCK_N==64; see module docstring for the wave-tiling rationale).
 
     # LDS layout:
     # Q/dO: [M, LDS_Q_STRIDE] row-major, padded stride for bank-conflict-free scatter.
@@ -919,8 +944,9 @@ def compile_fmha_bwd_dvdk_mfma(
         lane        = fx.Index(tid % WARP_SIZE)
         lane_mod_32 = fx.Index(lane % 32)
         lane_div_32 = fx.Index(lane // 32)
-        wave_n_sub  = fx.Index(wave // WAVE_D_TILES)
-        wave_d_sub  = fx.Index(wave % WAVE_D_TILES)
+        wave_n_sub      = fx.Index(wave // WAVES_PER_N_GROUP)
+        wave_d_group    = fx.Index(wave % WAVES_PER_N_GROUP)
+        wave_d_sub_base = wave_d_group * D_SUBS_PER_WAVE
 
         dV_buf   = fx.rocdl.make_buffer_tensor(dV)
         dK_buf   = fx.rocdl.make_buffer_tensor(dK)
@@ -1009,15 +1035,18 @@ def compile_fmha_bwd_dvdk_mfma(
             k_packs.append(_load_global_vec_cv(k_rsrc, kv_row_g_pre, col_off))
             v_packs.append(_load_global_vec_cv(v_rsrc, kv_row_g_pre, col_off))
 
-        dk_init   = Vec.filled(16, 0.0, fx.Float32)
-        dv_init   = Vec.filled(16, 0.0, fx.Float32)
+        # One dk/dv accumulator PER D-subtile this wave sequentially owns
+        # (D_SUBS_PER_WAVE == 1 for D==BLOCK_N==64, matching the original single-accumulator
+        # behavior; >1 for D=128/256, where this wave loops over multiple 32-col D chunks).
+        dk_inits  = [Vec.filled(16, 0.0, fx.Float32) for _ in range(D_SUBS_PER_WAVE)]
+        dv_inits  = [Vec.filled(16, 0.0, fx.Float32) for _ in range(D_SUBS_PER_WAVE)]
         dummy_val = fx.Float32(0.0)
-        init_st   = [dk_init, dv_init, dummy_val]
+        init_st   = dk_inits + dv_inits + [dummy_val]
 
         loop_results = init_st
         for m_tile, iter_args in range(fx.Index(0), n_M_tiles_idx, fx.Index(1), init=init_st):
-            dk_acc = iter_args[0]
-            dv_acc = iter_args[1]
+            dk_accs = list(iter_args[0:D_SUBS_PER_WAVE])
+            dv_accs = list(iter_args[D_SUBS_PER_WAVE:2 * D_SUBS_PER_WAVE])
             m_start = m_tile * BLOCK_M
 
             # ---- Cooperative LDS load: Q and dO tiles ----
@@ -1116,34 +1145,21 @@ def compile_fmha_bwd_dvdk_mfma(
 
                 gpu.barrier()
 
-                # ---- dV += P^T @ dO ; dK += dS^T @ Q (shared operand loads) ----
-                # A=P^T/dS^T[n,m]: free=n=lane%32, k=m; B=dO/Q[m,d]: free=d=lane%32, k=m
+                # ---- dV += P^T @ dO ; dK += dS^T @ Q ----
+                # A=P^T/dS^T[n,m]: free=n=lane%32, k=m; B=dO/Q[m,d]: free=d=lane%32, k=m.
+                # P/dS (the A-operand) do NOT depend on d, so they're loaded ONCE per ks and
+                # reused across every D-subtile this wave sequentially owns (D_SUBS_PER_WAVE
+                # loop below) — only the B-operand (dO/Q at a given d) changes per subtile.
                 MFMA_KS   = 32 // MFMA_K
-                d_local   = lane_mod_32 + wave_d_sub * 32
                 n_local_g = lane_mod_32 + wave_n_sub * 32
                 for ks in range_constexpr(MFMA_KS):
                     n_local = lane_mod_32 + wave_n_sub * 32
                     if use_trload:
-                        # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
-                        # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row base),
-                        # free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
-                        # tr lane decomposition:
-                        tr_k_group  = (lane_mod_32 % 16) // 4   # lane%16 //4 within 32-lane half
-                        tr_col_sub  = lane % 4
-                        tr_col_half = lane_mod_32 // 16
-                        d_col = wave_d_sub * 32 + tr_col_half * 16 + tr_col_sub * 4
-                        m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
-                        lo = m_base * LDS_Q_STRIDE + d_col
-                        hi = lo + 8 * LDS_Q_STRIDE
-                        do_a = _ds_read_tr_v4(v4elem_type, lo, lds_do_off)
-                        do_b = _ds_read_tr_v4(v4elem_type, hi, lds_do_off)
-                        do_pack = Vec(do_a).shuffle(Vec(do_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                        q_a = _ds_read_tr_v4(v4elem_type, lo, lds_q_off)
-                        q_b = _ds_read_tr_v4(v4elem_type, hi, lds_q_off)
-                        q_pack = Vec(q_a).shuffle(Vec(q_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                        # A-operand (P^T/dS^T): must hold the SAME m as B at each hardware slot.
-                        # B (tr) gives m = (m_sub*32+ks*16) + lane_div_32*4 + P8[e], P8={0,1,2,3,8,9,10,11}.
-                        # So load P^T[n, base_a + {0,1,2,3}] ++ P^T[n, base_a + {8,9,10,11}].
+                        # A-operand (P^T/dS^T): must hold the SAME m as the tr B-operand at
+                        # each hardware slot (independent of which D-subtile is being read).
+                        # B (tr) gives m = (m_sub*32+ks*16) + lane_div_32*4 + P8[e],
+                        # P8={0,1,2,3,8,9,10,11}. So load P^T[n, base_a+{0,1,2,3}] ++
+                        # P^T[n, base_a+{8,9,10,11}].
                         base_a = lane_div_32 * 4 + (m_sub * 32 + ks * MFMA_K)
                         p_lo  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a])
                         p_hi  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a + 8])
@@ -1151,43 +1167,66 @@ def compile_fmha_bwd_dvdk_mfma(
                         ds_lo = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a])
                         ds_hi = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a + 8])
                         ds_pack = Vec(ds_lo).shuffle(Vec(ds_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                        dv_acc = mfma(p_pack,  do_pack, dv_acc)
-                        dk_acc = mfma(ds_pack, q_pack,  dk_acc)
+                        tr_k_group  = (lane_mod_32 % 16) // 4   # lane%16 //4 within 32-lane half
+                        tr_col_sub  = lane % 4
+                        tr_col_half = lane_mod_32 // 16
+                        m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
+                        for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                            wave_d_sub_i = wave_d_sub_base + d_iter
+                            # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
+                            # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row
+                            # base), free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
+                            d_col = wave_d_sub_i * 32 + tr_col_half * 16 + tr_col_sub * 4
+                            lo = m_base * LDS_Q_STRIDE + d_col
+                            hi = lo + 8 * LDS_Q_STRIDE
+                            do_a = _ds_read_tr_v4(v4elem_type, lo, lds_do_off)
+                            do_b = _ds_read_tr_v4(v4elem_type, hi, lds_do_off)
+                            do_pack = Vec(do_a).shuffle(Vec(do_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                            q_a = _ds_read_tr_v4(v4elem_type, lo, lds_q_off)
+                            q_b = _ds_read_tr_v4(v4elem_type, hi, lds_q_off)
+                            q_pack = Vec(q_a).shuffle(Vec(q_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                            dv_accs[d_iter] = mfma(p_pack,  do_pack, dv_accs[d_iter])
+                            dk_accs[d_iter] = mfma(ds_pack, q_pack,  dk_accs[d_iter])
                     else:
                         base_m  = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K)
                         p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
                         ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
-                        # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
-                        # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
-                        do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                        q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                        for e in range_constexpr(MFMA_LK):
-                            m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
-                            do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
-                            q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
-                            fx.memref_store(do_sc, do_r,  e)
-                            fx.memref_store(q_sc,  q_r,   e)
-                        dv_acc = mfma(p_pack,  fx.memref_load_vec(do_r), dv_acc)
-                        dk_acc = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_acc)
+                        for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                            wave_d_sub_i = wave_d_sub_base + d_iter
+                            d_local = lane_mod_32 + wave_d_sub_i * 32
+                            # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
+                            # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
+                            do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                            q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                            for e in range_constexpr(MFMA_LK):
+                                m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
+                                do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
+                                q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
+                                fx.memref_store(do_sc, do_r,  e)
+                                fx.memref_store(q_sc,  q_r,   e)
+                            dv_accs[d_iter] = mfma(p_pack,  fx.memref_load_vec(do_r), dv_accs[d_iter])
+                            dk_accs[d_iter] = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_accs[d_iter])
 
                 gpu.barrier()
 
-            loop_results = yield [dk_acc, dv_acc, dummy_val]
+            loop_results = yield dk_accs + dv_accs + [dummy_val]
 
         # ---- Store dV and dK ----  (same output decode: M=n_key varies with r, N=d fixed)
-        dk_final  = loop_results[0]
-        dv_final  = loop_results[1]
-        d_col_abs = lane_mod_32 + wave_d_sub * 32
+        dk_finals = loop_results[0:D_SUBS_PER_WAVE]
+        dv_finals = loop_results[D_SUBS_PER_WAVE:2 * D_SUBS_PER_WAVE]
         for r in range_constexpr(16):
             n_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             n_row_abs = n_within + wave_n_sub * 32 + n_start
             n_ok      = n_row_abs < seq_N_idx
             n_safe    = n_ok.select(n_row_abs, seq_N_idx - fx.Index(1))
             kv_row_g  = _kv_row(n_safe)
-            flat_col  = fx.Int32(fx.Index(kv_row_g) * fx.Index(D) + d_col_abs)
-            if n_ok:
-                _store_f32_row(dV_buf, flat_col, Vec(dv_final)[r])
-                _store_f32_row(dK_buf, flat_col, Vec(dk_final)[r])
+            for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                wave_d_sub_i = wave_d_sub_base + d_iter
+                d_col_abs = lane_mod_32 + wave_d_sub_i * 32
+                flat_col  = fx.Int32(fx.Index(kv_row_g) * fx.Index(D) + d_col_abs)
+                if n_ok:
+                    _store_f32_row(dV_buf, flat_col, Vec(dv_finals[d_iter])[r])
+                    _store_f32_row(dK_buf, flat_col, Vec(dk_finals[d_iter])[r])
 
     @flyc.jit
     def launch_fn(
@@ -1255,7 +1294,8 @@ def compile_fmha_bwd_dq_mfma(
     import math as _pm
     if scale is None:
         scale = 1.0 / _pm.sqrt(D)
-    assert D == BLOCK_M, f"Phase B.3 requires D == BLOCK_M, got D={D}, BLOCK_M={BLOCK_M}"
+    assert BLOCK_M == 64, f"Phase B.3 requires BLOCK_M == 64 (wave-tiling fixed), got {BLOCK_M}"
+    assert D % 64 == 0, f"Phase B.3 (generalized) requires D a multiple of 64, got D={D}"
     assert D % 16 == 0
 
     elem_dtype = dtype_to_elem_type(dtype_str)
@@ -1265,10 +1305,14 @@ def compile_fmha_bwd_dq_mfma(
     fm         = arith.FastMathFlags.fast
 
     BLOCK_SIZE = 256
-    NUM_WAVES  = BLOCK_SIZE // WARP_SIZE
-    WAVE_M_TILES = BLOCK_M // 32
-    WAVE_D_TILES = D // 32
-    assert WAVE_M_TILES * WAVE_D_TILES == NUM_WAVES
+    NUM_WAVES  = BLOCK_SIZE // WARP_SIZE           # 4
+    WAVE_M_TILES = BLOCK_M // 32                   # 2 (BLOCK_M=64 fixed)
+    WAVES_PER_M_GROUP = NUM_WAVES // WAVE_M_TILES  # 2
+    D_TOTAL_SUBS = D // 32                          # 2,4,8 for D=64,128,256
+    assert D_TOTAL_SUBS % WAVES_PER_M_GROUP == 0
+    D_SUBS_PER_WAVE = D_TOTAL_SUBS // WAVES_PER_M_GROUP  # 1,2,4 for D=64,128,256 -- each
+    # wave sequentially covers D_SUBS_PER_WAVE contiguous 32-col D-subtiles (mirrors dvdk's
+    # generalization; see compile_fmha_bwd_dvdk_mfma for the full rationale).
 
     # LDS: K tile + V tile [BLOCK_N, D] + dS scratch [BLOCK_M, BLOCK_N].
     LDS_K_ELEMS  = BLOCK_N * D
@@ -1319,8 +1363,9 @@ def compile_fmha_bwd_dq_mfma(
         lane        = fx.Index(tid % WARP_SIZE)
         lane_mod_32 = fx.Index(lane % 32)
         lane_div_32 = fx.Index(lane // 32)
-        wave_m_sub  = fx.Index(wave // WAVE_D_TILES)
-        wave_d_sub  = fx.Index(wave % WAVE_D_TILES)
+        wave_m_sub      = fx.Index(wave // WAVES_PER_M_GROUP)
+        wave_d_group    = fx.Index(wave % WAVES_PER_M_GROUP)
+        wave_d_sub_base = wave_d_group * D_SUBS_PER_WAVE
 
         dQ_buf   = fx.rocdl.make_buffer_tensor(dQ)
         LSE_buf  = fx.rocdl.make_buffer_tensor(LSE)
@@ -1415,13 +1460,15 @@ def compile_fmha_bwd_dq_mfma(
         scale_cst = fx.Float32(scale)
         log2e_cst = fx.Float32(_LOG2E)
 
-        dq_init   = Vec.filled(16, 0.0, fx.Float32)
+        # One dq accumulator PER D-subtile this wave sequentially owns (mirrors dvdk's
+        # generalization; D_SUBS_PER_WAVE==1 for D==BLOCK_M==64, unchanged from before).
+        dq_inits  = [Vec.filled(16, 0.0, fx.Float32) for _ in range(D_SUBS_PER_WAVE)]
         dummy_val = fx.Float32(0.0)
-        init_dq   = [dq_init, dummy_val]
+        init_dq   = dq_inits + [dummy_val]
 
         loop_results = init_dq
         for n_tile, iter_args in range(fx.Index(0), n_N_tiles_idx, fx.Index(1), init=init_dq):
-            dq_acc = iter_args[0]
+            dq_accs = list(iter_args[0:D_SUBS_PER_WAVE])
             n_start = n_tile * BLOCK_N
 
             # ---- Cooperative LDS load: K and V tiles [BLOCK_N, D] ----
@@ -1509,38 +1556,45 @@ def compile_fmha_bwd_dq_mfma(
                 gpu.barrier()
 
                 # ---- dQ += dS @ K  (contract over this n_sub's 32 key rows) ----
-                # A=dS[m,n]: free=m=lane%32, k=n=ks*16+lane//32*8+e
+                # A=dS[m,n]: free=m=lane%32, k=n=ks*16+lane//32*8+e (d-independent, loaded
+                # once per ks and reused across every D-subtile this wave owns).
                 # B=K[n,d] : free=d=lane%32, k=n=ks*16+lane//32*8+e
                 for ks in range_constexpr(32 // MFMA_K):
                     dst_r = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                    k_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
                     for e in range_constexpr(MFMA_LK):
                         n_local = lane_div_32 * MFMA_LK + (n_sub * 32 + ks * MFMA_K + e)
                         m_local = lane_mod_32 + wave_m_sub * 32
                         ds_sc   = Vec.load(Vec.make_type(1, elem_dtype), lds_ds, [m_local * BLOCK_N + n_local])[0]
                         fx.memref_store(ds_sc, dst_r, e)
-                        d_local = lane_mod_32 + wave_d_sub * 32
-                        k_sc    = Vec.load(Vec.make_type(1, elem_dtype), lds_k, [n_local * D + d_local])[0]
-                        fx.memref_store(k_sc, k_r, e)
-                    dq_acc = mfma(fx.memref_load_vec(dst_r), fx.memref_load_vec(k_r), dq_acc)
+                    for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                        wave_d_sub_i = wave_d_sub_base + d_iter
+                        d_local = lane_mod_32 + wave_d_sub_i * 32
+                        k_r = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                        for e in range_constexpr(MFMA_LK):
+                            n_local = lane_div_32 * MFMA_LK + (n_sub * 32 + ks * MFMA_K + e)
+                            k_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_k, [n_local * D + d_local])[0]
+                            fx.memref_store(k_sc, k_r, e)
+                        dq_accs[d_iter] = mfma(fx.memref_load_vec(dst_r), fx.memref_load_vec(k_r), dq_accs[d_iter])
 
                 gpu.barrier()
 
-            loop_results = yield [dq_acc, dummy_val]
+            loop_results = yield dq_accs + [dummy_val]
 
         # ---- Store dQ ----  output C[M,N]: M=m (varies with r), N=d (fixed)
-        dq_final  = loop_results[0]
-        d_col_abs = lane_mod_32 + wave_d_sub * 32
+        dq_finals = loop_results[0:D_SUBS_PER_WAVE]
         for r in range_constexpr(16):
             m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             m_row_abs = m_within + wave_m_sub * 32 + m_start
             m_ok      = m_row_abs < seq_M_idx
             m_safe    = m_ok.select(m_row_abs, seq_M_idx - fx.Index(1))
             q_row_g   = _q_row(m_safe)
-            flat_dq   = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs)
-            val_f32   = Vec(dq_final)[r]
-            if m_ok:
-                _store_f32_row(dQ_buf, flat_dq, val_f32)
+            for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                wave_d_sub_i = wave_d_sub_base + d_iter
+                d_col_abs = lane_mod_32 + wave_d_sub_i * 32
+                flat_dq   = fx.Int32(fx.Index(q_row_g) * fx.Index(D) + d_col_abs)
+                val_f32   = Vec(dq_finals[d_iter])[r]
+                if m_ok:
+                    _store_f32_row(dQ_buf, flat_dq, val_f32)
 
     @flyc.jit
     def launch_fn(

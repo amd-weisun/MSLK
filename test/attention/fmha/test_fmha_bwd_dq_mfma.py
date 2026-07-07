@@ -88,11 +88,31 @@ CASES = [
     (1,  128, 128,  8,  64,  torch.float16),
 ]
 
+# D=128/256 (sequencing-plan step 2, head-dim generalization -- D a multiple of 64;
+# each wave sequentially loops D_SUBS_PER_WAVE 32-col subtiles, see fmha_bwd_mfma.py).
+CASES_WIDE_D = [
+    (1,   64,  64,  1,  128, torch.bfloat16),
+    (1,  128, 128,  8,  128, torch.bfloat16),
+    (2,  256, 128,  8,  128, torch.bfloat16),
+    (1,  128, 128,  8,  128, torch.float16),
+    (1,   64,  64,  1,  256, torch.bfloat16),
+    (1,  128, 128,  8,  256, torch.bfloat16),
+    (2,  256, 128,  8,  256, torch.bfloat16),
+    (1,  128, 128,  8,  256, torch.float16),
+]
+
 
 @rocm_only
 @pytest.mark.parametrize("use_pipeline", [False, True])
 @pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
 def test_dq_mfma(B, M, N, H, D, dtype, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_WIDE_D)
+def test_dq_mfma_wide_d(B, M, N, H, D, dtype, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
 
 

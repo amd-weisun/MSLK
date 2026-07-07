@@ -22,6 +22,7 @@ except ImportError:
 
 from mslk.attention import fmha
 from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
+from mslk.attention.fmha import flydsl  # noqa: F401 -- binds fmha.flydsl attribute
 from mslk.attention.fmha.unbind import unbind
 
 from .case_generation import (
@@ -111,6 +112,11 @@ def test_backward(  # noqa: C901
         if op_bw != fmha.cutlass.BwOp
         else fmha.cutlass.FwOp
     )
+
+    if op_bw == fmha.flydsl.BwOp:
+        # FlyDSL has no forward kernel; pin to CK's (verified working on both
+        # gfx942 and gfx950). Mirrors the ck.BwOp carve-out immediately below.
+        op_fw = fmha.ck.FwOp
 
     if op_bw == fmha.ck.BwOp:
         op_fw = fmha.ck.FwOp

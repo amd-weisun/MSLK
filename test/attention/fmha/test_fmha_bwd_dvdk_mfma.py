@@ -42,7 +42,11 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
     dO = torch.randn_like(O)
     _, dK_ref, dV_ref = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=False)
 
-    BLOCK_M, BLOCK_N = 128, 64
+    # BLOCK_M=128's Q/dO/P/dS tiles exceed gfx950's 160KB LDS limit at D=256
+    # (measured 164KB vs 83KB at BLOCK_M=64) -- drop BLOCK_M there, same mitigation
+    # CK's own codegen uses (shrinks its M-tile at D>=128).
+    BLOCK_M = 64 if D >= 256 else 128
+    BLOCK_N = 64
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
 
     Q_2d   = _as_i16(Q.contiguous().view(B * M * H, D))
@@ -84,11 +88,31 @@ CASES = [
     (1,  256, 128,  8,  64,  torch.float16),
 ]
 
+# D=128/256 (sequencing-plan step 2, head-dim generalization -- D a multiple of 64;
+# each wave sequentially loops D_SUBS_PER_WAVE 32-col subtiles, see fmha_bwd_mfma.py).
+CASES_WIDE_D = [
+    (1,  128,  64,  1,  128, torch.bfloat16),
+    (1,  256, 128,  8,  128, torch.bfloat16),
+    (2,  512, 128,  8,  128, torch.bfloat16),
+    (1,  256, 128,  8,  128, torch.float16),
+    (1,  128,  64,  1,  256, torch.bfloat16),
+    (1,  256, 128,  8,  256, torch.bfloat16),
+    (2,  512, 128,  8,  256, torch.bfloat16),
+    (1,  256, 128,  8,  256, torch.float16),
+]
+
 
 @rocm_only
 @pytest.mark.parametrize("use_trload,use_pipeline", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("B,M,N,H,D,dtype", CASES)
 def test_dvdk_mfma(B, M, N, H, D, dtype, use_trload, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_trload=use_trload, use_pipeline=use_pipeline)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_trload,use_pipeline", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_WIDE_D)
+def test_dvdk_mfma_wide_d(B, M, N, H, D, dtype, use_trload, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_trload=use_trload, use_pipeline=use_pipeline)
 
 
