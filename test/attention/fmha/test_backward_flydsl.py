@@ -76,11 +76,14 @@ def test_backward_flydsl(  # noqa: C901
         kv,
     ) = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
 
-    # FlyDSL's kernel is not stride-aware; skip the qkv-fused-storage /
-    # non-contiguous path rather than falling back to a copy (see
-    # mslk/attention/fmha/flydsl.py docstring).
-    if not grad_out_contiguous:
-        pytest.skip("FlyDSL BwOp requires contiguous grad_out (no stride-aware addressing yet)")
+    # Sequencing-plan item 7 (stride-aware addressing): the kernel now
+    # supports the qkv-fused-storage / packed-qkv-unbind non-contiguous case
+    # (see mslk/attention/fmha/flydsl.py docstring) -- no skip needed here.
+    # Note: this test file's `grad_out` is always `torch.randn_like(out)`
+    # (contiguous) regardless of `grad_out_contiguous`; that flag only gates
+    # `test_backward.py`'s broadcast/expand dO variant, which this file does
+    # not build, so `not_supported_reasons`'s stride-0 rejection for `grad`
+    # is not exercised via this parametrization.
 
     attn_bias_requires_grad = (
         random.Random(q_len + kv_len * batch_size).randint(0, 1) > 0

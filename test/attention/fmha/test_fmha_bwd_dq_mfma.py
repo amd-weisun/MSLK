@@ -27,16 +27,30 @@ def _as_i16(t):
     return t.view(torch.int16)
 
 
-def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=False):
+def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=False, packed_qkv=False):
     tag = " [pipeline]" if use_pipeline else ""
     if causal:
         tag += " [causal]"
+    if packed_qkv:
+        tag += " [packed_qkv]"
     print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
+    if packed_qkv:
+        assert M == N, "packed_qkv requires Q and K/V to share seqlen (stacked on a shared dim)"
     scale = 1.0 / math.sqrt(D)
 
-    Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
-    K  = torch.randn(B, N, H, D, device=device, dtype=dtype)
-    V  = torch.randn(B, N, H, D, device=device, dtype=dtype)
+    if packed_qkv:
+        # Sequencing-plan item 7: qkv = stack([Q,K,V], dim=2), unbind -> non-contiguous
+        # Q/K/V views (row pitch 3*H*D instead of H*D), mirrors test_backward.py's
+        # dominant non-contiguous-BMHK case.
+        qkv = torch.stack(
+            [torch.randn(B, M, H, D, device=device, dtype=dtype) for _ in range(3)], dim=2
+        )
+        Q, K, V = qkv.unbind(2)
+        assert not Q.is_contiguous()
+    else:
+        Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
+        K  = torch.randn(B, N, H, D, device=device, dtype=dtype)
+        V  = torch.randn(B, N, H, D, device=device, dtype=dtype)
     O, LSE = ref_fmha_fwd(Q, K, V, scale=scale, causal=causal)
     dO = torch.randn_like(O)
     dQ_ref, _, _ = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=causal)
@@ -49,10 +63,13 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=Fal
     BLOCK_N = 32 if ("gfx950" not in gpu_arch and D >= 256) else 64
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
 
-    Q_2d   = _as_i16(Q.contiguous().view(B * M * H, D))
-    K_2d   = _as_i16(K.contiguous().view(B * N * H, D))
-    V_2d   = _as_i16(V.contiguous().view(B * N * H, D))
-    dO_2d  = _as_i16(dO.contiguous().view(B * M * H, D))
+    Q_4d  = _as_i16(Q)
+    K_4d  = _as_i16(K)
+    V_4d  = _as_i16(V)
+    dO_4d = _as_i16(dO.contiguous())
+    q_stride_m  = Q.stride(1) // D
+    kv_stride_n = K.stride(1) // D
+    do_stride_m = dO_4d.stride(1) // D
     LSE_2d = LSE.contiguous().view(B * H * M, 1)
     D_vec  = (dO.float() * O.float()).sum(dim=-1).contiguous().view(B * M * H, 1)
     dQ_out = torch.zeros(B * M * H * D, 1, device=device, dtype=torch.float32)
@@ -62,13 +79,11 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=Fal
                                           use_pipeline=use_pipeline,
                                           gpu_arch=gpu_arch, causal=causal)
     n_N_tiles = (N + BLOCK_N - 1) // BLOCK_N
-    compiled = flyc.compile(launch_fn,
-                            Q_2d, K_2d, V_2d, dO_2d, dQ_out, LSE_2d, D_vec,
-                            B, M, N, H, n_N_tiles,
-                            torch.cuda.current_stream())
-    compiled(Q_2d, K_2d, V_2d, dO_2d, dQ_out, LSE_2d, D_vec,
-             B, M, N, H, n_N_tiles,
-             torch.cuda.current_stream())
+    args = (Q_4d, K_4d, V_4d, dO_4d, dQ_out, LSE_2d, D_vec,
+            B, M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m,
+            torch.cuda.current_stream())
+    compiled = flyc.compile(launch_fn, *args)
+    compiled(*args)
     torch.cuda.synchronize()
 
     dQ_kernel = dQ_out.view(B, M, H, D).to(dtype)
@@ -131,6 +146,17 @@ CASES_CAUSAL = [
     (1,  128, 128,  8,  96,  torch.bfloat16),
 ]
 
+# Stride-aware addressing (sequencing-plan item 7) -- packed-qkv unbind view
+# (M==N required: Q/K/V share seqlen when stacked on a shared dim).
+CASES_PACKED_QKV = [
+    (1,  128, 128,  1,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  64,  torch.bfloat16),
+    (1,  128, 128,  8,  128, torch.bfloat16),
+    (1,  128, 128,  8,  32,  torch.bfloat16),
+    (1,  128, 128,  8,  96,  torch.bfloat16),
+    (1,  128, 128,  8,  64,  torch.float16),
+]
+
 
 @rocm_only
 @pytest.mark.parametrize("use_pipeline", [False, True])
@@ -158,6 +184,13 @@ def test_dq_mfma_odd_d(B, M, N, H, D, dtype, use_pipeline):
 @pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_CAUSAL)
 def test_dq_mfma_causal(B, M, N, H, D, dtype, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, causal=True)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_PACKED_QKV)
+def test_dq_mfma_packed_qkv(B, M, N, H, D, dtype, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, packed_qkv=True)
 
 
 if __name__ == "__main__":

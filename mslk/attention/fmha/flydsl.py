@@ -13,23 +13,44 @@ that judges CK's `ck.BwOp` — see `test/attention/fmha/test_backward_flydsl.py`
 Deliberately NOT added to `ALL_BW_OPS` in `mslk/attention/fmha/__init__.py`:
 this is opt-in coverage, not a general-purpose backend.
 
-Zero-copy constraint: the FlyDSL kernel hardcodes flat row-major addressing
-(`row = b*(M*H) + m*H + h`, see `fmha_bwd_mfma.py`) and is NOT stride-aware
-like CK's C++ op. We use `.view()` only — never `.contiguous()`/`.reshape()` —
-so a non-contiguous BMHK input raises rather than silently triggering a copy
-kernel (HBM round-trip). `not_supported_reasons()` below checks contiguity
-upfront so the test harness skips those cases instead of crashing. Giving the
-kernel the same stride-awareness as CK's C++ op is tracked separately
-(sequencing-plan item 7) and out of scope here.
+Stride-aware addressing (sequencing-plan item 7): the kernel supports Q/K/V/dO
+with a possibly-non-contiguous per-tensor row pitch — e.g. a packed-`qkv`
+tensor sliced/unbound into Q/K/V views (`test_backward.py`'s dominant
+non-contiguous case). The kernel still requires each tensor to be flat *within*
+a row (last dim D stride-1, H-axis stride exactly D — i.e. only the outer
+B/M-or-N row pitch may differ from the contiguous `H*D`); this is checked in
+`not_supported_reasons()` below. Real per-axis arbitrary strides (transposed H,
+non-unit D stride) remain unsupported — no known test case exercises that.
 """
 
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 
 from .attn_bias import LowerTriangularMask
 from .common import AttentionBwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
+
+
+def _uniform_row_pitch_reason(name: str, t: torch.Tensor) -> Optional[str]:
+    """Validate the "flat within a row, possibly-non-contiguous row pitch"
+    assumption the kernel's stride-aware addressing relies on (sequencing-plan
+    item 7): last dim (D) must be stride-1, and the H-axis must be flat
+    relative to D (stride(2) == D) — only the outer B/M(or N)-axis row pitch
+    may exceed the contiguous H*D. Returns a reason string if unsupported,
+    else None. A stride-0 (broadcast/expand) row pitch is explicitly rejected:
+    it would alias every row onto row 0 under our `row_pos * stride` formula.
+    """
+    D = t.shape[-1]
+    if t.stride(-1) != 1:
+        return f"{name}'s last dim (head_dim) must be stride-1"
+    if t.stride(-2) != D:
+        return f"{name}'s head axis must be flat relative to head_dim (stride(-2) == D)"
+    if t.stride(-3) % D != 0:
+        return f"{name}'s row pitch (stride(-3)) must be a multiple of head_dim"
+    if t.stride(-3) == 0:
+        return f"{name} has a broadcast (stride-0) row pitch, not supported"
+    return None
 
 
 @torch.library.custom_op(
@@ -63,13 +84,29 @@ def _flydsl_bwd(
     def _as_i16(t: torch.Tensor) -> torch.Tensor:
         return t.view(torch.int16)
 
-    # `.view()` only (never `.contiguous()`/`.reshape()`) — raises if the
-    # input isn't already contiguous in BMHK order, by design (see module
-    # docstring). `not_supported_reasons` skips those cases before we get here.
-    Q_2d = _as_i16(query).view(B * M * H, D)
-    K_2d = _as_i16(key).view(B * N * H, D)
-    V_2d = _as_i16(value).view(B * N * H, D)
-    dO_2d = _as_i16(grad).view(B * M * H, D)
+    # Stride-aware addressing (sequencing-plan item 7): Q/K/V/dO may have a
+    # non-contiguous row pitch (e.g. a packed-qkv unbind view, stride(1) > H*D)
+    # as long as they're flat within a row (stride(-1)==1, stride(2)==D — this
+    # is enforced for query/key/value by `not_supported_reasons` before we get
+    # here). `grad` isn't visible to `not_supported_reasons` (it's not part of
+    # `Inputs`), so validate it here -- this also catches the
+    # `grad_out_contiguous=False` broadcast/expand case CK itself doesn't
+    # support either (test_backward.py skips it for ckB).
+    grad_reason = _uniform_row_pitch_reason("grad", grad)
+    if grad_reason is not None:
+        raise NotImplementedError(grad_reason)
+
+    # Keep Q/K/V/dO 4D (never collapse (B,M,H,D) -> (B*M*H,D) via `.view()`,
+    # which would raise on exactly the non-contiguous case we now want to
+    # support) and pass the real row pitch (in row units, i.e. elem_stride //
+    # D) as a runtime kernel arg instead.
+    Q_4d = _as_i16(query)
+    K_4d = _as_i16(key)
+    V_4d = _as_i16(value)
+    dO_4d = _as_i16(grad)
+    q_stride_m = query.stride(1) // D
+    kv_stride_n = key.stride(1) // D
+    do_stride_m = grad.stride(1) // D
 
     # `lse` is [B, H, M] float32 (CK's FwOp convention); `out`/`grad` are BMHK.
     # These are plain elementwise/reduction ops producing fresh contiguous
@@ -114,8 +151,8 @@ def _flydsl_bwd(
     )
     n_M_tiles = (M + BLOCK_M_DVDK - 1) // BLOCK_M_DVDK
     args_dvdk = (
-        Q_2d, K_2d, V_2d, dO_2d, dV_out, dK_out, LSE_2d, D_vec,
-        B, M, N, H, n_M_tiles, stream,
+        Q_4d, K_4d, V_4d, dO_4d, dV_out, dK_out, LSE_2d, D_vec,
+        B, M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m, stream,
     )
     compiled_dvdk = flyc.compile(launch_dvdk, *args_dvdk)
     compiled_dvdk(*args_dvdk)
@@ -136,8 +173,8 @@ def _flydsl_bwd(
     )
     n_N_tiles = (N + BLOCK_N_DQ - 1) // BLOCK_N_DQ
     args_dq = (
-        Q_2d, K_2d, V_2d, dO_2d, dQ_out, LSE_2d, D_vec,
-        B, M, N, H, n_N_tiles, stream,
+        Q_4d, K_4d, V_4d, dO_4d, dQ_out, LSE_2d, D_vec,
+        B, M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m, stream,
     )
     compiled_dq = flyc.compile(launch_dq, *args_dq)
     compiled_dq(*args_dq)
@@ -202,11 +239,12 @@ class BwOp(AttentionBwOpBase):
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
         for name, t in (("query", d.query), ("key", d.key), ("value", d.value)):
-            if not t.is_contiguous():
-                reasons.append(
-                    f"{name} is not contiguous in BMHK order — FlyDSL kernel "
-                    "addressing is not stride-aware yet (sequencing-plan item 7)"
-                )
+            reason = _uniform_row_pitch_reason(name, t)
+            if reason is not None:
+                reasons.append(reason)
+        # K and V share a single kv_stride_n kernel arg -- reject if they differ.
+        if d.key.stride(1) != d.value.stride(1):
+            reasons.append("key and value must share the same row pitch (stride(1))")
         if d.query.shape[-1] % 32 != 0:
             reasons.append("head_dim must be a multiple of 32")
         return reasons

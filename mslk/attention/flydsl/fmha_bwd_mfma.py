@@ -849,10 +849,15 @@ def compile_fmha_bwd_dvdk_mfma(
     2x bug — same reason CK / Phase A keep dQ split).
 
     Returns:
-        launch_fn(Q, K, V, dO, dV, dK, LSE, D_vec, B, M, N, H, n_M_tiles, stream)
-          Q, K, V, dO : [B*seq*H, D]   int16
-          dV, dK      : [B*N*H*D, 1]   float32
+        launch_fn(Q, K, V, dO, dV, dK, LSE, D_vec, B, M, N, H, n_M_tiles,
+                  q_stride_m, kv_stride_n, stream)
+          Q, K, V, dO : [B*seq*H, D]   int16 (row pitch may exceed H*D -- see
+                        q_stride_m/kv_stride_n, sequencing-plan item 7)
+          dV, dK      : [B*N*H*D, 1]   float32 (always contiguous output)
           LSE, D_vec  : [B*H*M,1] / [B*M*H,1] float32
+          q_stride_m  : Q/dO row pitch in ROW units (real_elem_stride(dim=1) // D);
+                        H for contiguous BMHK.
+          kv_stride_n : K/V row pitch in ROW units, same convention.
     """
     import math as _pm
     if scale is None:
@@ -928,26 +933,32 @@ def compile_fmha_bwd_dvdk_mfma(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_bwd_dvdk_mfma_kernel(  # noqa: F811
-        Q:         fx.Tensor,
-        K:         fx.Tensor,
-        V:         fx.Tensor,
-        dO:        fx.Tensor,
-        dV:        fx.Tensor,
-        dK:        fx.Tensor,
-        LSE:       fx.Tensor,
-        D_vec:     fx.Tensor,
-        seq_M:     fx.Int32,
-        seq_N:     fx.Int32,
-        n_heads:   fx.Int32,
-        n_M_tiles: fx.Int32,
+        Q:           fx.Tensor,
+        K:           fx.Tensor,
+        V:           fx.Tensor,
+        dO:          fx.Tensor,
+        dV:          fx.Tensor,
+        dK:          fx.Tensor,
+        LSE:         fx.Tensor,
+        D_vec:       fx.Tensor,
+        seq_M:       fx.Int32,
+        seq_N:       fx.Int32,
+        n_heads:     fx.Int32,
+        n_M_tiles:   fx.Int32,
+        q_stride_m:  fx.Int32,
+        kv_stride_n: fx.Int32,
+        do_stride_m: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
-        n_heads_idx   = fx.Index(n_heads)
-        seq_M_idx     = fx.Index(seq_M)
-        seq_N_idx     = fx.Index(seq_N)
-        n_M_tiles_idx = fx.Index(n_M_tiles)
+        n_heads_idx     = fx.Index(n_heads)
+        seq_M_idx       = fx.Index(seq_M)
+        seq_N_idx       = fx.Index(seq_N)
+        n_M_tiles_idx   = fx.Index(n_M_tiles)
+        q_stride_m_idx  = fx.Index(q_stride_m)
+        kv_stride_n_idx = fx.Index(kv_stride_n)
+        do_stride_m_idx = fx.Index(do_stride_m)
         num_N_tiles   = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
 
         bid_idx   = fx.Index(bid)
@@ -985,17 +996,31 @@ def compile_fmha_bwd_dvdk_mfma(
         lds_lse = SmemPtr(base_ptr, lds_lse_off, fx.Float32.ir_type, shape=(LDS_LSE_ELEMS,)).get()
         lds_dm  = SmemPtr(base_ptr, lds_dm_off,  fx.Float32.ir_type, shape=(LDS_DM_ELEMS,)).get()
 
+        # Q/dO and K/V are possibly-non-contiguous user inputs (e.g. a packed-qkv
+        # unbind view) -- row pitch is q_stride_m_idx/kv_stride_n_idx (in row
+        # units, i.e. real_elem_stride // D), NOT necessarily n_heads_idx. dO can
+        # have a DIFFERENT row pitch than Q (e.g. Q comes from a qkv-unbind view
+        # but dO is a fresh contiguous torch.randn_like(out)) -- separate helper.
         def _q_row(q_pos):
-            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_M_idx * q_stride_m_idx) + q_pos * q_stride_m_idx + head_idx)
+
+        def _do_row(q_pos):
+            return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
 
         def _kv_row(kv_pos):
+            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + head_idx)
+
+        # dV/dK are freshly-allocated contiguous outputs -- always row pitch n_heads_idx.
+        def _kv_row_out(kv_pos):
             return fx.Int32(batch_idx * (seq_N_idx * n_heads_idx) + kv_pos * n_heads_idx + head_idx)
 
         def _lse_row(q_pos):
             return fx.Int32(bh_idx * seq_M_idx + q_pos)
 
+        # D_vec is a freshly-allocated contiguous tensor -- always row pitch n_heads_idx
+        # (never the possibly-non-contiguous q_stride_m_idx used by _q_row above).
         def _dvec_row(q_pos):
-            return _q_row(q_pos)
+            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
 
         from flydsl.expr import buffer_ops as _bops
         q_rsrc  = _bops.create_buffer_resource(Q)
@@ -1091,9 +1116,10 @@ def compile_fmha_bwd_dvdk_mfma(
                     m_valid_ld  = m_global_ld < seq_M_idx
                     m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
                     q_row_g     = _q_row(m_safe_ld)
+                    do_row_g    = _do_row(m_safe_ld)
                     col_off_ld  = cv_i * fx.Index(MFMA_LK)
                     q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
-                    do_vec = _load_global_vec_cv(do_rsrc, q_row_g, col_off_ld)
+                    do_vec = _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld)
                     lds_base = row_in_tile * LDS_Q_STRIDE + col_off_ld
                     Vec(q_vec).store(lds_q,  [lds_base])
                     Vec(do_vec).store(lds_do, [lds_base])
@@ -1104,10 +1130,11 @@ def compile_fmha_bwd_dvdk_mfma(
                     m_valid_ld  = m_global_ld < seq_M_idx
                     m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
                     q_row_g     = _q_row(m_safe_ld)
+                    do_row_g    = _do_row(m_safe_ld)
                     for cv in range_constexpr(VEC_COLS):
                         col_off_ld = fx.Index(cv * MFMA_LK)
                         q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
-                        do_vec = _load_global_vec_cv(do_rsrc, q_row_g, col_off_ld)
+                        do_vec = _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld)
                         lds_base = row_in_tile * LDS_Q_STRIDE + cv * MFMA_LK
                         Vec(q_vec).store(lds_q,  [lds_base])
                         Vec(do_vec).store(lds_do, [lds_base])
@@ -1256,7 +1283,7 @@ def compile_fmha_bwd_dvdk_mfma(
             n_row_abs = n_within + wave_n_sub * 32 + n_start
             n_ok      = n_row_abs < seq_N_idx
             n_safe    = n_ok.select(n_row_abs, seq_N_idx - fx.Index(1))
-            kv_row_g  = _kv_row(n_safe)
+            kv_row_g  = _kv_row_out(n_safe)
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
                 d_col_abs = lane_mod_32 + wave_d_sub_i * 32
@@ -1270,20 +1297,23 @@ def compile_fmha_bwd_dvdk_mfma(
 
     @flyc.jit
     def launch_fn(
-        Q:         fx.Tensor,
-        K:         fx.Tensor,
-        V:         fx.Tensor,
-        dO:        fx.Tensor,
-        dV:        fx.Tensor,
-        dK:        fx.Tensor,
-        LSE:       fx.Tensor,
-        D_vec:     fx.Tensor,
-        B:         fx.Int32,
-        M:         fx.Int32,
-        N:         fx.Int32,
-        H:         fx.Int32,
-        n_M_tiles: fx.Int32,
-        stream:    fx.Stream,
+        Q:           fx.Tensor,
+        K:           fx.Tensor,
+        V:           fx.Tensor,
+        dO:          fx.Tensor,
+        dV:          fx.Tensor,
+        dK:          fx.Tensor,
+        LSE:         fx.Tensor,
+        D_vec:       fx.Tensor,
+        B:           fx.Int32,
+        M:           fx.Int32,
+        N:           fx.Int32,
+        H:           fx.Int32,
+        n_M_tiles:   fx.Int32,
+        q_stride_m:  fx.Int32,
+        kv_stride_n: fx.Int32,
+        do_stride_m: fx.Int32,
+        stream:      fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext
         from flydsl._mlir import ir
@@ -1296,7 +1326,7 @@ def compile_fmha_bwd_dvdk_mfma(
         grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_N_tiles)
         fmha_bwd_dvdk_mfma_kernel(
             Q, K, V, dO, dV, dK, LSE, D_vec,
-            M, N, H, n_M_tiles,
+            M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),
@@ -1330,8 +1360,12 @@ def compile_fmha_bwd_dq_mfma(
     and accumulates over all N-tiles in registers -> no atomics.
 
     Returns:
-        launch_fn(Q, K, V, dO, dQ, LSE, D_vec, B, M, N, H, n_N_tiles, stream)
-          dQ : [B*M*H*D, 1] float32
+        launch_fn(Q, K, V, dO, dQ, LSE, D_vec, B, M, N, H, n_N_tiles,
+                  q_stride_m, kv_stride_n, stream)
+          dQ : [B*M*H*D, 1] float32 (always contiguous output)
+          q_stride_m/kv_stride_n: row pitch in ROW units (real_elem_stride(dim=1)
+            // D) for possibly-non-contiguous Q/dO and K/V inputs; H for
+            contiguous BMHK (sequencing-plan item 7).
     """
     import math as _pm
     if scale is None:
@@ -1375,25 +1409,31 @@ def compile_fmha_bwd_dq_mfma(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_bwd_dq_mfma_kernel(  # noqa: F811
-        Q:         fx.Tensor,
-        K:         fx.Tensor,
-        V:         fx.Tensor,
-        dO:        fx.Tensor,
-        dQ:        fx.Tensor,
-        LSE:       fx.Tensor,
-        D_vec:     fx.Tensor,
-        seq_M:     fx.Int32,
-        seq_N:     fx.Int32,
-        n_heads:   fx.Int32,
-        n_N_tiles: fx.Int32,
+        Q:           fx.Tensor,
+        K:           fx.Tensor,
+        V:           fx.Tensor,
+        dO:          fx.Tensor,
+        dQ:          fx.Tensor,
+        LSE:         fx.Tensor,
+        D_vec:       fx.Tensor,
+        seq_M:       fx.Int32,
+        seq_N:       fx.Int32,
+        n_heads:     fx.Int32,
+        n_N_tiles:   fx.Int32,
+        q_stride_m:  fx.Int32,
+        kv_stride_n: fx.Int32,
+        do_stride_m: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
-        n_heads_idx   = fx.Index(n_heads)
-        seq_M_idx     = fx.Index(seq_M)
-        seq_N_idx     = fx.Index(seq_N)
-        n_N_tiles_idx = fx.Index(n_N_tiles)
+        n_heads_idx     = fx.Index(n_heads)
+        seq_M_idx       = fx.Index(seq_M)
+        seq_N_idx       = fx.Index(seq_N)
+        n_N_tiles_idx   = fx.Index(n_N_tiles)
+        q_stride_m_idx  = fx.Index(q_stride_m)
+        kv_stride_n_idx = fx.Index(kv_stride_n)
+        do_stride_m_idx = fx.Index(do_stride_m)
         num_M_tiles   = (seq_M_idx + BLOCK_M - 1) // BLOCK_M
 
         bid_idx   = fx.Index(bid)
@@ -1427,17 +1467,29 @@ def compile_fmha_bwd_dq_mfma(
         lds_v  = SmemPtr(base_ptr, lds_v_off,  elem_dtype.ir_type, shape=(LDS_V_ELEMS,)).get()
         lds_ds = SmemPtr(base_ptr, lds_ds_off, elem_dtype.ir_type, shape=(LDS_DS_ELEMS,)).get()
 
+        # Q/dO and K/V are possibly-non-contiguous user inputs (e.g. a packed-qkv
+        # unbind view) -- row pitch is q_stride_m_idx/kv_stride_n_idx (in row
+        # units, i.e. real_elem_stride // D), NOT necessarily n_heads_idx. dO can
+        # have a DIFFERENT row pitch than Q -- separate helper.
         def _q_row(q_pos):
-            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_M_idx * q_stride_m_idx) + q_pos * q_stride_m_idx + head_idx)
+
+        def _do_row(q_pos):
+            return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
 
         def _kv_row(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * n_heads_idx) + kv_pos * n_heads_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + head_idx)
+
+        # dQ is a freshly-allocated contiguous output -- always row pitch n_heads_idx.
+        def _q_row_out(q_pos):
+            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
 
         def _lse_row(q_pos):
             return fx.Int32(bh_idx * seq_M_idx + q_pos)
 
+        # D_vec is a freshly-allocated contiguous tensor -- always row pitch n_heads_idx.
         def _dvec_row(q_pos):
-            return _q_row(q_pos)
+            return _q_row_out(q_pos)
 
         from flydsl.expr import buffer_ops as _bops
         q_rsrc  = _bops.create_buffer_resource(Q)
@@ -1485,14 +1537,15 @@ def compile_fmha_bwd_dq_mfma(
         m_row_abs_q = m_wave_base + lane_mod_32
         m_valid_q   = m_row_abs_q < seq_M_idx
         m_safe_q    = m_valid_q.select(m_row_abs_q, seq_M_idx - fx.Index(1))
-        q_row_g_pre = _q_row(m_safe_q)
+        q_row_g_pre  = _q_row(m_safe_q)
+        do_row_g_pre = _do_row(m_safe_q)
 
         q_packs  = []
         do_packs = []
         for ks in range_constexpr(K_STEPS):
             col_off = fx.Index(ks * MFMA_K) + lane_div_32 * MFMA_LK
             q_packs.append(_load_global_vec_cv(q_rsrc,  q_row_g_pre, col_off))
-            do_packs.append(_load_global_vec_cv(do_rsrc, q_row_g_pre, col_off))
+            do_packs.append(_load_global_vec_cv(do_rsrc, do_row_g_pre, col_off))
 
         # ---- Pre-load per-r LSE, D_vec, m-validity (m varies with r, const across N) ----
         lse_vals    = []
@@ -1646,7 +1699,7 @@ def compile_fmha_bwd_dq_mfma(
             m_row_abs = m_within + wave_m_sub * 32 + m_start
             m_ok      = m_row_abs < seq_M_idx
             m_safe    = m_ok.select(m_row_abs, seq_M_idx - fx.Index(1))
-            q_row_g   = _q_row(m_safe)
+            q_row_g   = _q_row_out(m_safe)
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
                 d_col_abs = lane_mod_32 + wave_d_sub_i * 32
@@ -1660,19 +1713,22 @@ def compile_fmha_bwd_dq_mfma(
 
     @flyc.jit
     def launch_fn(
-        Q:         fx.Tensor,
-        K:         fx.Tensor,
-        V:         fx.Tensor,
-        dO:        fx.Tensor,
-        dQ:        fx.Tensor,
-        LSE:       fx.Tensor,
-        D_vec:     fx.Tensor,
-        B:         fx.Int32,
-        M:         fx.Int32,
-        N:         fx.Int32,
-        H:         fx.Int32,
-        n_N_tiles: fx.Int32,
-        stream:    fx.Stream,
+        Q:           fx.Tensor,
+        K:           fx.Tensor,
+        V:           fx.Tensor,
+        dO:          fx.Tensor,
+        dQ:          fx.Tensor,
+        LSE:         fx.Tensor,
+        D_vec:       fx.Tensor,
+        B:           fx.Int32,
+        M:           fx.Int32,
+        N:           fx.Int32,
+        H:           fx.Int32,
+        n_N_tiles:   fx.Int32,
+        q_stride_m:  fx.Int32,
+        kv_stride_n: fx.Int32,
+        do_stride_m: fx.Int32,
+        stream:      fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext
         from flydsl._mlir import ir
@@ -1685,7 +1741,7 @@ def compile_fmha_bwd_dq_mfma(
         grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_M_tiles)
         fmha_bwd_dq_mfma_kernel(
             Q, K, V, dO, dQ, LSE, D_vec,
-            M, N, H, n_N_tiles,
+            M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),
