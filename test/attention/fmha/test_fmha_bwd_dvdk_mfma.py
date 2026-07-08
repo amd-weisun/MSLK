@@ -101,8 +101,10 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
                                             heads_per_kv=H // Hkv,
                                             gpu_arch=gpu_arch, causal=causal)
     n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
+    _dummy_seqstart = torch.zeros(1, device=device, dtype=torch.int32)
     args = (Q_4d, K_4d, V_4d, dO_4d, dV_out, dK_out, LSE_2d, D_vec,
             B, M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m,
+            _dummy_seqstart, _dummy_seqstart, M,
             torch.cuda.current_stream())
     compiled = flyc.compile(launch_fn, *args)
     compiled(*args)
@@ -232,6 +234,150 @@ def test_dvdk_mfma_packed_qkv(B, M, N, H, D, dtype, use_pipeline):
 @pytest.mark.parametrize("B,M,N,H,D,dtype,H_kv", CASES_GQA)
 def test_dvdk_mfma_gqa(B, M, N, H, D, dtype, H_kv, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, H_kv=H_kv)
+
+
+def run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda", use_pipeline=False,
+                     causal=False):
+    """Sequencing-plan item 6: BlockDiagonalMask-style varlen (Stage B1 non-causal,
+    Stage B2 causal -- BlockDiagonalCausalMask, per-block top-left causal).
+
+    Builds B_logical batches of DIFFERENT seqlens, packs them along the M/N axis
+    (B collapses to 1, matching BlockDiagonalMask's actual tensor layout -- no
+    FlyDSL-specific reshaping here, plain per-batch construction + concatenation),
+    and compares the packed kernel output against per-batch reference calls.
+    """
+    assert len(seqlens_q) == len(seqlens_k)
+    B_logical = len(seqlens_q)
+    tag = " [pipeline]" if use_pipeline else ""
+    if causal:
+        tag += " [causal]"
+    print(f"  varlen B={B_logical} seqlens_q={seqlens_q} seqlens_k={seqlens_k} "
+          f"H={H} D={D} dtype={dtype}{tag} ... ", end="", flush=True)
+    scale = 1.0 / math.sqrt(D)
+
+    Qs, Ks, Vs, Os, LSEs, dOs = [], [], [], [], [], []
+    dK_refs, dV_refs = [], []
+    for m, n in zip(seqlens_q, seqlens_k):
+        q = torch.randn(1, m, H, D, device=device, dtype=dtype)
+        k = torch.randn(1, n, H, D, device=device, dtype=dtype)
+        v = torch.randn(1, n, H, D, device=device, dtype=dtype)
+        o, lse = ref_fmha_fwd(q, k, v, scale=scale, causal=causal)
+        do = torch.randn_like(o)
+        _, dk_ref, dv_ref = ref_fmha_bwd(q, k, v, o, do, lse, scale=scale, causal=causal)
+        Qs.append(q); Ks.append(k); Vs.append(v); Os.append(o); LSEs.append(lse); dOs.append(do)
+        dK_refs.append(dk_ref); dV_refs.append(dv_ref)
+
+    total_m = sum(seqlens_q)
+    total_n = sum(seqlens_k)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    # Pack along the M/N axis: (1, sum_M, H, D) -- matches BlockDiagonalMask's
+    # actual tensor shape (B_logical collapses to 1 in the physical tensor).
+    Q = torch.cat(Qs, dim=1)
+    K = torch.cat(Ks, dim=1)
+    V = torch.cat(Vs, dim=1)
+    dO = torch.cat(dOs, dim=1)
+    # LSE packed [1, H, sum_M] (CK's VARLEN_LSE_PACKED=True convention, see
+    # flydsl.py/fmha_bwd_mfma.py module docstrings) -- cat along the M axis.
+    LSE = torch.cat(LSEs, dim=2)
+    D_vec = torch.cat(
+        [(do.float() * o.float()).sum(dim=-1) for do, o in zip(dOs, Os)], dim=1
+    ).contiguous().view(total_m * H, 1)
+
+    seqstart_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()), device=device, dtype=torch.int32
+    )
+    seqstart_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()), device=device, dtype=torch.int32
+    )
+
+    gpu_arch = torch.cuda.get_device_properties(device).gcnArchName
+    if "gfx950" in gpu_arch:
+        BLOCK_M = 64 if D >= 256 else 128
+    else:
+        BLOCK_M = 32 if D >= 256 else 64
+    BLOCK_N = 64
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+
+    Q_4d = _as_i16(Q)
+    K_4d = _as_i16(K)
+    V_4d = _as_i16(V)
+    dO_4d = _as_i16(dO.contiguous())
+    q_stride_m = Q.stride(1) // D
+    kv_stride_n = K.stride(1) // D
+    do_stride_m = dO_4d.stride(1) // D
+    LSE_2d = LSE.contiguous().view(H * total_m, 1)
+    dV_out = torch.zeros(total_n * H * D, 1, device=device, dtype=torch.float32)
+    dK_out = torch.zeros(total_n * H * D, 1, device=device, dtype=torch.float32)
+
+    launch_fn = compile_fmha_bwd_dvdk_mfma(
+        D=D, dtype_str=dtype_str, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
+        use_pipeline=use_pipeline, gpu_arch=gpu_arch, causal=causal, varlen=True,
+    )
+    n_M_tiles = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
+    args = (
+        Q_4d, K_4d, V_4d, dO_4d, dV_out, dK_out, LSE_2d, D_vec,
+        B_logical, max_seqlen_q, max_seqlen_k, H, n_M_tiles,
+        q_stride_m, kv_stride_n, do_stride_m,
+        seqstart_q, seqstart_k, total_m,
+        torch.cuda.current_stream(),
+    )
+    compiled = flyc.compile(launch_fn, *args)
+    compiled(*args)
+    torch.cuda.synchronize()
+
+    dV_k = dV_out.view(1, total_n, H, D).to(dtype)
+    dK_k = dK_out.view(1, total_n, H, D).to(dtype)
+    dV_ref = torch.cat(dV_refs, dim=1)
+    dK_ref = torch.cat(dK_refs, dim=1)
+    err_v = (dV_k.float() - dV_ref.float()).abs().max().item()
+    err_k = (dK_k.float() - dK_ref.float()).abs().max().item()
+    ok_v = torch.allclose(dV_k.float(), dV_ref.float(), rtol=0.1, atol=0.1)
+    ok_k = torch.allclose(dK_k.float(), dK_ref.float(), rtol=0.1, atol=0.1)
+    ok = ok_v and ok_k
+    print(f"{'PASS' if ok else 'FAIL'}  dV_err={err_v:.5f} dK_err={err_k:.5f}")
+    return ok
+
+
+# Varlen / group-mode (sequencing-plan item 6, Stage B1) -- non-causal
+# BlockDiagonalMask only, hand-picked small seqlen sets before broadening.
+CASES_VARLEN = [
+    ([64, 128, 32], [64, 128, 32], 1, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 64, torch.bfloat16),
+    ([100, 50, 200], [100, 50, 200], 8, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 128, torch.bfloat16),
+]
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("seqlens_q,seqlens_k,H,D,dtype", CASES_VARLEN)
+def test_dvdk_mfma_varlen(seqlens_q, seqlens_k, H, D, dtype, use_pipeline):
+    assert run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
+
+
+# Varlen + causal (sequencing-plan item 6, Stage B2) -- BlockDiagonalCausalMask,
+# per-block top-left causal (Mq_i == Mk_i per batch, same constraint as simple
+# causal). Design hypothesis: the existing `n_row_abs <= m_row_abs` causal term
+# is ALREADY batch-tile-relative (never seqstart-offset), so no kernel-body
+# change is expected here beyond enabling causal=True + varlen=True together --
+# see the plan file for the full reasoning. These cases exist to VERIFY that on
+# real hardware, not assume it.
+CASES_VARLEN_CAUSAL = [
+    ([64, 128, 32], [64, 128, 32], 1, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 64, torch.bfloat16),
+    ([100, 50, 200], [100, 50, 200], 8, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 128, torch.bfloat16),
+]
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("seqlens_q,seqlens_k,H,D,dtype", CASES_VARLEN_CAUSAL)
+def test_dvdk_mfma_varlen_causal(seqlens_q, seqlens_k, H, D, dtype, use_pipeline):
+    assert run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda",
+                            use_pipeline=use_pipeline, causal=True)
 
 
 if __name__ == "__main__":

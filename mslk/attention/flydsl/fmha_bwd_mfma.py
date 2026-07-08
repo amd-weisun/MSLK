@@ -831,6 +831,7 @@ def compile_fmha_bwd_dvdk_mfma(
     gpu_arch: str = "gfx950",
     causal: bool = False,
     heads_per_kv: int = 1,
+    varlen: bool = False,
 ):
     """Phase B.4: FUSED dV + dK with MFMA (matches CK's dV/dK fusion).
 
@@ -861,6 +862,23 @@ def compile_fmha_bwd_dvdk_mfma(
     loop below. heads_per_kv==1 (default, non-GQA) degenerates to exactly the
     original per-head-unique behavior (loop trivially runs once).
 
+    varlen (sequencing-plan item 6, Stage B1, non-causal `BlockDiagonalMask`
+    only): B collapses to 1 (all batches' Q/K/V physically concatenated along
+    the M/N axis with no padding); grid_x is sized off `max_seqlen_k` (a host
+    constant, like non-varlen's `N`) instead of per-tensor `N`, so trip counts
+    stay host-computed -- NO scf-level control-flow change (FlyDSL's kernel
+    DSL has no early-return; reusing the existing "compute a possibly-garbage
+    result, discard via bounds-check + guarded store" pattern already used for
+    D=32/96 remainder tiles, rather than restructuring into a big `if` block).
+    Two new runtime `fx.Tensor` params, `seqstart_q`/`seqstart_k` (int32,
+    shape `[B_logical+1]`, cumulative offsets), are buffer-loaded once per
+    block to get `this_seqlen_k = seqstart_k[batch_idx+1] - seqstart_k[batch_idx]`
+    (replaces the global `seq_N_idx` bound in N-tile masking) and
+    `k_start = seqstart_k[batch_idx]` (replaces `batch_idx * seq_N_idx` in
+    `_kv_row`'s row-offset base; ditto `q_start`/`seqstart_q` for `_q_row`/
+    `_do_row`/output rows). `seq_M`/`seq_N` (now `max_seqlen_q`/`max_seqlen_k`
+    when `varlen=True`) still size the grid/LDS/loop trip-counts uniformly.
+
     Returns:
         launch_fn(Q, K, V, dO, dV, dK, LSE, D_vec, B, M, N, H, n_M_tiles,
                   q_stride_m, kv_stride_n, stream)
@@ -874,6 +892,8 @@ def compile_fmha_bwd_dvdk_mfma(
           kv_stride_n : K/V row pitch in ROW units, same convention.
           H           : total Q head count (Hq); Hkv is derived as H //
                         heads_per_kv (compile-time), not passed separately.
+          seqstart_q/seqstart_k : (varlen=True only) int32 [B_logical+1] cumulative
+                        offset tensors; M/N become max_seqlen_q/max_seqlen_k.
     """
     import math as _pm
     if scale is None:
@@ -964,6 +984,9 @@ def compile_fmha_bwd_dvdk_mfma(
         q_stride_m:  fx.Int32,
         kv_stride_n: fx.Int32,
         do_stride_m: fx.Int32,
+        seqstart_q:  fx.Tensor,
+        seqstart_k:  fx.Tensor,
+        total_m:     fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -975,6 +998,10 @@ def compile_fmha_bwd_dvdk_mfma(
         q_stride_m_idx  = fx.Index(q_stride_m)
         kv_stride_n_idx = fx.Index(kv_stride_n)
         do_stride_m_idx = fx.Index(do_stride_m)
+        # varlen (Stage B1): LSE/D_vec are packed over the TOTAL (sum-over-batches)
+        # M length, NOT seq_M_idx (which is max_seqlen_q here, used only for
+        # grid/loop sizing) -- see the module docstring. Non-varlen: total_m == seq_M.
+        total_m_idx     = fx.Index(total_m)
         num_N_tiles   = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
         # GQA (sequencing-plan item 4): grid is regrouped by KV-head (see
         # module docstring) -- n_kv_heads_idx = Hq // heads_per_kv (compile-time
@@ -989,6 +1016,29 @@ def compile_fmha_bwd_dvdk_mfma(
         kv_head_idx = bh_idx % n_kv_heads_idx
 
         n_start = n_tile * BLOCK_N
+
+        # varlen (Stage B1): q_start/k_start (packed-M/N row-offset bases) and
+        # this_seqlen_q/this_seqlen_k (per-batch REAL length, for masking) come
+        # from a runtime seqstart lookup instead of a globally-uniform
+        # batch_idx*seq_len_idx/seq_len_idx -- see module docstring. Non-varlen:
+        # these reduce to exactly the original formulas (B_logical==1-style).
+        if const_expr(varlen):
+            from flydsl.expr import buffer_ops as _seq_bops
+            seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
+            seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
+
+            def _seqstart_load(rsrc, idx):
+                return fx.Index(_seq_bops.buffer_load(rsrc, fx.Index(idx), vec_width=1, dtype=fx.Int32))
+
+            q_start = _seqstart_load(seqstart_q_rsrc, batch_idx)
+            k_start = _seqstart_load(seqstart_k_rsrc, batch_idx)
+            this_seqlen_q = _seqstart_load(seqstart_q_rsrc, batch_idx + 1) - q_start
+            this_seqlen_k = _seqstart_load(seqstart_k_rsrc, batch_idx + 1) - k_start
+        else:
+            q_start = batch_idx * seq_M_idx
+            k_start = batch_idx * seq_N_idx
+            this_seqlen_q = seq_M_idx
+            this_seqlen_k = seq_N_idx
 
         wave        = fx.Index(tid // WARP_SIZE)
         lane        = fx.Index(tid % WARP_SIZE)
@@ -1025,29 +1075,43 @@ def compile_fmha_bwd_dvdk_mfma(
         # GQA (sequencing-plan item 4): this block's Q-side rows vary across the
         # `heads_per_kv` group (see the q_head_in_group loop below), so head_idx
         # is now an explicit param rather than a fixed block-wide closure value.
+        # varlen: q_start/k_start replace batch_idx*seq_len_idx as the row-offset
+        # base -- q_pos/kv_pos are still batch-LOCAL positions (0..this_seqlen-1),
+        # added to the packed-global start before multiplying by the row stride.
         def _q_row(q_pos, head_idx):
-            return fx.Int32(batch_idx * (seq_M_idx * q_stride_m_idx) + q_pos * q_stride_m_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * q_stride_m_idx + head_idx)
 
         def _do_row(q_pos, head_idx):
-            return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * do_stride_m_idx + head_idx)
 
         # K/V are indexed by kv_head_idx (fixed for the whole block -- GQA's
         # grid-regroup-by-KV-head, see module docstring), NOT a per-q-head value.
         def _kv_row(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + kv_head_idx)
+            return fx.Int32((k_start + kv_pos) * kv_stride_n_idx + kv_head_idx)
 
         # dV/dK are freshly-allocated contiguous outputs, shaped [B,N,Hkv,D] --
         # row pitch n_kv_heads_idx, indexed by kv_head_idx (one write per block).
+        # Packed the SAME way as K/V's own N axis (varlen: k_start-relative).
         def _kv_row_out(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * n_kv_heads_idx) + kv_pos * n_kv_heads_idx + kv_head_idx)
+            return fx.Int32((k_start + kv_pos) * n_kv_heads_idx + kv_head_idx)
 
+        # LSE layout is [B,H,M] (batch-major, non-varlen) vs packed [1,H,sum_M]
+        # under varlen (B collapses to 1 in the actual tensor -- CK's
+        # VARLEN_LSE_PACKED=True convention). These are NOT unifiable via a
+        # single q_start-relative formula like the row helpers above, because
+        # the head-axis stride differs: seq_M_idx (non-varlen) vs total_m_idx
+        # (varlen, since M is the FULL packed extent, not this batch's slice).
         def _lse_row(q_pos, head_idx):
+            if const_expr(varlen):
+                return fx.Int32(head_idx * total_m_idx + q_start + q_pos)
             return fx.Int32((batch_idx * n_heads_idx + head_idx) * seq_M_idx + q_pos)
 
-        # D_vec is a freshly-allocated contiguous tensor -- always row pitch n_heads_idx
-        # (never the possibly-non-contiguous q_stride_m_idx used by _q_row above).
+        # D_vec is a freshly-allocated contiguous tensor computed by flydsl.py
+        # itself (BMHK row-major, H the fastest-varying non-D axis) -- q_start
+        # already unifies both cases (see _q_row above) since D_vec's row pitch
+        # is always n_heads_idx regardless of varlen/non-varlen.
         def _dvec_row(q_pos, head_idx):
-            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
 
         from flydsl.expr import buffer_ops as _bops
         q_rsrc  = _bops.create_buffer_resource(Q)
@@ -1097,10 +1161,13 @@ def compile_fmha_bwd_dvdk_mfma(
             return rocdl.mfma_f32_32x32x8f16(v16f32_type, [a_pack, b_pack, c_acc])
 
         # ---- Pre-load K and V packs for this wave's N sub-tile ----
+        # Bounds against this_seqlen_k (this batch's REAL length, varlen) rather
+        # than seq_N_idx (max_seqlen_k, used only for grid/loop sizing) -- see
+        # module docstring. Non-varlen: this_seqlen_k == seq_N_idx, unchanged.
         n_global_wave_base = n_start + wave_n_sub * 32
         n_row_abs_kv = n_global_wave_base + lane_mod_32
-        n_valid_kv   = n_row_abs_kv < seq_N_idx
-        n_safe_kv    = n_valid_kv.select(n_row_abs_kv, seq_N_idx - fx.Index(1))
+        n_valid_kv   = n_row_abs_kv < this_seqlen_k
+        n_safe_kv    = n_valid_kv.select(n_row_abs_kv, this_seqlen_k - fx.Index(1))
         kv_row_g_pre = _kv_row(n_safe_kv)
 
         k_packs = []
@@ -1150,8 +1217,8 @@ def compile_fmha_bwd_dvdk_mfma(
                         cv_i        = item % fx.Index(VEC_COLS)
                         row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
                         m_global_ld = m_start + row_in_tile
-                        m_valid_ld  = m_global_ld < seq_M_idx
-                        m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                        m_valid_ld  = m_global_ld < this_seqlen_q
+                        m_safe_ld   = m_valid_ld.select(m_global_ld, this_seqlen_q - fx.Index(1))
                         q_row_g     = _q_row(m_safe_ld, head_idx)
                         do_row_g    = _do_row(m_safe_ld, head_idx)
                         col_off_ld  = cv_i * fx.Index(MFMA_LK)
@@ -1164,8 +1231,8 @@ def compile_fmha_bwd_dvdk_mfma(
                     for row_off in range_constexpr(ROWS_PER_WAVE_LD):
                         row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
                         m_global_ld = m_start + row_in_tile
-                        m_valid_ld  = m_global_ld < seq_M_idx
-                        m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                        m_valid_ld  = m_global_ld < this_seqlen_q
+                        m_safe_ld   = m_valid_ld.select(m_global_ld, this_seqlen_q - fx.Index(1))
                         q_row_g     = _q_row(m_safe_ld, head_idx)
                         do_row_g    = _do_row(m_safe_ld, head_idx)
                         for cv in range_constexpr(VEC_COLS):
@@ -1180,8 +1247,8 @@ def compile_fmha_bwd_dvdk_mfma(
                 tid_idx = fx.Index(tid)
                 if tid_idx < fx.Index(BLOCK_M):
                     m_g_ls   = m_start + tid_idx
-                    m_ok_ls  = m_g_ls < seq_M_idx
-                    m_sf_ls  = m_ok_ls.select(m_g_ls, seq_M_idx - fx.Index(1))
+                    m_ok_ls  = m_g_ls < this_seqlen_q
+                    m_sf_ls  = m_ok_ls.select(m_g_ls, this_seqlen_q - fx.Index(1))
                     lse_g    = _load_f32_row(LSE_buf,  _lse_row(m_sf_ls, head_idx))
                     dm_g     = _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls, head_idx))
                     Vec.from_elements([lse_g], fx.Float32).store(lds_lse, [tid_idx])
@@ -1205,11 +1272,11 @@ def compile_fmha_bwd_dvdk_mfma(
                     # ---- P (for dV) and dS (for dK), both stored to LDS[m,n] ----
                     n_within  = lane_mod_32
                     n_row_abs = n_within + wave_n_sub * 32 + n_start
-                    n_ok      = n_row_abs < seq_N_idx
+                    n_ok      = n_row_abs < this_seqlen_k
                     for r in range_constexpr(16):
                         m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
                         m_row_abs = m_within + (m_sub * 32) + m_start
-                        m_valid   = m_row_abs < seq_M_idx
+                        m_valid   = m_row_abs < this_seqlen_q
                         m_local_f = m_within + (m_sub * 32)
                         lse_val   = Vec.load(Vec.make_type(1, fx.Float32), lds_lse, [m_local_f])[0]
                         dm_val    = Vec.load(Vec.make_type(1, fx.Float32), lds_dm,  [m_local_f])[0]
@@ -1318,8 +1385,8 @@ def compile_fmha_bwd_dvdk_mfma(
         for r in range_constexpr(16):
             n_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             n_row_abs = n_within + wave_n_sub * 32 + n_start
-            n_ok      = n_row_abs < seq_N_idx
-            n_safe    = n_ok.select(n_row_abs, seq_N_idx - fx.Index(1))
+            n_ok      = n_row_abs < this_seqlen_k
+            n_safe    = n_ok.select(n_row_abs, this_seqlen_k - fx.Index(1))
             kv_row_g  = _kv_row_out(n_safe)
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
@@ -1350,6 +1417,9 @@ def compile_fmha_bwd_dvdk_mfma(
         q_stride_m:  fx.Int32,
         kv_stride_n: fx.Int32,
         do_stride_m: fx.Int32,
+        seqstart_q:  fx.Tensor,
+        seqstart_k:  fx.Tensor,
+        total_m:     fx.Int32,
         stream:      fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext
@@ -1367,6 +1437,7 @@ def compile_fmha_bwd_dvdk_mfma(
         fmha_bwd_dvdk_mfma_kernel(
             Q, K, V, dO, dV, dK, LSE, D_vec,
             M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m,
+            seqstart_q, seqstart_k, total_m,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),
@@ -1387,6 +1458,7 @@ def compile_fmha_bwd_dq_mfma(
     gpu_arch: str = "gfx950",
     causal: bool = False,
     heads_per_kv: int = 1,
+    varlen: bool = False,
 ):
     """Phase B.3: dQ with MFMA. Grid over M-tiles, runtime loop over N-tiles.
 
@@ -1411,6 +1483,11 @@ def compile_fmha_bwd_dq_mfma(
             -- H // Hkv, 1 if not GQA. K/V are indexed by kv_head_idx = head_idx //
             heads_per_kv; dQ output stays uniquely addressed by head_idx (Hq-indexed),
             so no accumulation change is needed here (unlike dvdk's dV/dK).
+          varlen (sequencing-plan item 6, Stage B1, non-causal only): mirrors
+            compile_fmha_bwd_dvdk_mfma's `varlen` -- see that docstring for the
+            full design (no scf-control-flow change; per-batch runtime seqlen/
+            seqstart replace the global uniform bound/offset in masking and row
+            addressing; two new `fx.Tensor` params, `seqstart_q`/`seqstart_k`).
     """
     import math as _pm
     if scale is None:
@@ -1468,6 +1545,9 @@ def compile_fmha_bwd_dq_mfma(
         q_stride_m:  fx.Int32,
         kv_stride_n: fx.Int32,
         do_stride_m: fx.Int32,
+        seqstart_q:  fx.Tensor,
+        seqstart_k:  fx.Tensor,
+        total_m:     fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -1479,6 +1559,9 @@ def compile_fmha_bwd_dq_mfma(
         q_stride_m_idx  = fx.Index(q_stride_m)
         kv_stride_n_idx = fx.Index(kv_stride_n)
         do_stride_m_idx = fx.Index(do_stride_m)
+        # varlen (Stage B1): see compile_fmha_bwd_dvdk_mfma for total_m_idx's role
+        # (LSE/D_vec packed row pitch, distinct from seq_M_idx == max_seqlen_q).
+        total_m_idx     = fx.Index(total_m)
         num_M_tiles   = (seq_M_idx + BLOCK_M - 1) // BLOCK_M
 
         bid_idx   = fx.Index(bid)
@@ -1492,6 +1575,28 @@ def compile_fmha_bwd_dq_mfma(
         kv_head_idx = head_idx // heads_per_kv
 
         m_start = m_tile * BLOCK_M
+
+        # varlen (Stage B1): see compile_fmha_bwd_dvdk_mfma for the full design --
+        # q_start/k_start (packed-row-offset bases) and this_seqlen_q/this_seqlen_k
+        # (per-batch REAL length, for masking) replace the globally-uniform
+        # batch_idx*seq_len_idx/seq_len_idx. Non-varlen: reduces to the original.
+        if const_expr(varlen):
+            from flydsl.expr import buffer_ops as _seq_bops
+            seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
+            seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
+
+            def _seqstart_load(rsrc, idx):
+                return fx.Index(_seq_bops.buffer_load(rsrc, fx.Index(idx), vec_width=1, dtype=fx.Int32))
+
+            q_start = _seqstart_load(seqstart_q_rsrc, batch_idx)
+            k_start = _seqstart_load(seqstart_k_rsrc, batch_idx)
+            this_seqlen_q = _seqstart_load(seqstart_q_rsrc, batch_idx + 1) - q_start
+            this_seqlen_k = _seqstart_load(seqstart_k_rsrc, batch_idx + 1) - k_start
+        else:
+            q_start = batch_idx * seq_M_idx
+            k_start = batch_idx * seq_N_idx
+            this_seqlen_q = seq_M_idx
+            this_seqlen_k = seq_N_idx
 
         wave        = fx.Index(tid // WARP_SIZE)
         lane        = fx.Index(tid % WARP_SIZE)
@@ -1519,24 +1624,34 @@ def compile_fmha_bwd_dq_mfma(
         # Q/dO and K/V are possibly-non-contiguous user inputs (e.g. a packed-qkv
         # unbind view) -- row pitch is q_stride_m_idx/kv_stride_n_idx (in row
         # units, i.e. real_elem_stride // D), NOT necessarily n_heads_idx. dO can
-        # have a DIFFERENT row pitch than Q -- separate helper.
+        # have a DIFFERENT row pitch than Q -- separate helper. varlen: q_start/
+        # k_start (packed-row-offset bases) replace batch_idx*seq_len_idx -- see
+        # compile_fmha_bwd_dvdk_mfma for the full design.
         def _q_row(q_pos):
-            return fx.Int32(batch_idx * (seq_M_idx * q_stride_m_idx) + q_pos * q_stride_m_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * q_stride_m_idx + head_idx)
 
         def _do_row(q_pos):
-            return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * do_stride_m_idx + head_idx)
 
         # GQA: K/V are indexed by kv_head_idx (= head_idx // heads_per_kv), not
         # head_idx -- multiple Q heads share one KV head. kv_stride_n_idx is K/V's
         # own row pitch (in row units), unaffected by GQA head-count.
         def _kv_row(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + kv_head_idx)
+            return fx.Int32((k_start + kv_pos) * kv_stride_n_idx + kv_head_idx)
 
         # dQ is a freshly-allocated contiguous output -- always row pitch n_heads_idx.
         def _q_row_out(q_pos):
-            return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
+            return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
 
+        # LSE layout is [B,H,M] (non-varlen) vs packed [1,H,sum_M] (varlen, CK's
+        # VARLEN_LSE_PACKED=True convention) -- NOT unifiable via a single
+        # q_start-relative formula since the head-axis stride differs (seq_M_idx
+        # vs total_m_idx); see compile_fmha_bwd_dvdk_mfma's _lse_row for the
+        # matching non-varlen-branch derivation (bh_idx*seq_M_idx == (batch_idx*
+        # n_heads_idx+head_idx)*seq_M_idx here since bh_idx already folds both).
         def _lse_row(q_pos):
+            if const_expr(varlen):
+                return fx.Int32(head_idx * total_m_idx + q_start + q_pos)
             return fx.Int32(bh_idx * seq_M_idx + q_pos)
 
         # D_vec is a freshly-allocated contiguous tensor -- always row pitch n_heads_idx.
@@ -1587,8 +1702,8 @@ def compile_fmha_bwd_dq_mfma(
         # A-operand of S=Q@K^T and dP=dO@V^T: free=m=wave_m_sub*32+lane%32, contract=d.
         m_wave_base = m_start + wave_m_sub * 32
         m_row_abs_q = m_wave_base + lane_mod_32
-        m_valid_q   = m_row_abs_q < seq_M_idx
-        m_safe_q    = m_valid_q.select(m_row_abs_q, seq_M_idx - fx.Index(1))
+        m_valid_q   = m_row_abs_q < this_seqlen_q
+        m_safe_q    = m_valid_q.select(m_row_abs_q, this_seqlen_q - fx.Index(1))
         q_row_g_pre  = _q_row(m_safe_q)
         do_row_g_pre = _do_row(m_safe_q)
 
@@ -1607,8 +1722,8 @@ def compile_fmha_bwd_dq_mfma(
         for r in range_constexpr(16):
             m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             m_row_abs = m_within + wave_m_sub * 32 + m_start
-            m_valid   = m_row_abs < seq_M_idx
-            m_safe    = m_valid.select(m_row_abs, seq_M_idx - fx.Index(1))
+            m_valid   = m_row_abs < this_seqlen_q
+            m_safe    = m_valid.select(m_row_abs, this_seqlen_q - fx.Index(1))
             lse_vals.append(_load_f32_row(LSE_buf, _lse_row(m_safe)))
             dvec_vals.append(_load_f32_row(Dvec_buf, _dvec_row(m_safe)))
             m_valids.append(m_valid)
@@ -1647,8 +1762,8 @@ def compile_fmha_bwd_dq_mfma(
                     cv_i        = item_s % fx.Index(VEC_COLS)
                     row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
                     n_global_ld = n_start + row_in_tile
-                    n_valid_ld  = n_global_ld < seq_N_idx
-                    n_safe_ld   = n_valid_ld.select(n_global_ld, seq_N_idx - fx.Index(1))
+                    n_valid_ld  = n_global_ld < this_seqlen_k
+                    n_safe_ld   = n_valid_ld.select(n_global_ld, this_seqlen_k - fx.Index(1))
                     kv_row_g    = _kv_row(n_safe_ld)
                     col_off_ld  = cv_i * fx.Index(MFMA_LK)
                     k_vec = _load_global_vec_cv(k_rsrc, kv_row_g, col_off_ld)
@@ -1660,8 +1775,8 @@ def compile_fmha_bwd_dq_mfma(
                 for row_off in range_constexpr(ROWS_PER_WAVE_LD):
                     row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
                     n_global_ld = n_start + row_in_tile
-                    n_valid_ld  = n_global_ld < seq_N_idx
-                    n_safe_ld   = n_valid_ld.select(n_global_ld, seq_N_idx - fx.Index(1))
+                    n_valid_ld  = n_global_ld < this_seqlen_k
+                    n_safe_ld   = n_valid_ld.select(n_global_ld, this_seqlen_k - fx.Index(1))
                     kv_row_g    = _kv_row(n_safe_ld)
                     for cv in range_constexpr(VEC_COLS):
                         col_off_ld = fx.Index(cv * MFMA_LK)
@@ -1688,7 +1803,7 @@ def compile_fmha_bwd_dq_mfma(
                 # ---- dS = scale * P * (dP - D_vec[m]) ; store to LDS[m,n] ----
                 n_within  = lane_mod_32
                 n_row_abs = n_within + n_sub * 32 + n_start
-                n_ok      = n_row_abs < seq_N_idx
+                n_ok      = n_row_abs < this_seqlen_k
                 for r in range_constexpr(16):
                     m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
                     lse_val   = lse_vals[r]
@@ -1749,8 +1864,8 @@ def compile_fmha_bwd_dq_mfma(
         for r in range_constexpr(16):
             m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
             m_row_abs = m_within + wave_m_sub * 32 + m_start
-            m_ok      = m_row_abs < seq_M_idx
-            m_safe    = m_ok.select(m_row_abs, seq_M_idx - fx.Index(1))
+            m_ok      = m_row_abs < this_seqlen_q
+            m_safe    = m_ok.select(m_row_abs, this_seqlen_q - fx.Index(1))
             q_row_g   = _q_row_out(m_safe)
             for d_iter in range_constexpr(D_SUBS_PER_WAVE):
                 wave_d_sub_i = wave_d_sub_base + d_iter
@@ -1780,6 +1895,9 @@ def compile_fmha_bwd_dq_mfma(
         q_stride_m:  fx.Int32,
         kv_stride_n: fx.Int32,
         do_stride_m: fx.Int32,
+        seqstart_q:  fx.Tensor,
+        seqstart_k:  fx.Tensor,
+        total_m:     fx.Int32,
         stream:      fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext
@@ -1794,6 +1912,7 @@ def compile_fmha_bwd_dq_mfma(
         fmha_bwd_dq_mfma_kernel(
             Q, K, V, dO, dQ, LSE, D_vec,
             M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m,
+            seqstart_q, seqstart_k, total_m,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),

@@ -27,7 +27,7 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 
-from .attn_bias import LowerTriangularMask
+from .attn_bias import BlockDiagonalCausalMask, BlockDiagonalMask, LowerTriangularMask
 from .common import AttentionBwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
 
@@ -88,6 +88,8 @@ def _flydsl_bwd(
     grad: torch.Tensor,
     scale: float,
     causal: bool,
+    seqstart_q: Optional[torch.Tensor] = None,
+    seqstart_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import flydsl.compiler as flyc
 
@@ -96,8 +98,21 @@ def _flydsl_bwd(
         compile_fmha_bwd_dvdk_mfma,
     )
 
-    B, M, H, D = query.shape
-    N = key.shape[1]
+    # Varlen (sequencing-plan item 6, Stage B1, non-causal BlockDiagonalMask
+    # only): query/key/value arrive already reshaped to (1, sum_M_i, H, D) --
+    # B_logical (the real batch count) is `seqstart_q.shape[0] - 1`, NOT
+    # query.shape[0] (always 1 under group-mode). Non-varlen: B == query.shape[0].
+    varlen = seqstart_q is not None
+    H, D = query.shape[2], query.shape[3]
+    total_m = query.shape[1]  # real physical M extent (== sum_M_i under varlen)
+    total_n = key.shape[1]    # real physical N extent (== sum_N_i under varlen)
+    if varlen:
+        B = seqstart_q.shape[0] - 1
+        M = int(seqstart_q.diff().max().item())  # max_seqlen_q -- grid/loop sizing only
+        N = int(seqstart_k.diff().max().item())  # max_seqlen_k -- grid/loop sizing only
+    else:
+        B, M = query.shape[0], query.shape[1]
+        N = total_n
     device = query.device
     dtype = query.dtype
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
@@ -136,19 +151,23 @@ def _flydsl_bwd(
     kv_stride_n = key.stride(1) // D
     do_stride_m = grad.stride(1) // D
 
-    # `lse` is [B, H, M] float32 (CK's FwOp convention); `out`/`grad` are BMHK.
-    # These are plain elementwise/reduction ops producing fresh contiguous
-    # tensors, so `.view()` on their results is always safe regardless of the
-    # strides of `out`/`grad`/`lse` themselves.
-    LSE_2d = lse.contiguous().view(B * H * M, 1)
-    D_vec = (grad.float() * out.float()).sum(dim=-1).view(B * M * H, 1)
+    # `lse` is [B, H, M] float32 (non-varlen) or packed [1, H, sum_M] under
+    # varlen (CK's VARLEN_LSE_PACKED=True convention -- see fmha_bwd_mfma.py's
+    # _lse_row). `out`/`grad` are BMHK-shaped with total_m as their real M
+    # extent either way. These are plain elementwise/reduction ops producing
+    # fresh contiguous tensors, so `.view()` on their results is always safe
+    # regardless of the strides of `out`/`grad`/`lse` themselves.
+    LSE_2d = lse.contiguous().view(H * total_m, 1)
+    D_vec = (grad.float() * out.float()).sum(dim=-1).view(total_m * H, 1)
 
     # dV/dK are shaped [B, N, H_kv, D] under GQA (one gradient per KV head, summed
     # over its heads_per_kv group by the kernel's grid-regroup-by-KV-head -- see
     # fmha_bwd_mfma.py's compile_fmha_bwd_dvdk_mfma docstring); H_kv == H otherwise.
-    dV_out = torch.zeros(B * N * H_kv * D, 1, device=device, dtype=torch.float32)
-    dK_out = torch.zeros(B * N * H_kv * D, 1, device=device, dtype=torch.float32)
-    dQ_out = torch.zeros(B * M * H * D, 1, device=device, dtype=torch.float32)
+    # total_m/total_n (not B*M/B*N, which under varlen would use max_seqlen*B_logical
+    # instead of the real packed extent) size the physical output allocation.
+    dV_out = torch.zeros(total_n * H_kv * D, 1, device=device, dtype=torch.float32)
+    dK_out = torch.zeros(total_n * H_kv * D, 1, device=device, dtype=torch.float32)
+    dQ_out = torch.zeros(total_m * H * D, 1, device=device, dtype=torch.float32)
 
     stream = torch.cuda.current_stream()
 
@@ -180,11 +199,19 @@ def _flydsl_bwd(
         gpu_arch=gpu_arch,
         causal=causal,
         heads_per_kv=heads_per_kv,
+        varlen=varlen,
     )
     n_M_tiles = (M + BLOCK_M_DVDK - 1) // BLOCK_M_DVDK
+    # Varlen (sequencing-plan item 6, Stage B1): pass the real seqstart tensors;
+    # non-varlen passes dummies (unused since varlen=False at compile time --
+    # see compile_fmha_bwd_dvdk_mfma's `varlen` kwarg).
+    _dummy_seqstart = torch.zeros(1, device=device, dtype=torch.int32)
+    _seqstart_q_arg = seqstart_q if varlen else _dummy_seqstart
+    _seqstart_k_arg = seqstart_k if varlen else _dummy_seqstart
     args_dvdk = (
         Q_4d, K_4d, V_4d, dO_4d, dV_out, dK_out, LSE_2d, D_vec,
-        B, M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m, stream,
+        B, M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m,
+        _seqstart_q_arg, _seqstart_k_arg, total_m, stream,
     )
     compiled_dvdk = flyc.compile(launch_dvdk, *args_dvdk)
     compiled_dvdk(*args_dvdk)
@@ -203,18 +230,26 @@ def _flydsl_bwd(
         gpu_arch=gpu_arch,
         causal=causal,
         heads_per_kv=heads_per_kv,
+        varlen=varlen,
     )
     n_N_tiles = (N + BLOCK_N_DQ - 1) // BLOCK_N_DQ
     args_dq = (
         Q_4d, K_4d, V_4d, dO_4d, dQ_out, LSE_2d, D_vec,
-        B, M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m, stream,
+        B, M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m,
+        _seqstart_q_arg, _seqstart_k_arg, total_m, stream,
     )
     compiled_dq = flyc.compile(launch_dq, *args_dq)
     compiled_dq(*args_dq)
 
-    dq = dQ_out.view(B, M, H, D).to(dtype)
-    dk = dK_out.view(B, N, H_kv, D).to(dtype)
-    dv = dV_out.view(B, N, H_kv, D).to(dtype)
+    # Output shapes use total_m/total_n (real packed extent) as the M/N axis --
+    # under varlen this is sum_M_i/sum_N_i with B collapsed to 1 (matching
+    # Q/K/V's own physical shape); non-varlen: total_m==B*M, total_n==B*N.
+    out_b = 1 if varlen else B
+    out_m = total_m if varlen else M
+    out_n = total_n if varlen else N
+    dq = dQ_out.view(out_b, out_m, H, D).to(dtype)
+    dk = dK_out.view(out_b, out_n, H_kv, D).to(dtype)
+    dv = dV_out.view(out_b, out_n, H_kv, D).to(dtype)
     return dq, dk, dv
 
 
@@ -228,6 +263,8 @@ def _flydsl_bwd_abstract(
     grad: torch.Tensor,
     scale: float,
     causal: bool,
+    seqstart_q: Optional[torch.Tensor] = None,
+    seqstart_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(query),
@@ -263,14 +300,21 @@ class BwOp(AttentionBwOpBase):
     # tensors) that this kernel does not implement -- stays False.
     SUPPORTS_BMGHK = False
     IS_DETERMINISTIC = True  # split dvdk+dq path, no atomics
-    # Non-causal + simple top-left causal (single fixed-length sequence per batch)
-    # only so far (sequencing-plan item 3). NOT `BlockDiagonalCausalMask` or other
-    # block-diagonal/varlen variants: those pack multiple variable-length sequences
-    # per batch row with PER-BLOCK causal masking, which this kernel's flat `n<=m`
-    # comparison does not implement (confirmed via a real correctness failure —
-    # garbage-magnitude gradients, not the usual bf16 precision tail). Real varlen
-    # support is sequencing-plan item 6, separately scoped.
-    SUPPORTED_ATTN_BIAS_TYPES = (type(None), LowerTriangularMask)
+    VARLEN_LSE_PACKED = True  # matches ck.BwOp's convention (see fmha_bwd_mfma.py's _lse_row)
+    # Simple top-left causal (single fixed-length sequence per batch), non-causal
+    # `BlockDiagonalMask` varlen (Stage B1), AND per-block top-left causal
+    # `BlockDiagonalCausalMask` varlen (Stage B2) -- sequencing-plan item 6, see
+    # fmha_bwd_mfma.py's `varlen`/`causal` kwarg docstrings. The existing
+    # `n_row_abs <= m_row_abs` causal term is already tile-relative to each
+    # block's own batch-local n_start/m_start (never seqstart-global), which
+    # turned out to already implement per-block causal masking correctly once
+    # Stage B1's per-batch tiling landed -- verified via CASES_VARLEN_CAUSAL in
+    # test_fmha_bwd_{dvdk,dq}_mfma.py before enabling this. NOT other causal
+    # block-diagonal variants (e.g. `BlockDiagonalCausalFromBottomRightMask`,
+    # different alignment semantics) -- separately scoped, not attempted.
+    SUPPORTED_ATTN_BIAS_TYPES = (
+        type(None), LowerTriangularMask, BlockDiagonalMask, BlockDiagonalCausalMask,
+    )
     _TEST_K: List[int] = [32, 64, 96, 128, 256]
     NAME = "flydslB"
 
@@ -300,7 +344,17 @@ class BwOp(AttentionBwOpBase):
 
     @classmethod
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
-        causal = isinstance(inp.attn_bias, LowerTriangularMask)
+        # LowerTriangularMask (simple causal) and BlockDiagonalCausalMask (per-block
+        # top-left causal, Stage B2) both map to the same causal mask math in this
+        # kernel -- mirrors ck.py's _custom_mask_type grouping both under
+        # CausalFromTopLeft. BlockDiagonalCausalMask subclasses BlockDiagonalMask,
+        # so the isinstance check below (seqstart extraction) already covers it.
+        causal = isinstance(inp.attn_bias, (LowerTriangularMask, BlockDiagonalCausalMask))
+        seqstart_q = seqstart_k = None
+        if isinstance(inp.attn_bias, BlockDiagonalMask):
+            # Mirrors ck.py's _get_seqlen_info.
+            seqstart_q = inp.attn_bias.q_seqinfo.seqstart.to(inp.query.device)
+            seqstart_k = inp.attn_bias.k_seqinfo.seqstart.to(inp.query.device)
         dq, dk, dv = cls.OPERATOR(
             inp.query,
             inp.key,
@@ -310,5 +364,7 @@ class BwOp(AttentionBwOpBase):
             grad,
             inp.scale_float,
             causal,
+            seqstart_q,
+            seqstart_k,
         )
         return Gradients(dq=dq, dk=dk, dv=dv)

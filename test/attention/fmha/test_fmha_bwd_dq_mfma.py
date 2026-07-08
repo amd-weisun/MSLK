@@ -88,8 +88,10 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=False, causal=Fal
                                           heads_per_kv=H // Hkv,
                                           gpu_arch=gpu_arch, causal=causal)
     n_N_tiles = (N + BLOCK_N - 1) // BLOCK_N
+    _dummy_seqstart = torch.zeros(1, device=device, dtype=torch.int32)
     args = (Q_4d, K_4d, V_4d, dO_4d, dQ_out, LSE_2d, D_vec,
             B, M, N, H, n_N_tiles, q_stride_m, kv_stride_n, do_stride_m,
+            _dummy_seqstart, _dummy_seqstart, M,
             torch.cuda.current_stream())
     compiled = flyc.compile(launch_fn, *args)
     compiled(*args)
@@ -221,6 +223,127 @@ def test_dq_mfma_packed_qkv(B, M, N, H, D, dtype, use_pipeline):
 @pytest.mark.parametrize("B,M,N,H,D,dtype,H_kv", CASES_GQA)
 def test_dq_mfma_gqa(B, M, N, H, D, dtype, H_kv, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, H_kv=H_kv)
+
+
+def run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda", use_pipeline=False,
+                     causal=False):
+    """Sequencing-plan item 6: BlockDiagonalMask-style varlen (Stage B1 non-causal,
+    Stage B2 causal). Mirrors test_fmha_bwd_dvdk_mfma.py's run_case_varlen -- see
+    there for design notes.
+    """
+    assert len(seqlens_q) == len(seqlens_k)
+    B_logical = len(seqlens_q)
+    tag = " [pipeline]" if use_pipeline else ""
+    if causal:
+        tag += " [causal]"
+    print(f"  varlen B={B_logical} seqlens_q={seqlens_q} seqlens_k={seqlens_k} "
+          f"H={H} D={D} dtype={dtype}{tag} ... ", end="", flush=True)
+    scale = 1.0 / math.sqrt(D)
+
+    Qs, Ks, Vs, Os, LSEs, dOs, dQ_refs = [], [], [], [], [], [], []
+    for m, n in zip(seqlens_q, seqlens_k):
+        q = torch.randn(1, m, H, D, device=device, dtype=dtype)
+        k = torch.randn(1, n, H, D, device=device, dtype=dtype)
+        v = torch.randn(1, n, H, D, device=device, dtype=dtype)
+        o, lse = ref_fmha_fwd(q, k, v, scale=scale, causal=causal)
+        do = torch.randn_like(o)
+        dq_ref, _, _ = ref_fmha_bwd(q, k, v, o, do, lse, scale=scale, causal=causal)
+        Qs.append(q); Ks.append(k); Vs.append(v); Os.append(o); LSEs.append(lse); dOs.append(do)
+        dQ_refs.append(dq_ref)
+
+    total_m = sum(seqlens_q)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    Q = torch.cat(Qs, dim=1)
+    K = torch.cat(Ks, dim=1)
+    V = torch.cat(Vs, dim=1)
+    dO = torch.cat(dOs, dim=1)
+    LSE = torch.cat(LSEs, dim=2)
+    D_vec = torch.cat(
+        [(do.float() * o.float()).sum(dim=-1) for do, o in zip(dOs, Os)], dim=1
+    ).contiguous().view(total_m * H, 1)
+
+    seqstart_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()), device=device, dtype=torch.int32
+    )
+    seqstart_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()), device=device, dtype=torch.int32
+    )
+
+    gpu_arch = torch.cuda.get_device_properties(device).gcnArchName
+    BLOCK_M = 64
+    BLOCK_N = 32 if ("gfx950" not in gpu_arch and D >= 256) else 64
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+
+    Q_4d = _as_i16(Q)
+    K_4d = _as_i16(K)
+    V_4d = _as_i16(V)
+    dO_4d = _as_i16(dO.contiguous())
+    q_stride_m = Q.stride(1) // D
+    kv_stride_n = K.stride(1) // D
+    do_stride_m = dO_4d.stride(1) // D
+    LSE_2d = LSE.contiguous().view(H * total_m, 1)
+    dQ_out = torch.zeros(total_m * H * D, 1, device=device, dtype=torch.float32)
+
+    launch_fn = compile_fmha_bwd_dq_mfma(
+        D=D, dtype_str=dtype_str, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
+        use_pipeline=use_pipeline, gpu_arch=gpu_arch, causal=causal, varlen=True,
+    )
+    n_N_tiles = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
+    args = (
+        Q_4d, K_4d, V_4d, dO_4d, dQ_out, LSE_2d, D_vec,
+        B_logical, max_seqlen_q, max_seqlen_k, H, n_N_tiles,
+        q_stride_m, kv_stride_n, do_stride_m,
+        seqstart_q, seqstart_k, total_m,
+        torch.cuda.current_stream(),
+    )
+    compiled = flyc.compile(launch_fn, *args)
+    compiled(*args)
+    torch.cuda.synchronize()
+
+    dQ_kernel = dQ_out.view(1, total_m, H, D).to(dtype)
+    dQ_ref = torch.cat(dQ_refs, dim=1)
+    max_err = (dQ_kernel.float() - dQ_ref.float()).abs().max().item()
+    ok = torch.allclose(dQ_kernel.float(), dQ_ref.float(), rtol=0.1, atol=0.1)
+    print(f"{'PASS' if ok else 'FAIL'}  max_err={max_err:.5f}")
+    return ok
+
+
+# Varlen / group-mode (sequencing-plan item 6, Stage B1) -- non-causal
+# BlockDiagonalMask only, hand-picked small seqlen sets before broadening.
+CASES_VARLEN = [
+    ([64, 128, 32], [64, 128, 32], 1, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 64, torch.bfloat16),
+    ([100, 50, 200], [100, 50, 200], 8, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 128, torch.bfloat16),
+]
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("seqlens_q,seqlens_k,H,D,dtype", CASES_VARLEN)
+def test_dq_mfma_varlen(seqlens_q, seqlens_k, H, D, dtype, use_pipeline):
+    assert run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda", use_pipeline=use_pipeline)
+
+
+# Varlen + causal (sequencing-plan item 6, Stage B2) -- BlockDiagonalCausalMask,
+# per-block top-left causal. See test_fmha_bwd_dvdk_mfma.py's matching cases for
+# the design hypothesis this is verifying.
+CASES_VARLEN_CAUSAL = [
+    ([64, 128, 32], [64, 128, 32], 1, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 64, torch.bfloat16),
+    ([100, 50, 200], [100, 50, 200], 8, 64, torch.bfloat16),
+    ([64, 128, 32], [64, 128, 32], 8, 128, torch.bfloat16),
+]
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("seqlens_q,seqlens_k,H,D,dtype", CASES_VARLEN_CAUSAL)
+def test_dq_mfma_varlen_causal(seqlens_q, seqlens_k, H, D, dtype, use_pipeline):
+    assert run_case_varlen(seqlens_q, seqlens_k, H, D, dtype, device="cuda",
+                            use_pipeline=use_pipeline, causal=True)
 
 
 if __name__ == "__main__":
