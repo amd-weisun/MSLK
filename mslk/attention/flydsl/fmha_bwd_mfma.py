@@ -830,6 +830,7 @@ def compile_fmha_bwd_dvdk_mfma(
     use_pipeline: bool = False,
     gpu_arch: str = "gfx950",
     causal: bool = False,
+    heads_per_kv: int = 1,
 ):
     """Phase B.4: FUSED dV + dK with MFMA (matches CK's dV/dK fusion).
 
@@ -848,16 +849,31 @@ def compile_fmha_bwd_dvdk_mfma(
     (grid over M-tiles; fusing it would need atomic-add, blocked by the f32-atomic
     2x bug — same reason CK / Phase A keep dQ split).
 
+    GQA (sequencing-plan item 4, heads_per_kv > 1): under Hq==Hkv, each
+    (batch,head,n_tile) block already writes a UNIQUE dV/dK row. Under GQA,
+    multiple Q-heads (all sharing one KV-head) would compute the SAME dV/dK
+    address -- a plain store would race (last-writer-wins). Rather than
+    atomic-add (would flip IS_DETERMINISTIC=True), the grid is regrouped by
+    KV-head (`B*Hkv*num_N_tiles` instead of `B*Hq*num_N_tiles`) and each block
+    internally loops over its `heads_per_kv` Q-heads, accumulating all their
+    P/dS contributions into ONE register accumulator before a single plain
+    store -- see the `for q_head_in_group in range_constexpr(heads_per_kv)`
+    loop below. heads_per_kv==1 (default, non-GQA) degenerates to exactly the
+    original per-head-unique behavior (loop trivially runs once).
+
     Returns:
         launch_fn(Q, K, V, dO, dV, dK, LSE, D_vec, B, M, N, H, n_M_tiles,
                   q_stride_m, kv_stride_n, stream)
           Q, K, V, dO : [B*seq*H, D]   int16 (row pitch may exceed H*D -- see
                         q_stride_m/kv_stride_n, sequencing-plan item 7)
-          dV, dK      : [B*N*H*D, 1]   float32 (always contiguous output)
+          dV, dK      : [B*N*Hkv*D, 1] float32 (always contiguous output;
+                        Hkv = H // heads_per_kv)
           LSE, D_vec  : [B*H*M,1] / [B*M*H,1] float32
           q_stride_m  : Q/dO row pitch in ROW units (real_elem_stride(dim=1) // D);
                         H for contiguous BMHK.
           kv_stride_n : K/V row pitch in ROW units, same convention.
+          H           : total Q head count (Hq); Hkv is derived as H //
+                        heads_per_kv (compile-time), not passed separately.
     """
     import math as _pm
     if scale is None:
@@ -960,12 +976,17 @@ def compile_fmha_bwd_dvdk_mfma(
         kv_stride_n_idx = fx.Index(kv_stride_n)
         do_stride_m_idx = fx.Index(do_stride_m)
         num_N_tiles   = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
+        # GQA (sequencing-plan item 4): grid is regrouped by KV-head (see
+        # module docstring) -- n_kv_heads_idx = Hq // heads_per_kv (compile-time
+        # constant divisor). heads_per_kv==1 (non-GQA) makes kv_head_idx ==
+        # head_idx for the single q_head_in_group iteration below.
+        n_kv_heads_idx = n_heads_idx // heads_per_kv
 
-        bid_idx   = fx.Index(bid)
-        n_tile    = bid_idx % num_N_tiles
-        bh_idx    = bid_idx // num_N_tiles
-        batch_idx = bh_idx // n_heads_idx
-        head_idx  = bh_idx % n_heads_idx
+        bid_idx     = fx.Index(bid)
+        n_tile      = bid_idx % num_N_tiles
+        bh_idx      = bid_idx // num_N_tiles
+        batch_idx   = bh_idx // n_kv_heads_idx
+        kv_head_idx = bh_idx % n_kv_heads_idx
 
         n_start = n_tile * BLOCK_N
 
@@ -1001,25 +1022,31 @@ def compile_fmha_bwd_dvdk_mfma(
         # units, i.e. real_elem_stride // D), NOT necessarily n_heads_idx. dO can
         # have a DIFFERENT row pitch than Q (e.g. Q comes from a qkv-unbind view
         # but dO is a fresh contiguous torch.randn_like(out)) -- separate helper.
-        def _q_row(q_pos):
+        # GQA (sequencing-plan item 4): this block's Q-side rows vary across the
+        # `heads_per_kv` group (see the q_head_in_group loop below), so head_idx
+        # is now an explicit param rather than a fixed block-wide closure value.
+        def _q_row(q_pos, head_idx):
             return fx.Int32(batch_idx * (seq_M_idx * q_stride_m_idx) + q_pos * q_stride_m_idx + head_idx)
 
-        def _do_row(q_pos):
+        def _do_row(q_pos, head_idx):
             return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
 
+        # K/V are indexed by kv_head_idx (fixed for the whole block -- GQA's
+        # grid-regroup-by-KV-head, see module docstring), NOT a per-q-head value.
         def _kv_row(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + kv_head_idx)
 
-        # dV/dK are freshly-allocated contiguous outputs -- always row pitch n_heads_idx.
+        # dV/dK are freshly-allocated contiguous outputs, shaped [B,N,Hkv,D] --
+        # row pitch n_kv_heads_idx, indexed by kv_head_idx (one write per block).
         def _kv_row_out(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * n_heads_idx) + kv_pos * n_heads_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_N_idx * n_kv_heads_idx) + kv_pos * n_kv_heads_idx + kv_head_idx)
 
-        def _lse_row(q_pos):
-            return fx.Int32(bh_idx * seq_M_idx + q_pos)
+        def _lse_row(q_pos, head_idx):
+            return fx.Int32((batch_idx * n_heads_idx + head_idx) * seq_M_idx + q_pos)
 
         # D_vec is a freshly-allocated contiguous tensor -- always row pitch n_heads_idx
         # (never the possibly-non-contiguous q_stride_m_idx used by _q_row above).
-        def _dvec_row(q_pos):
+        def _dvec_row(q_pos, head_idx):
             return fx.Int32(batch_idx * (seq_M_idx * n_heads_idx) + q_pos * n_heads_idx + head_idx)
 
         from flydsl.expr import buffer_ops as _bops
@@ -1091,189 +1118,199 @@ def compile_fmha_bwd_dvdk_mfma(
         dummy_val = fx.Float32(0.0)
         init_st   = dk_inits + dv_inits + [dummy_val]
 
+        # GQA (sequencing-plan item 4): dk_accs/dv_accs must accumulate across
+        # ALL `heads_per_kv` Q-heads sharing this block's kv_head_idx (see module
+        # docstring) -- reset ONCE (init_st) before the group, not per q-head.
+        # The m_tile scf.for loop is re-entered once per q_head_in_group, each
+        # time threading the running accumulator through as its `init`.
+        # heads_per_kv==1 (non-GQA): this loop runs once, degenerating to the
+        # original per-head-unique behavior.
         loop_results = init_st
-        for m_tile, iter_args in range(fx.Index(0), n_M_tiles_idx, fx.Index(1), init=init_st):
-            dk_accs = list(iter_args[0:D_SUBS_PER_WAVE])
-            dv_accs = list(iter_args[D_SUBS_PER_WAVE:2 * D_SUBS_PER_WAVE])
-            m_start = m_tile * BLOCK_M
+        for q_head_in_group in range_constexpr(heads_per_kv):
+            head_idx = kv_head_idx * heads_per_kv + q_head_in_group
 
-            # ---- Cooperative LDS load: Q and dO tiles ----
-            VEC_COLS         = D // MFMA_LK
-            ROWS_PER_WAVE_LD = BLOCK_M // NUM_WAVES
-            if use_pipeline:
-                # Lane-distributed cooperative load: the (row_off, cv) work items of
-                # this wave are spread across its 64 lanes (baseline had every lane
-                # redundantly issue ALL items -> 64x redundant global loads + same-
-                # address LDS stores). 32 rows * 8 cvs = 256 items / 64 lanes = 4/lane.
-                N_ITEMS_LD     = ROWS_PER_WAVE_LD * VEC_COLS
-                ITEMS_PER_LANE = N_ITEMS_LD // WARP_SIZE
-                for it in range_constexpr(ITEMS_PER_LANE):
-                    item        = lane + fx.Index(it * WARP_SIZE)
-                    row_off_i   = item // fx.Index(VEC_COLS)
-                    cv_i        = item % fx.Index(VEC_COLS)
-                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
-                    m_global_ld = m_start + row_in_tile
-                    m_valid_ld  = m_global_ld < seq_M_idx
-                    m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
-                    q_row_g     = _q_row(m_safe_ld)
-                    do_row_g    = _do_row(m_safe_ld)
-                    col_off_ld  = cv_i * fx.Index(MFMA_LK)
-                    q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
-                    do_vec = _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld)
-                    lds_base = row_in_tile * LDS_Q_STRIDE + col_off_ld
-                    Vec(q_vec).store(lds_q,  [lds_base])
-                    Vec(do_vec).store(lds_do, [lds_base])
-            else:
-                for row_off in range_constexpr(ROWS_PER_WAVE_LD):
-                    row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
-                    m_global_ld = m_start + row_in_tile
-                    m_valid_ld  = m_global_ld < seq_M_idx
-                    m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
-                    q_row_g     = _q_row(m_safe_ld)
-                    do_row_g    = _do_row(m_safe_ld)
-                    for cv in range_constexpr(VEC_COLS):
-                        col_off_ld = fx.Index(cv * MFMA_LK)
+            for m_tile, iter_args in range(fx.Index(0), n_M_tiles_idx, fx.Index(1), init=loop_results):
+                dk_accs = list(iter_args[0:D_SUBS_PER_WAVE])
+                dv_accs = list(iter_args[D_SUBS_PER_WAVE:2 * D_SUBS_PER_WAVE])
+                m_start = m_tile * BLOCK_M
+
+                # ---- Cooperative LDS load: Q and dO tiles ----
+                VEC_COLS         = D // MFMA_LK
+                ROWS_PER_WAVE_LD = BLOCK_M // NUM_WAVES
+                if use_pipeline:
+                    # Lane-distributed cooperative load: the (row_off, cv) work items of
+                    # this wave are spread across its 64 lanes (baseline had every lane
+                    # redundantly issue ALL items -> 64x redundant global loads + same-
+                    # address LDS stores). 32 rows * 8 cvs = 256 items / 64 lanes = 4/lane.
+                    N_ITEMS_LD     = ROWS_PER_WAVE_LD * VEC_COLS
+                    ITEMS_PER_LANE = N_ITEMS_LD // WARP_SIZE
+                    for it in range_constexpr(ITEMS_PER_LANE):
+                        item        = lane + fx.Index(it * WARP_SIZE)
+                        row_off_i   = item // fx.Index(VEC_COLS)
+                        cv_i        = item % fx.Index(VEC_COLS)
+                        row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
+                        m_global_ld = m_start + row_in_tile
+                        m_valid_ld  = m_global_ld < seq_M_idx
+                        m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                        q_row_g     = _q_row(m_safe_ld, head_idx)
+                        do_row_g    = _do_row(m_safe_ld, head_idx)
+                        col_off_ld  = cv_i * fx.Index(MFMA_LK)
                         q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
                         do_vec = _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld)
-                        lds_base = row_in_tile * LDS_Q_STRIDE + cv * MFMA_LK
+                        lds_base = row_in_tile * LDS_Q_STRIDE + col_off_ld
                         Vec(q_vec).store(lds_q,  [lds_base])
                         Vec(do_vec).store(lds_do, [lds_base])
+                else:
+                    for row_off in range_constexpr(ROWS_PER_WAVE_LD):
+                        row_in_tile = wave * ROWS_PER_WAVE_LD + row_off
+                        m_global_ld = m_start + row_in_tile
+                        m_valid_ld  = m_global_ld < seq_M_idx
+                        m_safe_ld   = m_valid_ld.select(m_global_ld, seq_M_idx - fx.Index(1))
+                        q_row_g     = _q_row(m_safe_ld, head_idx)
+                        do_row_g    = _do_row(m_safe_ld, head_idx)
+                        for cv in range_constexpr(VEC_COLS):
+                            col_off_ld = fx.Index(cv * MFMA_LK)
+                            q_vec  = _load_global_vec_cv(q_rsrc,  q_row_g, col_off_ld)
+                            do_vec = _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld)
+                            lds_base = row_in_tile * LDS_Q_STRIDE + cv * MFMA_LK
+                            Vec(q_vec).store(lds_q,  [lds_base])
+                            Vec(do_vec).store(lds_do, [lds_base])
 
-            # ---- Cooperative LSE + D_vec tile stage ----
-            tid_idx = fx.Index(tid)
-            if tid_idx < fx.Index(BLOCK_M):
-                m_g_ls   = m_start + tid_idx
-                m_ok_ls  = m_g_ls < seq_M_idx
-                m_sf_ls  = m_ok_ls.select(m_g_ls, seq_M_idx - fx.Index(1))
-                lse_g    = _load_f32_row(LSE_buf,  _lse_row(m_sf_ls))
-                dm_g     = _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls))
-                Vec.from_elements([lse_g], fx.Float32).store(lds_lse, [tid_idx])
-                Vec.from_elements([dm_g],  fx.Float32).store(lds_dm,  [tid_idx])
-
-            gpu.barrier()
-
-            scale_cst = fx.Float32(scale)
-            log2e_cst = fx.Float32(_LOG2E)
-            M_SUBTILES = BLOCK_M // 32
-            for m_sub in range_constexpr(M_SUBTILES):
-                # ---- GEMM1a: S = Q @ K^T ; GEMM1b: dP = dO @ V^T ----
-                s_acc  = Vec.filled(16, 0.0, fx.Float32)
-                dp_acc = Vec.filled(16, 0.0, fx.Float32)
-                for ks in range_constexpr(K_STEPS):
-                    q_pack  = _lds_load_pack_a(lds_q,  m_sub * 32, ks)
-                    do_pack = _lds_load_pack_a(lds_do, m_sub * 32, ks)
-                    s_acc   = mfma(q_pack,  k_packs[ks], s_acc)
-                    dp_acc  = mfma(do_pack, v_packs[ks], dp_acc)
-
-                # ---- P (for dV) and dS (for dK), both stored to LDS[m,n] ----
-                n_within  = lane_mod_32
-                n_row_abs = n_within + wave_n_sub * 32 + n_start
-                n_ok      = n_row_abs < seq_N_idx
-                for r in range_constexpr(16):
-                    m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
-                    m_row_abs = m_within + (m_sub * 32) + m_start
-                    m_valid   = m_row_abs < seq_M_idx
-                    m_local_f = m_within + (m_sub * 32)
-                    lse_val   = Vec.load(Vec.make_type(1, fx.Float32), lds_lse, [m_local_f])[0]
-                    dm_val    = Vec.load(Vec.make_type(1, fx.Float32), lds_dm,  [m_local_f])[0]
-                    s_val     = Vec(s_acc)[r]
-                    dp_val    = Vec(dp_acc)[r]
-                    s_scaled  = fx.Float32(arith.mulf(_raw(s_val), _raw(scale_cst), fastmath=fm))
-                    s_sub_lse = fx.Float32(arith.subf(_raw(s_scaled), _raw(lse_val), fastmath=fm))
-                    p_arg     = fx.Float32(arith.mulf(_raw(s_sub_lse), _raw(log2e_cst), fastmath=fm))
-                    p_val     = fx.Float32(fly_math.exp2(p_arg, fastmath=fm))
-                    valid_mn  = m_valid & n_ok
-                    if const_expr(causal):
-                        valid_mn = valid_mn & (n_row_abs <= m_row_abs)
-                    p_val     = valid_mn.select(p_val, fx.Float32(0.0))
-                    dp_sub    = fx.Float32(arith.subf(_raw(dp_val), _raw(dm_val), fastmath=fm))
-                    ds_val    = fx.Float32(arith.mulf(_raw(scale_cst), _raw(p_val), fastmath=fm))
-                    ds_val    = fx.Float32(arith.mulf(_raw(ds_val), _raw(dp_sub), fastmath=fm))
-                    ds_val    = valid_mn.select(ds_val, fx.Float32(0.0))
-                    m_local   = m_within + (m_sub * 32)
-                    n_local   = n_within + wave_n_sub * 32
-                    Vec.from_elements([p_val],  fx.Float32).to(elem_dtype).store(lds_p,  [n_local * LDS_MPAD + m_local])
-                    Vec.from_elements([ds_val], fx.Float32).to(elem_dtype).store(lds_ds, [n_local * LDS_MPAD + m_local])
+                # ---- Cooperative LSE + D_vec tile stage ----
+                tid_idx = fx.Index(tid)
+                if tid_idx < fx.Index(BLOCK_M):
+                    m_g_ls   = m_start + tid_idx
+                    m_ok_ls  = m_g_ls < seq_M_idx
+                    m_sf_ls  = m_ok_ls.select(m_g_ls, seq_M_idx - fx.Index(1))
+                    lse_g    = _load_f32_row(LSE_buf,  _lse_row(m_sf_ls, head_idx))
+                    dm_g     = _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls, head_idx))
+                    Vec.from_elements([lse_g], fx.Float32).store(lds_lse, [tid_idx])
+                    Vec.from_elements([dm_g],  fx.Float32).store(lds_dm,  [tid_idx])
 
                 gpu.barrier()
 
-                # ---- dV += P^T @ dO ; dK += dS^T @ Q ----
-                # A=P^T/dS^T[n,m]: free=n=lane%32, k=m; B=dO/Q[m,d]: free=d=lane%32, k=m.
-                # P/dS (the A-operand) do NOT depend on d, so they're loaded ONCE per ks and
-                # reused across every D-subtile this wave sequentially owns (D_SUBS_PER_WAVE
-                # loop below) — only the B-operand (dO/Q at a given d) changes per subtile.
-                MFMA_KS   = 32 // MFMA_K
-                n_local_g = lane_mod_32 + wave_n_sub * 32
-                for ks in range_constexpr(MFMA_KS):
-                    n_local = lane_mod_32 + wave_n_sub * 32
-                    if use_trload:
-                        # A-operand (P^T/dS^T): must hold the SAME m as the tr B-operand at
-                        # each hardware slot (independent of which D-subtile is being read).
-                        # B (tr) gives m = (m_sub*32+ks*16) + lane_div_32*4 + P8[e],
-                        # P8={0,1,2,3,8,9,10,11}. So load P^T[n, base_a+{0,1,2,3}] ++
-                        # P^T[n, base_a+{8,9,10,11}].
-                        base_a = lane_div_32 * 4 + (m_sub * 32 + ks * MFMA_K)
-                        p_lo  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a])
-                        p_hi  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a + 8])
-                        p_pack = Vec(p_lo).shuffle(Vec(p_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                        ds_lo = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a])
-                        ds_hi = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a + 8])
-                        ds_pack = Vec(ds_lo).shuffle(Vec(ds_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                        tr_k_group  = (lane_mod_32 % 16) // 4   # lane%16 //4 within 32-lane half
-                        tr_col_sub  = lane % 4
-                        tr_col_half = lane_mod_32 // 16
-                        m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
-                        for d_iter in range_constexpr(D_SUBS_PER_WAVE):
-                            wave_d_sub_i_raw = wave_d_sub_base + d_iter
-                            # D=32/96 (D_TOTAL_SUBS not evenly divisible by WAVES_PER_N_GROUP):
-                            # the last wave-group's nominal D-subtile range can run past
-                            # D_TOTAL_SUBS. Clamp the address to subtile 0 (always in-bounds)
-                            # for out-of-range iterations; the result is discarded at the store
-                            # site below via d_in_range, so the clamped value is never observed.
-                            d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
-                            wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
-                            # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
-                            # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row
-                            # base), free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
-                            d_col = wave_d_sub_i * 32 + tr_col_half * 16 + tr_col_sub * 4
-                            lo = m_base * LDS_Q_STRIDE + d_col
-                            hi = lo + 8 * LDS_Q_STRIDE
-                            do_a = _ds_read_tr_v4(v4elem_type, lo, lds_do_off)
-                            do_b = _ds_read_tr_v4(v4elem_type, hi, lds_do_off)
-                            do_pack = Vec(do_a).shuffle(Vec(do_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                            q_a = _ds_read_tr_v4(v4elem_type, lo, lds_q_off)
-                            q_b = _ds_read_tr_v4(v4elem_type, hi, lds_q_off)
-                            q_pack = Vec(q_a).shuffle(Vec(q_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-                            dv_accs[d_iter] = mfma(p_pack,  do_pack, dv_accs[d_iter])
-                            dk_accs[d_iter] = mfma(ds_pack, q_pack,  dk_accs[d_iter])
-                    else:
-                        base_m  = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K)
-                        p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
-                        ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
-                        for d_iter in range_constexpr(D_SUBS_PER_WAVE):
-                            wave_d_sub_i_raw = wave_d_sub_base + d_iter
-                            # See the use_trload branch above for why out-of-range D-subtiles
-                            # (D=32/96) are clamped rather than skipped: the LDS address must
-                            # stay in-bounds even though the result is discarded at store time.
-                            d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
-                            wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
-                            d_local = lane_mod_32 + wave_d_sub_i * 32
-                            # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
-                            # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
-                            do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                            q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
-                            for e in range_constexpr(MFMA_LK):
-                                m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
-                                do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
-                                q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
-                                fx.memref_store(do_sc, do_r,  e)
-                                fx.memref_store(q_sc,  q_r,   e)
-                            dv_accs[d_iter] = mfma(p_pack,  fx.memref_load_vec(do_r), dv_accs[d_iter])
-                            dk_accs[d_iter] = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_accs[d_iter])
+                scale_cst = fx.Float32(scale)
+                log2e_cst = fx.Float32(_LOG2E)
+                M_SUBTILES = BLOCK_M // 32
+                for m_sub in range_constexpr(M_SUBTILES):
+                    # ---- GEMM1a: S = Q @ K^T ; GEMM1b: dP = dO @ V^T ----
+                    s_acc  = Vec.filled(16, 0.0, fx.Float32)
+                    dp_acc = Vec.filled(16, 0.0, fx.Float32)
+                    for ks in range_constexpr(K_STEPS):
+                        q_pack  = _lds_load_pack_a(lds_q,  m_sub * 32, ks)
+                        do_pack = _lds_load_pack_a(lds_do, m_sub * 32, ks)
+                        s_acc   = mfma(q_pack,  k_packs[ks], s_acc)
+                        dp_acc  = mfma(do_pack, v_packs[ks], dp_acc)
 
-                gpu.barrier()
+                    # ---- P (for dV) and dS (for dK), both stored to LDS[m,n] ----
+                    n_within  = lane_mod_32
+                    n_row_abs = n_within + wave_n_sub * 32 + n_start
+                    n_ok      = n_row_abs < seq_N_idx
+                    for r in range_constexpr(16):
+                        m_within  = lane_div_32 * 4 + ((r // 4) * 8 + (r % 4))
+                        m_row_abs = m_within + (m_sub * 32) + m_start
+                        m_valid   = m_row_abs < seq_M_idx
+                        m_local_f = m_within + (m_sub * 32)
+                        lse_val   = Vec.load(Vec.make_type(1, fx.Float32), lds_lse, [m_local_f])[0]
+                        dm_val    = Vec.load(Vec.make_type(1, fx.Float32), lds_dm,  [m_local_f])[0]
+                        s_val     = Vec(s_acc)[r]
+                        dp_val    = Vec(dp_acc)[r]
+                        s_scaled  = fx.Float32(arith.mulf(_raw(s_val), _raw(scale_cst), fastmath=fm))
+                        s_sub_lse = fx.Float32(arith.subf(_raw(s_scaled), _raw(lse_val), fastmath=fm))
+                        p_arg     = fx.Float32(arith.mulf(_raw(s_sub_lse), _raw(log2e_cst), fastmath=fm))
+                        p_val     = fx.Float32(fly_math.exp2(p_arg, fastmath=fm))
+                        valid_mn  = m_valid & n_ok
+                        if const_expr(causal):
+                            valid_mn = valid_mn & (n_row_abs <= m_row_abs)
+                        p_val     = valid_mn.select(p_val, fx.Float32(0.0))
+                        dp_sub    = fx.Float32(arith.subf(_raw(dp_val), _raw(dm_val), fastmath=fm))
+                        ds_val    = fx.Float32(arith.mulf(_raw(scale_cst), _raw(p_val), fastmath=fm))
+                        ds_val    = fx.Float32(arith.mulf(_raw(ds_val), _raw(dp_sub), fastmath=fm))
+                        ds_val    = valid_mn.select(ds_val, fx.Float32(0.0))
+                        m_local   = m_within + (m_sub * 32)
+                        n_local   = n_within + wave_n_sub * 32
+                        Vec.from_elements([p_val],  fx.Float32).to(elem_dtype).store(lds_p,  [n_local * LDS_MPAD + m_local])
+                        Vec.from_elements([ds_val], fx.Float32).to(elem_dtype).store(lds_ds, [n_local * LDS_MPAD + m_local])
 
-            loop_results = yield dk_accs + dv_accs + [dummy_val]
+                    gpu.barrier()
+
+                    # ---- dV += P^T @ dO ; dK += dS^T @ Q ----
+                    # A=P^T/dS^T[n,m]: free=n=lane%32, k=m; B=dO/Q[m,d]: free=d=lane%32, k=m.
+                    # P/dS (the A-operand) do NOT depend on d, so they're loaded ONCE per ks and
+                    # reused across every D-subtile this wave sequentially owns (D_SUBS_PER_WAVE
+                    # loop below) — only the B-operand (dO/Q at a given d) changes per subtile.
+                    MFMA_KS   = 32 // MFMA_K
+                    n_local_g = lane_mod_32 + wave_n_sub * 32
+                    for ks in range_constexpr(MFMA_KS):
+                        n_local = lane_mod_32 + wave_n_sub * 32
+                        if use_trload:
+                            # A-operand (P^T/dS^T): must hold the SAME m as the tr B-operand at
+                            # each hardware slot (independent of which D-subtile is being read).
+                            # B (tr) gives m = (m_sub*32+ks*16) + lane_div_32*4 + P8[e],
+                            # P8={0,1,2,3,8,9,10,11}. So load P^T[n, base_a+{0,1,2,3}] ++
+                            # P^T[n, base_a+{8,9,10,11}].
+                            base_a = lane_div_32 * 4 + (m_sub * 32 + ks * MFMA_K)
+                            p_lo  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a])
+                            p_hi  = Vec.load(v4elem_type, lds_p,  [n_local * LDS_MPAD + base_a + 8])
+                            p_pack = Vec(p_lo).shuffle(Vec(p_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                            ds_lo = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a])
+                            ds_hi = Vec.load(v4elem_type, lds_ds, [n_local * LDS_MPAD + base_a + 8])
+                            ds_pack = Vec(ds_lo).shuffle(Vec(ds_hi), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                            tr_k_group  = (lane_mod_32 % 16) // 4   # lane%16 //4 within 32-lane half
+                            tr_col_sub  = lane % 4
+                            tr_col_half = lane_mod_32 // 16
+                            m_base = m_sub * 32 + ks * MFMA_K + lane_div_32 * 4 + tr_k_group
+                            for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                                wave_d_sub_i_raw = wave_d_sub_base + d_iter
+                                # D=32/96 (D_TOTAL_SUBS not evenly divisible by WAVES_PER_N_GROUP):
+                                # the last wave-group's nominal D-subtile range can run past
+                                # D_TOTAL_SUBS. Clamp the address to subtile 0 (always in-bounds)
+                                # for out-of-range iterations; the result is discarded at the store
+                                # site below via d_in_range, so the clamped value is never observed.
+                                d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
+                                wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
+                                # B-operand (dO/Q) via HW transpose. tr yields, per lane, contract
+                                # m = P8 = {0,1,2,3,8,9,10,11} + lane_div_32*4 (relative to m_row
+                                # base), free d = lane%32. Read row-major [m,d] with EVEN LDS_Q_STRIDE.
+                                d_col = wave_d_sub_i * 32 + tr_col_half * 16 + tr_col_sub * 4
+                                lo = m_base * LDS_Q_STRIDE + d_col
+                                hi = lo + 8 * LDS_Q_STRIDE
+                                do_a = _ds_read_tr_v4(v4elem_type, lo, lds_do_off)
+                                do_b = _ds_read_tr_v4(v4elem_type, hi, lds_do_off)
+                                do_pack = Vec(do_a).shuffle(Vec(do_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                                q_a = _ds_read_tr_v4(v4elem_type, lo, lds_q_off)
+                                q_b = _ds_read_tr_v4(v4elem_type, hi, lds_q_off)
+                                q_pack = Vec(q_a).shuffle(Vec(q_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                                dv_accs[d_iter] = mfma(p_pack,  do_pack, dv_accs[d_iter])
+                                dk_accs[d_iter] = mfma(ds_pack, q_pack,  dk_accs[d_iter])
+                        else:
+                            base_m  = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K)
+                            p_pack  = Vec.load(v8elem_type, lds_p,  [n_local * LDS_MPAD + base_m]).ir_value()
+                            ds_pack = Vec.load(v8elem_type, lds_ds, [n_local * LDS_MPAD + base_m]).ir_value()
+                            for d_iter in range_constexpr(D_SUBS_PER_WAVE):
+                                wave_d_sub_i_raw = wave_d_sub_base + d_iter
+                                # See the use_trload branch above for why out-of-range D-subtiles
+                                # (D=32/96) are clamped rather than skipped: the LDS address must
+                                # stay in-bounds even though the result is discarded at store time.
+                                d_in_range   = wave_d_sub_i_raw < fx.Index(D_TOTAL_SUBS)
+                                wave_d_sub_i = d_in_range.select(wave_d_sub_i_raw, fx.Index(0))
+                                d_local = lane_mod_32 + wave_d_sub_i * 32
+                                # B-operand (dO / Q): scatter load with padded stride LDS_Q_STRIDE=D+2
+                                # for bank-conflict-free access (16 consecutive m-rows hit 16 distinct banks).
+                                do_r  = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                                q_r   = fx.make_rmem_tensor(MFMA_LK, elem_dtype)
+                                for e in range_constexpr(MFMA_LK):
+                                    m_local = lane_div_32 * MFMA_LK + (m_sub * 32 + ks * MFMA_K + e)
+                                    do_sc = Vec.load(Vec.make_type(1, elem_dtype), lds_do, [m_local * LDS_Q_STRIDE + d_local])[0]
+                                    q_sc  = Vec.load(Vec.make_type(1, elem_dtype), lds_q,  [m_local * LDS_Q_STRIDE + d_local])[0]
+                                    fx.memref_store(do_sc, do_r,  e)
+                                    fx.memref_store(q_sc,  q_r,   e)
+                                dv_accs[d_iter] = mfma(p_pack,  fx.memref_load_vec(do_r), dv_accs[d_iter])
+                                dk_accs[d_iter] = mfma(ds_pack, fx.memref_load_vec(q_r),  dk_accs[d_iter])
+
+                    gpu.barrier()
+
+                loop_results = yield dk_accs + dv_accs + [dummy_val]
 
         # ---- Store dV and dK ----  (same output decode: M=n_key varies with r, N=d fixed)
         dk_finals = loop_results[0:D_SUBS_PER_WAVE]
@@ -1323,7 +1360,10 @@ def compile_fmha_bwd_dvdk_mfma(
             allocator.finalize()
 
         num_N_tiles = (fx.Index(N) + BLOCK_N - 1) // BLOCK_N
-        grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_N_tiles)
+        # GQA (sequencing-plan item 4): grid is regrouped by KV-head (see kernel
+        # docstring) -- H // heads_per_kv KV-heads, not H (Hq) blocks per batch.
+        n_kv_heads_idx = fx.Index(H) // heads_per_kv
+        grid_x = fx.Int32(fx.Index(B) * n_kv_heads_idx * num_N_tiles)
         fmha_bwd_dvdk_mfma_kernel(
             Q, K, V, dO, dV, dK, LSE, D_vec,
             M, N, H, n_M_tiles, q_stride_m, kv_stride_n, do_stride_m,
@@ -1346,6 +1386,7 @@ def compile_fmha_bwd_dq_mfma(
     use_pipeline: bool = False,
     gpu_arch: str = "gfx950",
     causal: bool = False,
+    heads_per_kv: int = 1,
 ):
     """Phase B.3: dQ with MFMA. Grid over M-tiles, runtime loop over N-tiles.
 
@@ -1361,11 +1402,15 @@ def compile_fmha_bwd_dq_mfma(
 
     Returns:
         launch_fn(Q, K, V, dO, dQ, LSE, D_vec, B, M, N, H, n_N_tiles,
-                  q_stride_m, kv_stride_n, stream)
+                  q_stride_m, kv_stride_n, do_stride_m, stream)
           dQ : [B*M*H*D, 1] float32 (always contiguous output)
           q_stride_m/kv_stride_n: row pitch in ROW units (real_elem_stride(dim=1)
             // D) for possibly-non-contiguous Q/dO and K/V inputs; H for
             contiguous BMHK (sequencing-plan item 7).
+          heads_per_kv (compile-time, like `causal`): GQA (sequencing-plan item 4)
+            -- H // Hkv, 1 if not GQA. K/V are indexed by kv_head_idx = head_idx //
+            heads_per_kv; dQ output stays uniquely addressed by head_idx (Hq-indexed),
+            so no accumulation change is needed here (unlike dvdk's dV/dK).
     """
     import math as _pm
     if scale is None:
@@ -1441,6 +1486,10 @@ def compile_fmha_bwd_dq_mfma(
         bh_idx    = bid_idx // num_M_tiles
         batch_idx = bh_idx // n_heads_idx
         head_idx  = bh_idx % n_heads_idx
+        # GQA (sequencing-plan item 4): heads_per_kv is a compile-time constant
+        # (like `causal`), not a runtime kernel arg -- Hq/Hkv are fixed at compile
+        # time via flydsl.py's per-shape kernel cache key.
+        kv_head_idx = head_idx // heads_per_kv
 
         m_start = m_tile * BLOCK_M
 
@@ -1477,8 +1526,11 @@ def compile_fmha_bwd_dq_mfma(
         def _do_row(q_pos):
             return fx.Int32(batch_idx * (seq_M_idx * do_stride_m_idx) + q_pos * do_stride_m_idx + head_idx)
 
+        # GQA: K/V are indexed by kv_head_idx (= head_idx // heads_per_kv), not
+        # head_idx -- multiple Q heads share one KV head. kv_stride_n_idx is K/V's
+        # own row pitch (in row units), unaffected by GQA head-count.
         def _kv_row(kv_pos):
-            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + head_idx)
+            return fx.Int32(batch_idx * (seq_N_idx * kv_stride_n_idx) + kv_pos * kv_stride_n_idx + kv_head_idx)
 
         # dQ is a freshly-allocated contiguous output -- always row pitch n_heads_idx.
         def _q_row_out(q_pos):

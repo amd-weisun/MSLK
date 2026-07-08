@@ -32,7 +32,9 @@ from .common import AttentionBwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
 
 
-def _uniform_row_pitch_reason(name: str, t: torch.Tensor) -> Optional[str]:
+def _uniform_row_pitch_reason(
+    name: str, t: torch.Tensor, allow_broadcast_heads: bool = False
+) -> Optional[str]:
     """Validate the "flat within a row, possibly-non-contiguous row pitch"
     assumption the kernel's stride-aware addressing relies on (sequencing-plan
     item 7): last dim (D) must be stride-1, and the H-axis must be flat
@@ -40,10 +42,18 @@ def _uniform_row_pitch_reason(name: str, t: torch.Tensor) -> Optional[str]:
     may exceed the contiguous H*D. Returns a reason string if unsupported,
     else None. A stride-0 (broadcast/expand) row pitch is explicitly rejected:
     it would alias every row onto row 0 under our `row_pos * stride` formula.
+
+    allow_broadcast_heads (GQA, sequencing-plan item 4): key/value may ALSO
+    have stride(-2) == 0 (a `.expand()`-broadcast H axis, e.g.
+    `key[:, :, :1].expand(-1, -1, Hq, -1)` -- test_backward_gqa's MQA-via-
+    broadcast case) -- this means the tensor's REAL KV-head count is 1, not
+    shape[2]. Query never gets this exception (no broadcast-Q case exists).
     """
     D = t.shape[-1]
     if t.stride(-1) != 1:
         return f"{name}'s last dim (head_dim) must be stride-1"
+    if allow_broadcast_heads and t.stride(-2) == 0:
+        return None
     if t.stride(-2) != D:
         return f"{name}'s head axis must be flat relative to head_dim (stride(-2) == D)"
     if t.stride(-3) % D != 0:
@@ -51,6 +61,17 @@ def _uniform_row_pitch_reason(name: str, t: torch.Tensor) -> Optional[str]:
     if t.stride(-3) == 0:
         return f"{name} has a broadcast (stride-0) row pitch, not supported"
     return None
+
+
+def _num_kv_heads(key: torch.Tensor) -> int:
+    """Real number of distinct KV heads (GQA, sequencing-plan item 4).
+
+    `key.stride(2) == 0` means every logical head slot aliases the same
+    underlying head (a `.expand()` broadcast, e.g. MQA-via-broadcast) -- the
+    real count is 1, not `key.shape[2]`. Otherwise key is a genuinely
+    distinctly-shaped `(B, N, Hkv, D)` tensor (contiguous, stride(2) == D).
+    """
+    return 1 if key.stride(2) == 0 else key.shape[2]
 
 
 @torch.library.custom_op(
@@ -80,6 +101,13 @@ def _flydsl_bwd(
     device = query.device
     dtype = query.dtype
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+
+    # GQA (sequencing-plan item 4): H_kv < H is either a genuine distinctly-shaped
+    # (B,N,Hkv,D) tensor or a stride-0 `.expand()` broadcast (H_kv=1 in that case,
+    # regardless of key.shape[2]) -- see _num_kv_heads. heads_per_kv is passed to
+    # the kernel as a COMPILE-TIME constant (like `causal`), not a runtime arg.
+    H_kv = _num_kv_heads(key)
+    heads_per_kv = H // H_kv
 
     def _as_i16(t: torch.Tensor) -> torch.Tensor:
         return t.view(torch.int16)
@@ -115,8 +143,11 @@ def _flydsl_bwd(
     LSE_2d = lse.contiguous().view(B * H * M, 1)
     D_vec = (grad.float() * out.float()).sum(dim=-1).view(B * M * H, 1)
 
-    dV_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
-    dK_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
+    # dV/dK are shaped [B, N, H_kv, D] under GQA (one gradient per KV head, summed
+    # over its heads_per_kv group by the kernel's grid-regroup-by-KV-head -- see
+    # fmha_bwd_mfma.py's compile_fmha_bwd_dvdk_mfma docstring); H_kv == H otherwise.
+    dV_out = torch.zeros(B * N * H_kv * D, 1, device=device, dtype=torch.float32)
+    dK_out = torch.zeros(B * N * H_kv * D, 1, device=device, dtype=torch.float32)
     dQ_out = torch.zeros(B * M * H * D, 1, device=device, dtype=torch.float32)
 
     stream = torch.cuda.current_stream()
@@ -148,6 +179,7 @@ def _flydsl_bwd(
         use_pipeline=True,
         gpu_arch=gpu_arch,
         causal=causal,
+        heads_per_kv=heads_per_kv,
     )
     n_M_tiles = (M + BLOCK_M_DVDK - 1) // BLOCK_M_DVDK
     args_dvdk = (
@@ -170,6 +202,7 @@ def _flydsl_bwd(
         scale=scale,
         gpu_arch=gpu_arch,
         causal=causal,
+        heads_per_kv=heads_per_kv,
     )
     n_N_tiles = (N + BLOCK_N_DQ - 1) // BLOCK_N_DQ
     args_dq = (
@@ -180,8 +213,8 @@ def _flydsl_bwd(
     compiled_dq(*args_dq)
 
     dq = dQ_out.view(B, M, H, D).to(dtype)
-    dk = dK_out.view(B, N, H, D).to(dtype)
-    dv = dV_out.view(B, N, H, D).to(dtype)
+    dk = dK_out.view(B, N, H_kv, D).to(dtype)
+    dv = dV_out.view(B, N, H_kv, D).to(dtype)
     return dq, dk, dv
 
 
@@ -222,7 +255,13 @@ class BwOp(AttentionBwOpBase):
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
-    SUPPORTS_BMGHK = False  # no GQA yet (sequencing-plan item 4)
+    # GQA (sequencing-plan item 4) is supported via the plain 4D BMHK path
+    # (key/value with Hkv < Hq, either a genuine (B,N,Hkv,D) tensor or a
+    # stride-0 `.expand()` broadcast -- see _num_kv_heads/_uniform_row_pitch_
+    # reason), matching how CK's own C++ op and test_backward_gqa use it.
+    # SUPPORTS_BMGHK covers a DIFFERENT, unrelated case (true 5D BMGHK
+    # tensors) that this kernel does not implement -- stays False.
+    SUPPORTS_BMGHK = False
     IS_DETERMINISTIC = True  # split dvdk+dq path, no atomics
     # Non-causal + simple top-left causal (single fixed-length sequence per batch)
     # only so far (sequencing-plan item 3). NOT `BlockDiagonalCausalMask` or other
@@ -238,8 +277,13 @@ class BwOp(AttentionBwOpBase):
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
-        for name, t in (("query", d.query), ("key", d.key), ("value", d.value)):
-            reason = _uniform_row_pitch_reason(name, t)
+        reason = _uniform_row_pitch_reason("query", d.query)
+        if reason is not None:
+            reasons.append(reason)
+        # key/value get the GQA broadcast exception (allow_broadcast_heads) --
+        # query never does (no broadcast-Q case exists).
+        for name, t in (("key", d.key), ("value", d.value)):
+            reason = _uniform_row_pitch_reason(name, t, allow_broadcast_heads=True)
             if reason is not None:
                 reasons.append(reason)
         # K and V share a single kv_stride_n kernel arg -- reject if they differ.
@@ -247,6 +291,11 @@ class BwOp(AttentionBwOpBase):
             reasons.append("key and value must share the same row pitch (stride(1))")
         if d.query.shape[-1] % 32 != 0:
             reasons.append("head_dim must be a multiple of 32")
+        # GQA (sequencing-plan item 4): Hq must be a whole multiple of Hkv --
+        # the kernel's heads_per_kv = Hq // Hkv grid-regroup requires this.
+        h_kv = _num_kv_heads(d.key)
+        if d.query.shape[2] % h_kv != 0:
+            reasons.append("query head count must be a multiple of the KV head count (GQA)")
         return reasons
 
     @classmethod

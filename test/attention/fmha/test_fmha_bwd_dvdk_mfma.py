@@ -27,7 +27,7 @@ def _as_i16(t):
 
 
 def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline=False,
-             causal=False, packed_qkv=False):
+             causal=False, packed_qkv=False, H_kv=None):
     tag = ""
     if use_trload:
         tag += " [trload]"
@@ -37,12 +37,18 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
         tag += " [causal]"
     if packed_qkv:
         tag += " [packed_qkv]"
+    if H_kv is not None and H_kv != H:
+        tag += f" [gqa Hkv={H_kv}]"
     print(f"  B={B} M={M} N={N} H={H} D={D} dtype={dtype}{tag}", end=" ... ", flush=True)
     if use_trload and "gfx950" not in torch.cuda.get_device_properties(device).gcnArchName:
         pytest.skip("use_trload requires gfx950 (ds_read_tr16_b64 is CDNA4-only)")
     if packed_qkv:
         assert M == N, "packed_qkv requires Q and K/V to share seqlen (stacked on a shared dim)"
+    if H_kv is not None:
+        assert not packed_qkv, "GQA and packed_qkv are independent axes, not tested combined"
+        assert H % H_kv == 0, f"H={H} must be a multiple of H_kv={H_kv}"
     scale = 1.0 / math.sqrt(D)
+    Hkv = H if H_kv is None else H_kv
 
     if packed_qkv:
         # Sequencing-plan item 7: qkv = stack([Q,K,V], dim=2), unbind -> non-contiguous
@@ -55,8 +61,11 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
         assert not Q.is_contiguous()
     else:
         Q  = torch.randn(B, M, H, D, device=device, dtype=dtype)
-        K  = torch.randn(B, N, H, D, device=device, dtype=dtype)
-        V  = torch.randn(B, N, H, D, device=device, dtype=dtype)
+        # GQA (sequencing-plan item 4): a genuinely distinctly-shaped (B,N,Hkv,D)
+        # tensor (contiguous, stride(2)==D) -- NOT the MQA-via-broadcast case
+        # (that's exercised separately by test_backward_gqa itself).
+        K  = torch.randn(B, N, Hkv, D, device=device, dtype=dtype)
+        V  = torch.randn(B, N, Hkv, D, device=device, dtype=dtype)
     O, LSE = ref_fmha_fwd(Q, K, V, scale=scale, causal=causal)
     dO = torch.randn_like(O)
     _, dK_ref, dV_ref = ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=scale, causal=causal)
@@ -83,12 +92,13 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
     do_stride_m = dO_4d.stride(1) // D
     LSE_2d = LSE.contiguous().view(B * H * M, 1)
     D_vec  = (dO.float() * O.float()).sum(dim=-1).contiguous().view(B * M * H, 1)
-    dV_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
-    dK_out = torch.zeros(B * N * H * D, 1, device=device, dtype=torch.float32)
+    dV_out = torch.zeros(B * N * Hkv * D, 1, device=device, dtype=torch.float32)
+    dK_out = torch.zeros(B * N * Hkv * D, 1, device=device, dtype=torch.float32)
 
     launch_fn = compile_fmha_bwd_dvdk_mfma(D=D, dtype_str=dtype_str,
                                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, scale=scale,
                                             use_trload=use_trload, use_pipeline=use_pipeline,
+                                            heads_per_kv=H // Hkv,
                                             gpu_arch=gpu_arch, causal=causal)
     n_M_tiles = (M + BLOCK_M - 1) // BLOCK_M
     args = (Q_4d, K_4d, V_4d, dO_4d, dV_out, dK_out, LSE_2d, D_vec,
@@ -98,8 +108,8 @@ def run_case(B, M, N, H, D, dtype, device="cuda", use_trload=False, use_pipeline
     compiled(*args)
     torch.cuda.synchronize()
 
-    dV_k = dV_out.view(B, N, H, D).to(dtype)
-    dK_k = dK_out.view(B, N, H, D).to(dtype)
+    dV_k = dV_out.view(B, N, Hkv, D).to(dtype)
+    dK_k = dK_out.view(B, N, Hkv, D).to(dtype)
     err_v = (dV_k.float() - dV_ref.float()).abs().max().item()
     err_k = (dK_k.float() - dK_ref.float()).abs().max().item()
     ok_v = torch.allclose(dV_k.float(), dV_ref.float(), rtol=0.1, atol=0.1)
@@ -164,6 +174,21 @@ CASES_PACKED_QKV = [
     (1,  256, 256,  8,  64,  torch.float16),
 ]
 
+# GQA (sequencing-plan item 4) -- genuinely distinctly-shaped (B,N,Hkv,D) K/V
+# (contiguous, Hkv < Hq, Hq % Hkv == 0). (B, M, N, H=Hq, D, dtype, H_kv).
+CASES_GQA = [
+    (1,  128,  64,  2,  64,  torch.bfloat16, 1),   # MQA (Hkv=1)
+    (1,  128,  64,  8,  64,  torch.bfloat16, 2),
+    (1,  256, 128,  8,  64,  torch.bfloat16, 4),
+    (2,  512, 128,  8,  64,  torch.bfloat16, 2),
+    (1,  256, 128,  8,  128, torch.bfloat16, 2),
+    (1,  256, 128,  8,  32,  torch.bfloat16, 2),
+    (1,  256, 128,  8,  96,  torch.bfloat16, 4),
+    (1,  256, 128,  8,  64,  torch.float16,  2),
+    # heads_per_kv==1 (Hkv==Hq) degenerate check: must match non-GQA behavior.
+    (1,  256, 128,  8,  64,  torch.bfloat16, 8),
+]
+
 
 @rocm_only
 @pytest.mark.parametrize("use_trload,use_pipeline", [(False, False), (True, False), (False, True), (True, True)])
@@ -200,6 +225,13 @@ def test_dvdk_mfma_causal(B, M, N, H, D, dtype, use_pipeline):
 @pytest.mark.parametrize("B,M,N,H,D,dtype", CASES_PACKED_QKV)
 def test_dvdk_mfma_packed_qkv(B, M, N, H, D, dtype, use_pipeline):
     assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, packed_qkv=True)
+
+
+@rocm_only
+@pytest.mark.parametrize("use_pipeline", [False, True])
+@pytest.mark.parametrize("B,M,N,H,D,dtype,H_kv", CASES_GQA)
+def test_dvdk_mfma_gqa(B, M, N, H, D, dtype, H_kv, use_pipeline):
+    assert run_case(B, M, N, H, D, dtype, device="cuda", use_pipeline=use_pipeline, H_kv=H_kv)
 
 
 if __name__ == "__main__":

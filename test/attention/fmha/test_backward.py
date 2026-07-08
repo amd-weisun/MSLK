@@ -277,7 +277,8 @@ def test_backward(  # noqa: C901
         fmha.flash.BwOp,
         fmha.ck.BwOp if torch.version.hip else fmha.cutlass.BwOp,
         fmha.cutlass_blackwell.BwOp,
-    ],
+    ]
+    + ([fmha.flydsl.BwOp] if torch.version.hip else []),
 )
 def test_backward_gqa(opBW):
     device = torch._C._get_accelerator().type

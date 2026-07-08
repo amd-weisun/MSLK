@@ -28,8 +28,8 @@ def ref_fmha_fwd(Q, K, V, scale=None, causal=False):
 
     Args:
         Q: [B, M, H, D]  (BMHK layout, matches CK convention)
-        K: [B, N, H, D]
-        V: [B, N, H, Dv]
+        K: [B, N, Hkv, D]  (Hkv == H, or Hkv < H for GQA -- H % Hkv == 0)
+        V: [B, N, Hkv, Dv]
         scale: softmax scale (default 1/sqrt(D))
         causal: if True, apply lower-triangular causal mask
 
@@ -39,13 +39,21 @@ def ref_fmha_fwd(Q, K, V, scale=None, causal=False):
     """
     B, M, H, D = Q.shape
     N = K.shape[1]
+    Hkv = K.shape[2]
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
     # Rearrange to [B, H, M/N, D] for matmuls
     q = Q.transpose(1, 2).float()  # [B, H, M, D]
-    k = K.transpose(1, 2).float()  # [B, H, N, D]
-    v = V.transpose(1, 2).float()  # [B, H, N, Dv]
+    k = K.transpose(1, 2).float()  # [B, Hkv, N, D]
+    v = V.transpose(1, 2).float()  # [B, Hkv, N, Dv]
+    if Hkv != H:
+        # GQA: broadcast each KV head across its heads_per_kv query heads
+        # (matches CK's kv_head = q_head // heads_per_kv convention).
+        assert H % Hkv == 0, f"H={H} must be a multiple of Hkv={Hkv}"
+        heads_per_kv = H // Hkv
+        k = k.repeat_interleave(heads_per_kv, dim=1)  # [B, H, N, D]
+        v = v.repeat_interleave(heads_per_kv, dim=1)  # [B, H, N, Dv]
 
     S = scale * (q @ k.transpose(-2, -1))  # [B, H, M, N]
 
@@ -68,7 +76,7 @@ def ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=None, causal=False):
     Recomputes P from (Q, K, LSE) — does not store P from forward.
 
     Args:
-        Q, K, V : [B, M/N, H, D]
+        Q, K, V : [B, M/N, H, D]  (K/V may have Hkv < H for GQA, H % Hkv == 0)
         O       : [B, M, H, Dv]  (forward output)
         dO      : [B, M, H, Dv]  (upstream gradient)
         LSE     : [B, H, M]      (log-sum-exp from forward)
@@ -76,19 +84,25 @@ def ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=None, causal=False):
 
     Returns:
         dQ: [B, M, H, D]
-        dK: [B, N, H, D]
-        dV: [B, N, H, Dv]
+        dK: [B, N, Hkv, D]   (summed over the heads_per_kv group, if GQA)
+        dV: [B, N, Hkv, Dv]
     """
     B, M, H, D = Q.shape
     N = K.shape[1]
+    Hkv = K.shape[2]
+    heads_per_kv = H // Hkv
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
     q  = Q.transpose(1, 2).float()   # [B, H, M, D]
-    k  = K.transpose(1, 2).float()   # [B, H, N, D]
-    v  = V.transpose(1, 2).float()   # [B, H, N, Dv]
+    k  = K.transpose(1, 2).float()   # [B, Hkv, N, D]
+    v  = V.transpose(1, 2).float()   # [B, Hkv, N, Dv]
     o  = O.transpose(1, 2).float()   # [B, H, M, Dv]
     do = dO.transpose(1, 2).float()  # [B, H, M, Dv]
+    if Hkv != H:
+        assert H % Hkv == 0, f"H={H} must be a multiple of Hkv={Hkv}"
+        k = k.repeat_interleave(heads_per_kv, dim=1)  # [B, H, N, D]
+        v = v.repeat_interleave(heads_per_kv, dim=1)  # [B, H, N, Dv]
 
     # --- Recompute P from Q, K, LSE (no KV re-scan) ---
     S = scale * (q @ k.transpose(-2, -1))  # [B, H, M, N]
@@ -109,6 +123,12 @@ def ref_fmha_bwd(Q, K, V, O, dO, LSE, scale=None, causal=False):
     dS = scale * dS
     dK = dS.transpose(-2, -1) @ q         # [B, H, N, D]
     dQ = dS @ k                            # [B, H, M, D]
+
+    if Hkv != H:
+        # Reduce each KV head's gradient contributions across its heads_per_kv
+        # query heads (matches CK's tmp_grad_k.unflatten(...).sum(...) convention).
+        dK = dK.unflatten(1, (Hkv, heads_per_kv)).sum(dim=2)  # [B, Hkv, N, D]
+        dV = dV.unflatten(1, (Hkv, heads_per_kv)).sum(dim=2)  # [B, Hkv, N, Dv]
 
     return (
         dQ.transpose(1, 2).to(Q.dtype),
