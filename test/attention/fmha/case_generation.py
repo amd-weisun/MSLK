@@ -28,6 +28,11 @@ def sample_random_supported_fw(
     fw_ops = list(fw_ops)
     if op_bw == fmha.cutlass_blackwell.BwOp:
         fw_ops = [fmha.cutlass_blackwell.FwOp, fmha.flash.FwOp]
+    if op_bw == fmha.flydsl.BwOp:
+        # flydsl.BwOp has no forward kernel of its own and must be paired with
+        # ck.FwOp specifically (same LSE convention) -- see flydsl.py's module
+        # docstring and test_backward.py's separate, equivalent carve-out.
+        fw_ops = [fmha.ck.FwOp]
     if (
         isinstance(inp.attn_bias, fmha.attn_bias.VARLEN_BIASES)
         and inp.attn_bias.q_seqinfo.seqstart.shape[0] > 2
