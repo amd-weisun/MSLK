@@ -30,13 +30,8 @@ from mslk.quantize.triton.legacy.primitives import (  # noqa: F401
 from mslk.quantize.triton.legacy.quantize import triton_quantize_nvfp4  # noqa: F401
 from mslk.quantize.triton.legacy.quantize_stacked import (  # noqa: F401
     _nvfp4_quantize_stacked_kernel,
-    mega_fp4_quantize_kernel,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
-)
-from mslk.quantize.triton.legacy.unpack import (  # noqa: F401
-    mega_fp4_pack,
-    mega_fp4_unpack,
 )
 from mslk.quantize.triton.quantize_kernels.mx4 import quantize_mx4
 
@@ -130,9 +125,6 @@ __all__ = [
     "calculate_group_max",
     "nvfp4_quantize_stacked",
     "nvfp4_quantize_stacked_with_token_scale",
-    "mega_fp4_quantize_kernel",
-    "mega_fp4_pack",
-    "mega_fp4_unpack",
     "cal_global_scale_mx4_as_nvfp4",
     "RoundingMode",
     "get_mx4_exp_bias",
