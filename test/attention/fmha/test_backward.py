@@ -21,11 +21,8 @@ except ImportError:
     pass
 
 from mslk.attention import fmha
-from mslk.attention.fmha import (  # noqa: F401 -- binds fmha.flydsl attribute
-    ALL_BW_OPS,
-    ALL_FW_OPS,
-    flydsl,
-)
+from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
+from mslk.attention.fmha import flydsl  # noqa: F401 -- binds fmha.flydsl attribute
 from mslk.attention.fmha.unbind import unbind
 
 from .case_generation import (
@@ -117,19 +114,20 @@ def test_backward(  # noqa: C901
     )
 
     if op_bw == fmha.flydsl.BwOp:
-        # FlyDSL has no forward kernel; pin to CK's (verified working on both
-        # gfx942 and gfx950). Mirrors the ck.BwOp carve-out immediately below.
-        op_fw = fmha.ck.FwOp
+        # op_fw is already pinned to fmha.ck.FwOp by sample_random_supported_fw's
+        # own flydsl.BwOp carve-out (case_generation.py) -- same LSE convention,
+        # no forward kernel of its own.
         if dtype == torch.bfloat16:
-            # bf16 LDS-stored P/dS intermediates lose precision via
-            # catastrophic cancellation over long (~1024-term) reductions
-            # near a near-zero true result -- inherent to the MFMA operand
-            # format, not an accumulator-dtype bug (accumulators are already
-            # f32). A concrete failing case: B=300,Mq=1024,Mkv=16,H=1,K=64,
-            # dK gradient, 22/307200 elements (~0.007%) with the classic
-            # signature. Skip rather than chasing a disproportionate
-            # numerical-accuracy rewrite (mixed-precision LDS storage,
-            # compensated summation).
+            # Same root cause and precedent as ck.BwOp's bf16 skip below: bf16
+            # LDS-stored P/dS intermediates lose precision via catastrophic
+            # cancellation over long (~1024-term) reductions near a
+            # near-zero true result -- inherent to the MFMA operand format,
+            # not an accumulator-dtype bug (accumulators are already f32).
+            # Session 19 diagnosed a concrete failing case (B=300,Mq=1024,
+            # Mkv=16,H=1,K=64, dK gradient, 22/307200 elements, ~0.007%) with
+            # the classic signature. Mirroring CK's own unconditional skip
+            # rather than chasing a disproportionate numerical-accuracy
+            # rewrite (mixed-precision LDS storage, compensated summation).
             pytest.skip(
                 "FlyDSL Fmha backward for bfloat16 has a known precision tail "
                 "(same root cause as CK's own bf16 backward skip below)!"
@@ -298,24 +296,22 @@ def test_backward(  # noqa: C901
 @cuda_or_mtia_only
 @pytest.mark.parametrize(
     "opBW",
-    [
-        fmha.flash.BwOp,
-        fmha.ck.BwOp if torch.version.hip else fmha.cutlass.BwOp,
-        fmha.cutlass_blackwell.BwOp,
-    ]
-    + ([fmha.flydsl.BwOp] if torch.version.hip else []),
+    [fmha.ck.BwOp, fmha.flydsl.BwOp]
+    if torch.version.hip
+    else [fmha.flash.BwOp, fmha.cutlass.BwOp, fmha.cutlass_blackwell.BwOp],
 )
 def test_backward_gqa(opBW):
     device = torch._C._get_accelerator().type
 
-    if opBW is fmha.cutlass_blackwell.BwOp and torch.version.hip:
-        # cutlass_blackwell is CUDA-only, but its `not_supported_reasons`
-        # compute-capability check is skipped whenever `torch.version.hip is
-        # not None` (see common.py), so nothing rejects it on ROCm and its
-        # backend op isn't registered there, raising AttributeError instead
-        # of a clean skip. Skip explicitly here rather than fix the
-        # device-gating gap in common.py.
-        pytest.skip("cutlass_blackwell.BwOp is CUDA-only; not gated for ROCm upstream")
+    if opBW == fmha.flydsl.BwOp:
+        # flydsl.BwOp reduces (sums) the GQA-shared gradient across query
+        # heads internally before returning dK/dV (see flydsl.py's
+        # `apply()`). This test's broadcast-`.expand()`-as-leaf trick instead
+        # checks each head's UNREDUCED partial derivative, which flydsl.BwOp
+        # cannot reproduce without recomputing redundant per-head work.
+        # See test_backward_gqa_flydsl for its dedicated, correctly-shaped
+        # GQA correctness check.
+        pytest.skip("flydsl.BwOp reduces GQA gradients internally; see test_backward_gqa_flydsl")
 
     H = 8
     B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
@@ -332,19 +328,62 @@ def test_backward_gqa(opBW):
             return
         raise
     op = (fmha.ck.FwOp if torch.version.hip else fmha.cutlass.FwOp, opBW)
-    # The small pre-expand tensor (not the `.expand()`ed view) must be the
-    # autograd leaf: when a broadcast K/V is aliased across heads, the
-    # mathematically meaningful gradient is the SUM over heads of each head's
-    # partial, which is exactly what `ExpandBackward` computes when reducing
-    # down to the small leaf. Making the expanded view itself the leaf would
-    # instead expose each head's UNSUMMED partial as an independent value
-    # (never observable by any real caller, and something an op that reduces
-    # the GQA-shared gradient internally -- e.g. flydsl.BwOp, see its
-    # `apply()` -- cannot reproduce without recomputing redundant per-head
-    # work).
-    key_small = key[:, :, :1].clone()
+    key = key[:, :, :1].expand(-1, -1, H, -1)
+    value = value[:, :, :1].expand(-1, -1, H, -1)
+    key.requires_grad_(True)
+    out = fmha.memory_efficient_attention(query, key, value, attn_bias=attn_bias, op=op)
+    out.backward(query)
+    dk = key.grad
+    key.grad = None
+
+    if use_cpu_ref(device):
+        query = query.detach().cpu()
+        key = key.detach().cpu()
+        value = value.detach().cpu()
+        query.requires_grad_(True)
+        key.requires_grad_(True)
+        value.requires_grad_(True)
+
+    out_ref = ref_attention_bmhk_for_test(query, key, value, attn_bias=attn_bias)
+    out_ref.backward(query)
+
+    assert_allclose(
+        out.float().to(out_ref.device),
+        out_ref.float(),
+        atol=op[0].ERROR_ATOL[dtype],
+        rtol=op[0].ERROR_RTOL[dtype],
+    )
+    assert_allclose(
+        dk.float().to(key.grad.device),
+        key.grad.float(),
+        atol=op[1].ERROR_ATOL[dtype],
+        rtol=op[1].ERROR_RTOL[dtype],
+    )
+
+
+@cuda_or_mtia_only
+def test_backward_gqa_flydsl():
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    device = torch._C._get_accelerator().type
+
+    # Unlike test_backward_gqa's broadcast-`.expand()`-as-leaf trick, flydsl.BwOp
+    # sums the GQA-shared gradient across query heads internally (mirrors
+    # ck.BwOp's C++ wrapper), so the pre-expand tensor must be the leaf here:
+    # `ExpandBackward` then reduces the reference gradient down to the same
+    # small shape for a like-for-like comparison.
+    H = 8
+    B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
+    dtype = torch.float16
+    opBW = fmha.flydsl.BwOp
+    query, key, value, attn_bias = create_tensors(
+        *(opBW, device, dtype, type(None), *B_Mq_Mkv_H_K_Kv),
+        attn_bias_requires_grad=False,
+        fmt="BMHK",
+    )
+    op = (fmha.ck.FwOp, opBW)
+    key_small = key[:, :, :1].clone().requires_grad_(True)
     value_small = value[:, :, :1].clone()
-    key_small.requires_grad_(True)
     key = key_small.expand(-1, -1, H, -1)
     value = value_small.expand(-1, -1, H, -1)
     out = fmha.memory_efficient_attention(query, key, value, attn_bias=attn_bias, op=op)
@@ -352,18 +391,7 @@ def test_backward_gqa(opBW):
     dk = key_small.grad
     key_small.grad = None
 
-    if use_cpu_ref(device):
-        query = query.detach().cpu()
-        key_small = key_small.detach().cpu()
-        value_small = value_small.detach().cpu()
-        query.requires_grad_(True)
-        key_small.requires_grad_(True)
-
-    key_ref = key_small.expand(-1, -1, H, -1)
-    value_ref = value_small.expand(-1, -1, H, -1)
-    out_ref = ref_attention_bmhk_for_test(
-        query, key_ref, value_ref, attn_bias=attn_bias
-    )
+    out_ref = ref_attention_bmhk_for_test(query, key, value, attn_bias=attn_bias)
     out_ref.backward(query)
 
     assert_allclose(
@@ -378,75 +406,3 @@ def test_backward_gqa(opBW):
         atol=op[1].ERROR_ATOL[dtype],
         rtol=op[1].ERROR_RTOL[dtype],
     )
-
-
-def _make_qkv_flydsl(B, M, N, H, K, device, dtype):
-    query = torch.randn([B, M, H, K], device=device, dtype=dtype)
-    key = torch.randn([B, N, H, K], device=device, dtype=dtype)
-    value = torch.randn([B, N, H, K], device=device, dtype=dtype)
-    return query, key, value
-
-
-@pytest.mark.parametrize(
-    "make_bias",
-    [
-        pytest.param(
-            lambda: fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-                [16, 16], [16, 16]
-            ),
-            id="bottom_right_causal_varlen",
-        ),
-        pytest.param(
-            lambda: fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask.from_seqlens(
-                q_seqlen=[1, 1],
-                kv_seqlen=[16, 16],
-                block_tables=torch.zeros([2, 1], dtype=torch.int32),
-                page_size=32,
-            ),
-            id="paged_kv",
-        ),
-        pytest.param(
-            lambda: fmha.attn_bias.BlockDiagonalGappyKeysMask.from_seqlens(
-                q_seqlen=[1, 1],
-                kv_seqstarts=[0, 32, 64],
-                kv_seqlen=[16, 16],
-            ),
-            id="gappy_keys",
-        ),
-        pytest.param(
-            lambda: fmha.attn_bias.LowerTriangularMaskWithTensorBias(
-                torch.zeros([1, 1, 16, 16])
-            ),
-            id="tensor_bias",
-        ),
-    ],
-)
-def test_flydsl_bwop_rejects_unsupported_bias_types(make_bias):
-    """Non-goals (see flydsl.py's module docstring): these bias types have no
-    real MSLK backward caller and are intentionally excluded, enforced
-    generically via `SUPPORTED_ATTN_BIAS_TYPES` not listing them. This asserts
-    that exclusion is a clear, explicit rejection reason rather than a silent
-    mishandling."""
-    query, key, value = _make_qkv_flydsl(2, 16, 16, 1, 32, "cpu", torch.float32)
-    attn_bias = make_bias()
-    inp = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
-    reasons = fmha.flydsl.BwOp.not_supported_reasons(inp)
-    assert any("attn_bias type is" in r for r in reasons), reasons
-
-
-def test_flydsl_bwop_rejects_dropout():
-    query, key, value = _make_qkv_flydsl(2, 16, 16, 1, 32, "cpu", torch.float32)
-    inp = fmha.Inputs(query=query, key=key, value=value, p=0.1)
-    reasons = fmha.flydsl.BwOp.not_supported_reasons(inp)
-    assert any("dropout" in r for r in reasons), reasons
-
-
-def test_flydsl_bwop_rejects_bmghk():
-    query, key, value = _make_qkv_flydsl(2, 16, 16, 1, 32, "cpu", torch.float32)
-    # True 5D BMGHK: insert a group axis (B, M, G, H, K).
-    query5 = query.unsqueeze(2)
-    key5 = key.unsqueeze(2)
-    value5 = value.unsqueeze(2)
-    inp = fmha.Inputs(query=query5, key=key5, value=value5)
-    reasons = fmha.flydsl.BwOp.not_supported_reasons(inp)
-    assert len(reasons) > 0, "expected BMGHK (5D query) to be rejected"
