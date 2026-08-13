@@ -21,8 +21,11 @@ except ImportError:
     pass
 
 from mslk.attention import fmha
-from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
-from mslk.attention.fmha import flydsl  # noqa: F401 -- binds fmha.flydsl attribute
+from mslk.attention.fmha import (  # noqa: F401 -- binds fmha.flydsl attribute
+    ALL_BW_OPS,
+    ALL_FW_OPS,
+    flydsl,
+)
 from mslk.attention.fmha.unbind import unbind
 
 from .case_generation import (
@@ -311,7 +314,9 @@ def test_backward_gqa(opBW):
         # cannot reproduce without recomputing redundant per-head work.
         # See test_backward_gqa_flydsl for its dedicated, correctly-shaped
         # GQA correctness check.
-        pytest.skip("flydsl.BwOp reduces GQA gradients internally; see test_backward_gqa_flydsl")
+        pytest.skip(
+            "flydsl.BwOp reduces GQA gradients internally; see test_backward_gqa_flydsl"
+        )
 
     H = 8
     B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
