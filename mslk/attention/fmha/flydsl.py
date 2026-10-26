@@ -47,9 +47,6 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
-- Bottom-right local attention (`LowerTriangularFromBottomRightLocalAttentionMask`):
-  the window term uses the top-left diagonal, so it cannot be combined with
-  bottom-right alignment. Rejected via `SUPPORTED_ATTN_BIAS_TYPES` omission.
 """
 
 import math
@@ -1515,8 +1512,8 @@ class BwOp(AttentionBwOpBase):
     # (never seqstart-global), which already implements per-block causal
     # masking correctly given per-batch tiling -- confirmed via
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
-    # Bottom-right is the tri-state's second mode. The bottom-right LOCAL
-    # types stay out: the window term still uses the top-left diagonal.
+    # Bottom-right is the tri-state's second mode; its window term is measured
+    # from the bottom-right diagonal (see _window_keep).
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,
@@ -1528,6 +1525,8 @@ class BwOp(AttentionBwOpBase):
         # Bottom-right alignment, dense and per-block.
         LowerTriangularFromBottomRightMask,
         BlockDiagonalCausalFromBottomRightMask,
+        # Bottom-right alignment + sliding window.
+        LowerTriangularFromBottomRightLocalAttentionMask,
     )
     _TEST_K: List[int] = [32, 48, 64, 96, 128, 256]
     NAME = "flydslB"

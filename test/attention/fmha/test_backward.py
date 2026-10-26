@@ -731,3 +731,34 @@ def test_backward_flydsl_deterministic(heads):
     out_ref.backward(grad_out)
     for name, got, ref in zip(("dq", "dk", "dv"), first, leaves_ref):
         _assert_grad_close(got.float(), ref.grad.float(), f"flydslB deterministic:{name}")
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("window", [8, 33, 200])
+@pytest.mark.parametrize("seqlens", [(128, 128), (64, 256), (100, 333)])
+def test_backward_flydsl_bottom_right_local_attention(seqlens, window):
+    # The window is measured from the bottom-right diagonal, so it only differs
+    # from the top-left one when Mq != Mkv.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    Mq, Mkv = seqlens
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves = [
+        torch.randn(2, n, 4, 64, device=device, dtype=dtype).requires_grad_(True)
+        for n in (Mq, Mkv, Mkv)
+    ]
+    bias = fmha.attn_bias.LowerTriangularFromBottomRightLocalAttentionMask(window)
+    out = fmha.memory_efficient_attention(
+        *leaves, attn_bias=bias, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    ref = ref_attention_for_test(*leaves, bias)
+    ref.backward(grad_out)
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
