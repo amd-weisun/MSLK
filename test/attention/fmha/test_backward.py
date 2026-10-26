@@ -515,11 +515,10 @@ def test_dispatch_bw_falls_back_to_flydsl_on_arch_ck_is_not_built_for(monkeypatc
     assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.ck.BwOp
 
 
-def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss):
+def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss, dtype=torch.bfloat16):
     """Runs flydsl.FwOp/BwOp against the reference for inputs `make_inputs`
     builds as (leaf tensors, q, k, v) and a loss built by `make_grad_loss`."""
     device = torch._C._get_accelerator().type
-    dtype = torch.bfloat16
     torch.manual_seed(0)
     leaves, query, key, value = make_inputs(device, dtype, head_dim)
     out = fmha.memory_efficient_attention(
@@ -625,3 +624,57 @@ def test_flydsl_fwd_declines_dropout_with_gradients():
 
     assert dropout_reasons(requires_grad=True)
     assert not dropout_reasons(requires_grad=False)
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 256])
+def test_backward_flydsl_fwd_bwd_pair(head_dim, dtype):
+    # The FlyDSL forward and backward are dispatched as a pair on archs CK is
+    # not built for, so check them together against the reference.
+    if not torch.version.hip:
+        pytest.skip("flydsl ops are ROCm-only")
+    _flydsl_bwd_case(head_dim, _plain_inputs, lambda out: (out**2).sum(), dtype=dtype)
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [48, 64])
+def test_backward_flydsl_gqa_broadcast_kv(head_dim):
+    # Stride-0 `.expand()` K/V (GQA) must stay correct with and without the
+    # head-dim padding path, which has to materialise them.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        k_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        v_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        leaves = [t.requires_grad_(True) for t in (q, k_small, v_small)]
+        return (
+            leaves,
+            leaves[0],
+            leaves[1].expand(-1, -1, H, -1),
+            leaves[2].expand(-1, -1, H, -1),
+        )
+
+    _flydsl_bwd_case(head_dim, make_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_transposed_head_axis():
+    # A head axis that is not flat relative to head_dim is copied, not declined.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q_t = torch.randn(B, H, N, head_dim, device=device, dtype=dtype)
+        k, v = (
+            torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+            for _ in range(2)
+        )
+        leaves = [t.requires_grad_(True) for t in (q_t, k, v)]
+        return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
+
+    _flydsl_bwd_case(64, make_inputs, lambda out: (out**2).sum())
