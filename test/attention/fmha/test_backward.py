@@ -486,3 +486,30 @@ def test_backward_flydsl_block_diagonal_causal_local_and_unwindowed(head_dim):
                 atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
                 rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
             )
+
+
+@cuda_or_mtia_only
+def test_dispatch_bw_falls_back_to_flydsl_on_arch_ck_is_not_built_for(monkeypatch):
+    if not torch.version.hip:
+        pytest.skip("ROCm dispatch list")
+    if not fmha.flydsl._is_flydsl_available():
+        pytest.skip("FlyDSL unavailable on this device/arch")
+    from mslk.attention.fmha.dispatch import _dispatch_bw
+
+    device = torch._C._get_accelerator().type
+    query, key, value, attn_bias = create_tensors(
+        *(fmha.flydsl.BwOp, device, torch.bfloat16, type(None), 1, 128, 128, 4, 64, 64),
+        attn_bias_requires_grad=False,
+        fmt="BMHK",
+    )
+    inp = fmha.Inputs(query, key, value, attn_bias)
+
+    # An arch outside CK's build set makes it decline, so the next op is chosen.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", {"gfx_not_this_one"})
+    reasons = fmha.ck.BwOp.not_supported_reasons(inp)
+    assert any("gfx arch" in r for r in reasons), reasons
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.flydsl.BwOp
+
+    # With the real arch set on CK, CK stays preferred wherever it is built.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", None)
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.ck.BwOp

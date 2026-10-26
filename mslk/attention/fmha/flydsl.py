@@ -12,11 +12,11 @@ that judges CK's `ck.BwOp` (both are covered by `test_backward`'s `ALL_BW_OPS`
 parametrization there).
 
 Part of `ALL_BW_OPS` in `mslk/attention/fmha/__init__.py` (guarded by
-`torch.version.hip`) for TEST-ENUMERATION purposes only -- this broadens which
-test files (`test_mem_eff_attention.py`, `test_forward.py`) exercise this op.
-It is deliberately NOT wired into `dispatch.py`'s live `_dispatch_bw()`
-priority list, which still hardcodes `[ck.BwOp]` on ROCm -- this op is not a
-live production backend.
+`torch.version.hip`), which broadens which test files (`test_mem_eff_attention.py`,
+`test_forward.py`) exercise this op. It is also the second entry of
+`dispatch.py`'s ROCm `_dispatch_bw()` priority list, after `ck.BwOp`: CK wins
+on the archs it is built for and declines the rest (`SUPPORTED_GFX_ARCHS`), which
+is when this op is selected.
 
 Stride-aware addressing: the kernel supports Q/K/V/dO with a possibly-non-
 contiguous per-tensor row pitch — e.g. a packed-`qkv` tensor sliced/unbound
@@ -32,8 +32,7 @@ negative-path test in `test_backward.py`):
 - Dropout (`d.p != 0.0`): no MSLK caller passes dropout through this op;
   rejected generically by `AttentionOpBase.not_supported_reasons()`'s
   `(d.p != 0.0) and not cls.SUPPORTS_DROPOUT` check (`SUPPORTS_DROPOUT = False`
-  below). Revisit if `flydsl.BwOp` is ever added to a live dispatch path and a
-  caller trips this.
+  below). Revisit if a caller trips this now that the op is dispatched.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
@@ -46,14 +45,9 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
-- Tensor-bias / ALiBi (`LowerTriangularMaskWithTensorBias` and similar): no
-  MSLK caller found for this backward op. Rejected the same way, via
-  `SUPPORTED_ATTN_BIAS_TYPES` omission.
-- Bottom-right varlen (`BlockDiagonalCausalFromBottomRightMask` and other
-  bottom-right alignment variants): only top-left causal alignment, including
-  `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
-  way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
-  bottom-right causal masking specifically.
+- Bottom-right local attention (`LowerTriangularFromBottomRightLocalAttentionMask`):
+  the window term uses the top-left diagonal, so it cannot be combined with
+  bottom-right alignment. Rejected via `SUPPORTED_ATTN_BIAS_TYPES` omission.
 """
 
 import math
@@ -1505,6 +1499,8 @@ class BwOp(AttentionBwOpBase):
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
+        if not _is_flydsl_available():
+            reasons.append("FlyDSL unavailable on this device/arch")
         reason = _uniform_row_pitch_reason("query", d.query)
         if reason is not None:
             reasons.append(reason)
