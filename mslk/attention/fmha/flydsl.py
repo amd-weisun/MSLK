@@ -331,6 +331,14 @@ class FwOp(AttentionFwOpBase):
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
 
+        # Dropout masks are drawn with torch.rand inside the forward, so no
+        # backward can reproduce them; `apply` would raise after selection.
+        if _needs_grad and d.p != 0.0:
+            reasons.append(
+                "dropout with gradients is not supported (the mask is not "
+                "reproducible in the backward)"
+            )
+
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
         # ignored (only gappy paged folds sm_scale).
         if d.scale is not None and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):

@@ -604,3 +604,24 @@ def test_backward_flydsl_key_value_row_pitch_differs():
             atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
             rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
         )
+
+
+@cuda_or_mtia_only
+def test_flydsl_fwd_declines_dropout_with_gradients():
+    if not torch.version.hip:
+        pytest.skip("flydsl.FwOp is ROCm-only")
+    device = torch._C._get_accelerator().type
+    q = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    def dropout_reasons(requires_grad):
+        inp = fmha.Inputs(
+            q.clone().requires_grad_(requires_grad),
+            k.clone().requires_grad_(requires_grad),
+            v.clone().requires_grad_(requires_grad),
+            p=0.1,
+        )
+        return [r for r in fmha.flydsl.FwOp.not_supported_reasons(inp) if "dropout" in r]
+
+    assert dropout_reasons(requires_grad=True)
+    assert not dropout_reasons(requires_grad=False)
