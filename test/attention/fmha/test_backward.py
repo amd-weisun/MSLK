@@ -515,6 +515,14 @@ def test_dispatch_bw_falls_back_to_flydsl_on_arch_ck_is_not_built_for(monkeypatc
     assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.ck.BwOp
 
 
+def _assert_grad_close(got, ref, msg, rel_tol=3e-2):
+    """Max error relative to the reference's largest entry. The harness's
+    absolute tolerances are loose enough to hide O(10%) gradient errors."""
+    assert got.shape == ref.shape, f"{msg}: shape {got.shape} != {ref.shape}"
+    rel = (got.float() - ref.float()).abs().max() / ref.float().abs().max()
+    assert rel < rel_tol, f"{msg}: max relative error {rel.item():.3e} >= {rel_tol}"
+
+
 def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss, dtype=torch.bfloat16):
     """Runs flydsl.FwOp/BwOp against the reference for inputs `make_inputs`
     builds as (leaf tensors, q, k, v) and a loss built by `make_grad_loss`."""
@@ -532,13 +540,7 @@ def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss, dtype=torch.bfloat16
     out_ref = ref_attention_for_test(query, key, value, None)
     make_grad_loss(out_ref).backward()
     for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
-        assert_allclose(
-            grad.float(),
-            leaf.grad.float(),
-            msg=f"flydslB:{name}",
-            atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
-            rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
-        )
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
 
 
 def _plain_inputs(device, dtype, head_dim):
@@ -596,13 +598,7 @@ def test_backward_flydsl_key_value_row_pitch_differs():
     ref = ref_attention_for_test(query, key, value, None)
     ref.backward(grad_out)
     for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
-        assert_allclose(
-            grad.float(),
-            leaf.grad.float(),
-            msg=f"flydslB:{name}",
-            atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
-            rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
-        )
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
 
 
 @cuda_or_mtia_only
@@ -628,7 +624,7 @@ def test_flydsl_fwd_declines_dropout_with_gradients():
 
 @cuda_or_mtia_only
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 256])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
 def test_backward_flydsl_fwd_bwd_pair(head_dim, dtype):
     # The FlyDSL forward and backward are dispatched as a pair on archs CK is
     # not built for, so check them together against the reference.

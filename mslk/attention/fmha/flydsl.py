@@ -705,9 +705,7 @@ def _with_kernel_layout(
     t: torch.Tensor, allow_broadcast_heads: bool = False
 ) -> torch.Tensor:
     """`t` itself if the kernel's stride-aware addressing can read it as is,
-    else a contiguous copy. Copying is cheaper than declining the op, which on
-    ROCm archs without a CK build leaves the caller with no backward at all.
-    """
+    else a contiguous copy."""
     reason = _uniform_row_pitch_reason("", t, allow_broadcast_heads)
     return t if reason is None else t.contiguous()
 
@@ -893,8 +891,10 @@ def _flydsl_bwd(
     LSE_2d = lse.contiguous().view(_lse_dvec_rows, 1)
     stream = torch.cuda.current_stream()
     # D_vec = rowsum(dO * O) per query row. Use the FlyDSL preprocess kernel
-    # when D is compatible (D%64==0), otherwise fall back to PyTorch ops.
-    _use_preprocess_kernel = D % 64 == 0
+    # when D is compatible, otherwise fall back to PyTorch ops. The kernel
+    # reduces D/8 threads per row with xor shuffles, so D/8 must be a power of
+    # two (D=192 would use 24 lanes and sum the wrong ones).
+    _use_preprocess_kernel = D in (64, 128, 256)
     if _use_preprocess_kernel:
         from mslk.attention.flydsl.fmha_bwd_preprocess import (
             compile_fmha_bwd_preprocess,
