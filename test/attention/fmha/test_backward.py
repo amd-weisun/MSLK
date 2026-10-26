@@ -602,27 +602,6 @@ def test_backward_flydsl_key_value_row_pitch_differs():
 
 
 @cuda_or_mtia_only
-def test_flydsl_fwd_declines_dropout_with_gradients():
-    if not torch.version.hip:
-        pytest.skip("flydsl.FwOp is ROCm-only")
-    device = torch._C._get_accelerator().type
-    q = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
-    k, v = torch.randn_like(q), torch.randn_like(q)
-
-    def dropout_reasons(requires_grad):
-        inp = fmha.Inputs(
-            q.clone().requires_grad_(requires_grad),
-            k.clone().requires_grad_(requires_grad),
-            v.clone().requires_grad_(requires_grad),
-            p=0.1,
-        )
-        return [r for r in fmha.flydsl.FwOp.not_supported_reasons(inp) if "dropout" in r]
-
-    assert dropout_reasons(requires_grad=True)
-    assert not dropout_reasons(requires_grad=False)
-
-
-@cuda_or_mtia_only
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
 def test_backward_flydsl_fwd_bwd_pair(head_dim, dtype):
@@ -801,3 +780,121 @@ def test_backward_flydsl_value_head_dim_differs(dims, causal):
     for name, got, leaf in zip(("dq", "dk", "dv"), (grads.dq, grads.dk, grads.dv), leaves):
         assert got.shape == leaf.shape
         _assert_grad_close(got.float(), leaf.grad.float(), f"flydslB value dim:{name}")
+
+
+def _ck_dropout_ops_usable(inp):
+    return (
+        not fmha.ck.FwOp.not_supported_reasons(inp)
+        and not fmha.ck.BwOp.not_supported_reasons(inp)
+        and hasattr(torch.ops.xformers, "_ck_rand_uniform")
+    )
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("seqlens", [(32, 32), (100, 70), (64, 256)])
+def test_dropout_mask_matches_ck(seqlens):
+    # The mask is CK's: same philox, counters and byte layout, so a forward and
+    # backward from different backends can share `Context.rng_state`.
+    if not torch.version.hip or not hasattr(torch.ops.xformers, "_ck_rand_uniform"):
+        pytest.skip("CK dropout oracle unavailable")
+    from mslk.attention.flydsl.fmha_dropout import philox_randval
+    from mslk.utils.device import is_gfx942, is_gfx950
+
+    if not (is_gfx942() or is_gfx950()):
+        pytest.skip("CK dropout oracle is built for gfx942/gfx950 only")
+    Mq, Mkv = seqlens
+    device = torch.device(torch._C._get_accelerator().type)
+    torch.cuda.manual_seed(1234)
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    for B, H in [(1, 1), (2, 3)]:  # the second call has a non-zero offset
+        seed, offset = gen.initial_seed(), gen.get_offset()
+        expected = torch.ops.xformers._ck_rand_uniform(
+            0.1, B, H, Mq, Mkv, torch.cuda.current_device()
+        )
+        got = philox_randval(seed, offset, B, H, Mq, Mkv, device)
+        assert torch.equal(got, expected), f"mismatch at B={B} H={H} offset={offset}"
+
+
+def _dropout_reference_grads(q, k, v, grad_out, keep, p, causal):
+    ql, kl, vl = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    S = q.shape[1]
+    scores = torch.einsum("bmhd,bnhd->bhmn", ql, kl) * q.shape[-1] ** -0.5
+    if causal:
+        tril = torch.ones(S, S, device=q.device, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~tril, float("-inf"))
+    probs = scores.softmax(-1) * keep.float() / (1.0 - p)
+    out = torch.einsum("bhmn,bnhd->bmhd", probs, vl)
+    out.backward(grad_out.float())
+    return out, ql.grad, kl.grad, vl.grad
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("p", [0.1, 0.5])
+@pytest.mark.parametrize("heads", [(4, 4), (8, 2)])
+def test_backward_flydsl_dropout(heads, p, causal):
+    if not torch.version.hip or not fmha.flydsl._is_flydsl_available():
+        pytest.skip("flydsl ops are ROCm-only")
+    from mslk.attention.flydsl.fmha_dropout import philox_keep_mask
+    from mslk.utils.device import is_gfx950
+
+    if not is_gfx950():
+        pytest.skip("the FlyDSL dropout backward is implemented for gfx950 only")
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    H, Hkv = heads
+    B, S, D = 2, 200, 64  # S is not a multiple of the 32x32 mask tile
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    grad_out = torch.randn_like(q)
+    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    kx, vx = (t.repeat_interleave(H // Hkv, dim=2) for t in (k, v))
+    inp = fmha.Inputs(q, kx, vx, attn_bias=bias, p=p)
+    assert not fmha.flydsl.FwOp.not_supported_reasons(inp)
+    assert not fmha.flydsl.BwOp.not_supported_reasons(inp)
+
+    out, ctx = fmha.flydsl.FwOp.apply(inp, needs_gradient=True)
+    seed, offset = ctx.rng_state.tolist()
+    grads = fmha.flydsl.BwOp.apply(ctx, inp, grad_out)
+
+    keep = philox_keep_mask(seed, offset, p, B, H, S, S, torch.device(device))
+    ref_out, ref_dq, ref_dk, ref_dv = _dropout_reference_grads(
+        q, kx, vx, grad_out, keep, p, causal
+    )
+    _assert_grad_close(out, ref_out, "flydslF dropout out")
+    for name, got, ref in (
+        ("dq", grads.dq, ref_dq),
+        ("dk", grads.dk, ref_dk),
+        ("dv", grads.dv, ref_dv),
+    ):
+        _assert_grad_close(got, ref, f"flydslB dropout {name}")
+
+    # A second call draws a fresh mask rather than replaying the first.
+    _, ctx2 = fmha.flydsl.FwOp.apply(inp, needs_gradient=True)
+    assert ctx2.rng_state.tolist() != ctx.rng_state.tolist()
+
+    # Either backend replays the same mask from the shared state.
+    if _ck_dropout_ops_usable(inp):
+        grads_ck = fmha.ck.BwOp.apply(ctx, inp, grad_out)
+        for name, got, ref in (
+            ("dq", grads.dq, grads_ck.dq),
+            ("dk", grads.dk, grads_ck.dk),
+            ("dv", grads.dv, grads_ck.dv),
+        ):
+            _assert_grad_close(got, ref, f"flydslB vs ck.BwOp dropout {name}")
+
+
+@cuda_or_mtia_only
+def test_flydsl_bwd_declines_dropout_on_varlen():
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    device = torch._C._get_accelerator().type
+    seqlens = [32, 64]
+    bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens(seqlens)
+    q = torch.randn(1, sum(seqlens), 2, 64, device=device, dtype=torch.bfloat16)
+    inp = fmha.Inputs(q, q.clone(), q.clone(), attn_bias=bias, p=0.1)
+    assert any(
+        "dropout" in r for r in fmha.flydsl.BwOp.not_supported_reasons(inp)
+    )
