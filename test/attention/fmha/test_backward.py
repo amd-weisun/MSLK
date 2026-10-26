@@ -762,3 +762,42 @@ def test_backward_flydsl_bottom_right_local_attention(seqlens, window):
     ref.backward(grad_out)
     for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
         _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("dims", [(192, 128), (64, 128), (128, 96), (80, 48)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_backward_flydsl_value_head_dim_differs(dims, causal):
+    # q/k and v/dO contract over different dims (e.g. MLA's 192/128). The
+    # forward is computed with torch so only the backward is under test.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    qk_dim, v_dim = dims
+    B, S, H = 2, 128, 4
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves = [
+        torch.randn(B, S, H, d, device=device, dtype=dtype).requires_grad_(True)
+        for d in (qk_dim, qk_dim, v_dim)
+    ]
+    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    q, k, v = leaves
+    scale = qk_dim**-0.5
+    with torch.no_grad():
+        scores = torch.einsum("bmhd,bnhd->bhmn", q.float(), k.float()) * scale
+        if causal:
+            mask = torch.ones(S, S, device=device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        out = torch.einsum("bhmn,bnhd->bmhd", scores.softmax(-1), v.float()).to(dtype)
+    grad_out = torch.randn_like(out)
+    inp = fmha.Inputs(q, k, v, attn_bias=bias, scale=scale)
+    assert not fmha.flydsl.BwOp.not_supported_reasons(inp)
+    grads = fmha.flydsl.BwOp.apply(fmha.Context(lse=lse, out=out), inp, grad_out)
+
+    ref = ref_attention_for_test(q, k, v, bias, scale=scale)
+    ref.backward(grad_out)
+    for name, got, leaf in zip(("dq", "dk", "dv"), (grads.dq, grads.dk, grads.dv), leaves):
+        assert got.shape == leaf.shape
+        _assert_grad_close(got.float(), leaf.grad.float(), f"flydslB value dim:{name}")

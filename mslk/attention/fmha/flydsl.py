@@ -709,9 +709,9 @@ def _with_kernel_layout(
     return t if reason is None else t.contiguous()
 
 
-def _pad_head_dim_to_32(t: torch.Tensor) -> torch.Tensor:
-    """Zero-pad the last dim up to a multiple of 32 (the kernel's wave tiling)."""
-    pad = -t.shape[-1] % 32
+def _pad_last_dim(t: torch.Tensor, size: int) -> torch.Tensor:
+    """Zero-pad the last dim of `t` up to `size`."""
+    pad = size - t.shape[-1]
     return torch.nn.functional.pad(t, (0, pad)) if pad else t
 
 
@@ -1485,7 +1485,7 @@ class BwOp(AttentionBwOpBase):
     SUPPORTED_MIN_K = 1
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     # GQA is supported via the plain 4D BMHK path (key/value with Hkv < Hq,
     # either a genuine (B,N,Hkv,D) tensor or a stride-0 `.expand()` broadcast
     # -- see _num_kv_heads/_uniform_row_pitch_reason), matching how
@@ -1602,14 +1602,15 @@ class BwOp(AttentionBwOpBase):
             else -1
         )
         query, key, value, out = inp.query, inp.key, inp.value, ctx.out
-        # Head dims that are not a multiple of 32 run on zero-padded inputs
-        # (zeros add nothing to QK^T, dO.O or the gradients). `scale` is passed
-        # explicitly below, so padding does not change the softmax scale.
-        head_dim = query.shape[-1]
-        if head_dim % 32:
-            query, key, value, out, grad = (
-                _pad_head_dim_to_32(t) for t in (query, key, value, out, grad)
-            )
+        # The kernel takes one head dim for every tensor and needs a multiple of
+        # 32. Q/K only contract over qk_dim and V/dO only over v_dim, so zero-
+        # padding all of them to a common size changes no product (and `scale`
+        # is passed explicitly, so the softmax scale is unchanged). The padded
+        # gradient columns are sliced off below.
+        qk_dim, v_dim = query.shape[-1], value.shape[-1]
+        kernel_dim = -(-max(qk_dim, v_dim) // 32) * 32
+        query, key = _pad_last_dim(query, kernel_dim), _pad_last_dim(key, kernel_dim)
+        value, out, grad = (_pad_last_dim(t, kernel_dim) for t in (value, out, grad))
         query = _with_kernel_layout(query)
         key = _with_kernel_layout(key, allow_broadcast_heads=True)
         value = _with_kernel_layout(value, allow_broadcast_heads=True)
@@ -1657,8 +1658,7 @@ class BwOp(AttentionBwOpBase):
         # autograd graph, no `ExpandBackward` reduction), this op's contract
         # is "correct after an `ExpandBackward` reduction", matching every
         # other op's broadcast-GQA contract.
-        if head_dim % 32:
-            dq, dk, dv = dq[..., :head_dim], dk[..., :head_dim], dv[..., :head_dim]
+        dq, dk, dv = dq[..., :qk_dim], dk[..., :qk_dim], dv[..., :v_dim]
         if dk.shape[2] != inp.key.shape[2]:
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
             dk = (dk / heads_per_kv).expand(inp.key.shape)
