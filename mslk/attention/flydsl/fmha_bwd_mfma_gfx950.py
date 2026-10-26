@@ -419,7 +419,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             dq_total_elems_idx = (
                 fx.Index(batch_size) * seq_M_idx * n_heads_idx * fx.Index(D)
             )
-        num_N_tiles = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
         # Compact K/V and dK/dV tensors are indexed by KV heads; the grid is query
         # head based, but the output row pitch for dK/dV remains Hkv = H/heads_per_kv.
         n_kv_heads_idx = n_heads_idx // heads_per_kv
