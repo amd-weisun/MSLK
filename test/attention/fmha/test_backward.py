@@ -674,3 +674,60 @@ def test_backward_flydsl_transposed_head_axis():
         return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
 
     _flydsl_bwd_case(64, make_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("heads", [(32, 32), (32, 8)])
+def test_backward_flydsl_deterministic(heads):
+    if not torch.version.hip or not fmha.flydsl._is_flydsl_available():
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    from mslk.utils.device import is_gfx950
+
+    if not is_gfx950():
+        pytest.skip("deterministic FlyDSL backward is implemented for gfx950 only")
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    H, Hkv = heads
+    # Large enough that the atomic path measurably differs run to run.
+    B, S, D = 1, 4096, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    grad_out = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    bias = fmha.attn_bias.LowerTriangularMask()
+
+    def run():
+        leaves = [t.clone().requires_grad_(True) for t in (q, k, v)]
+        kk = leaves[1].repeat_interleave(H // Hkv, dim=2)
+        vv = leaves[2].repeat_interleave(H // Hkv, dim=2)
+        torch.use_deterministic_algorithms(True)
+        try:
+            out = fmha.memory_efficient_attention(
+                leaves[0],
+                kk,
+                vv,
+                attn_bias=bias,
+                op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp),
+            )
+            out.backward(grad_out)
+        finally:
+            torch.use_deterministic_algorithms(False)
+        return [leaf.grad for leaf in leaves], leaves
+
+    first, leaves = run()
+    for _ in range(3):
+        again, _ = run()
+        for name, a, b in zip(("dq", "dk", "dv"), first, again):
+            assert torch.equal(a, b), f"{name} differs between identical runs"
+
+    leaves_ref = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    out_ref = ref_attention_for_test(
+        leaves_ref[0],
+        leaves_ref[1].repeat_interleave(H // Hkv, dim=2),
+        leaves_ref[2].repeat_interleave(H // Hkv, dim=2),
+        bias,
+    )
+    out_ref.backward(grad_out)
+    for name, got, ref in zip(("dq", "dk", "dv"), first, leaves_ref):
+        _assert_grad_close(got.float(), ref.grad.float(), f"flydslB deterministic:{name}")
