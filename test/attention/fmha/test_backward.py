@@ -616,7 +616,9 @@ def test_flydsl_fwd_declines_dropout_with_gradients():
             v.clone().requires_grad_(requires_grad),
             p=0.1,
         )
-        return [r for r in fmha.flydsl.FwOp.not_supported_reasons(inp) if "dropout" in r]
+        return [
+            r for r in fmha.flydsl.FwOp.not_supported_reasons(inp) if "dropout" in r
+        ]
 
     assert dropout_reasons(requires_grad=True)
     assert not dropout_reasons(requires_grad=False)
@@ -667,8 +669,7 @@ def test_backward_flydsl_transposed_head_axis():
         B, N, H = 2, 96, 4
         q_t = torch.randn(B, H, N, head_dim, device=device, dtype=dtype)
         k, v = (
-            torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
-            for _ in range(2)
+            torch.randn(B, N, H, head_dim, device=device, dtype=dtype) for _ in range(2)
         )
         leaves = [t.requires_grad_(True) for t in (q_t, k, v)]
         return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
@@ -730,4 +731,6 @@ def test_backward_flydsl_deterministic(heads):
     )
     out_ref.backward(grad_out)
     for name, got, ref in zip(("dq", "dk", "dv"), first, leaves_ref):
-        _assert_grad_close(got.float(), ref.grad.float(), f"flydslB deterministic:{name}")
+        _assert_grad_close(
+            got.float(), ref.grad.float(), f"flydslB deterministic:{name}"
+        )

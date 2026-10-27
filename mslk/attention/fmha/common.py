@@ -22,6 +22,7 @@ from typing import (
 )
 
 import torch
+from mslk.utils.device import get_gfx_arch_name, gfx_arch_in
 
 from .attn_bias import (
     AttentionBias,
@@ -33,8 +34,6 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from mslk.utils.device import get_gfx_arch_name, gfx_arch_in
-
 from .utils.op_common import BaseOperator
 
 

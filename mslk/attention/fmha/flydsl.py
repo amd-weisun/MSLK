@@ -56,6 +56,7 @@ import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
+from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
     BlockDiagonalCausalFromBottomRightMask,
@@ -75,8 +76,6 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from mslk.utils.device import is_gfx950
-
 from .common import AttentionBwOpBase, AttentionFwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
 
