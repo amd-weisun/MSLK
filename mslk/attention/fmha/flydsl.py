@@ -49,6 +49,8 @@ import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
+from mslk.attention.flydsl.fmha_dropout import philox_keep_mask, philox_offset_increment
+from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
     BlockDiagonalCausalFromBottomRightMask,
@@ -68,12 +70,6 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from mslk.attention.flydsl.fmha_dropout import (
-    philox_keep_mask,
-    philox_offset_increment,
-)
-from mslk.utils.device import is_gfx950
-
 from .common import AttentionBwOpBase, AttentionFwOpBase, Context, Gradients, Inputs
 from .utils.op_common import get_operator, register_operator
 
@@ -1572,7 +1568,9 @@ class BwOp(AttentionBwOpBase):
                 + _PAGED_BIAS_TYPES
                 + _PAGED_GAPPY_TYPES,
             ):
-                reasons.append("dropout only supported on the dense self-attention path")
+                reasons.append(
+                    "dropout only supported on the dense self-attention path"
+                )
         if torch.are_deterministic_algorithms_enabled() and not is_gfx950():
             reasons.append(
                 "deterministic backward is implemented for gfx950 only, but "

@@ -646,8 +646,7 @@ def test_backward_flydsl_transposed_head_axis():
         B, N, H = 2, 96, 4
         q_t = torch.randn(B, H, N, head_dim, device=device, dtype=dtype)
         k, v = (
-            torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
-            for _ in range(2)
+            torch.randn(B, N, H, head_dim, device=device, dtype=dtype) for _ in range(2)
         )
         leaves = [t.requires_grad_(True) for t in (q_t, k, v)]
         return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
@@ -709,7 +708,9 @@ def test_backward_flydsl_deterministic(heads):
     )
     out_ref.backward(grad_out)
     for name, got, ref in zip(("dq", "dk", "dv"), first, leaves_ref):
-        _assert_grad_close(got.float(), ref.grad.float(), f"flydslB deterministic:{name}")
+        _assert_grad_close(
+            got.float(), ref.grad.float(), f"flydslB deterministic:{name}"
+        )
 
 
 @cuda_or_mtia_only
@@ -777,7 +778,9 @@ def test_backward_flydsl_value_head_dim_differs(dims, causal):
 
     ref = ref_attention_for_test(q, k, v, bias, scale=scale)
     ref.backward(grad_out)
-    for name, got, leaf in zip(("dq", "dk", "dv"), (grads.dq, grads.dk, grads.dv), leaves):
+    for name, got, leaf in zip(
+        ("dq", "dk", "dv"), (grads.dq, grads.dk, grads.dv), leaves
+    ):
         assert got.shape == leaf.shape
         _assert_grad_close(got.float(), leaf.grad.float(), f"flydslB value dim:{name}")
 
@@ -895,6 +898,4 @@ def test_flydsl_bwd_declines_dropout_on_varlen():
     bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens(seqlens)
     q = torch.randn(1, sum(seqlens), 2, 64, device=device, dtype=torch.bfloat16)
     inp = fmha.Inputs(q, q.clone(), q.clone(), attn_bias=bias, p=0.1)
-    assert any(
-        "dropout" in r for r in fmha.flydsl.BwOp.not_supported_reasons(inp)
-    )
+    assert any("dropout" in r for r in fmha.flydsl.BwOp.not_supported_reasons(inp))
