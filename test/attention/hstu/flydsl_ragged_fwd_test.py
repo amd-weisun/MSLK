@@ -386,3 +386,104 @@ def test_cuda_graph_capture():
     torch.cuda.synchronize()
     ref, _ = ragged_hstu_attention_ref(**args)
     assert_hstu_close(out, ref, "silu")
+
+
+def _rows_reference(inputs, b, rows, options):
+    """T1's output for some rows of sequence b, without materializing the
+    other rows' scores (T1's reference forms [H, n, n])."""
+    from mslk.attention.hstu._torch_ref import _attend
+
+    s0, e0 = (int(x) for x in inputs["seq_offsets"][b : b + 2])
+    targets = inputs.get("num_targets")
+    valid = ragged_hstu_valid_mask(
+        e0 - s0,
+        options.get("invalid_attn_mask_type", "lower_triangular"),
+        None if targets is None else int(targets[b]),
+        options.get("max_attn_len", 0),
+        options.get("contextual_seq_len", 0),
+        options.get("full_attn_size", 0),
+        device=_CUDA,
+    )[rows]
+    q = inputs["q"][s0:e0][rows].float()
+    k = inputs["k"][s0:e0].float()
+    v = inputs["v"][s0:e0].float()
+    out, _ = _attend(q, k, v, valid, inputs["alpha"], 1.0 / inputs["N"], 0)
+    return out.to(inputs["q"].dtype)
+
+
+def _free_gpu_bytes():
+    free, _ = torch.cuda.mem_get_info()
+    return free
+
+
+def test_offsets_beyond_2_31_elements():
+    """Packed row offset x token stride crosses 2^31 elements (A9): the last
+    sequences start beyond it, so 32-bit address arithmetic would wrap."""
+    heads, dim = 8, 256
+    per_token = heads * dim
+    total = (2**31) // per_token + 4096  # ~1.05M tokens, ~4.3 GB per tensor
+    if _free_gpu_bytes() < 5 * total * per_token * 2:
+        pytest.skip("needs about 25 GB of free GPU memory")
+    gen = torch.Generator(device=_CUDA).manual_seed(18)
+
+    def rand(*shape):
+        return (torch.rand(*shape, generator=gen, device=_CUDA) * 2 - 1).to(
+            torch.bfloat16
+        )
+
+    q, k, v = rand(total, heads, dim), rand(total, heads, dim), rand(total, heads, dim)
+    # Long sequences up to the end; the last two start past 2^31 elements.
+    lengths = [4096] * (total // 4096 - 2)
+    lengths += [total - sum(lengths) - 1000, 1000]
+    offsets = lengths_to_offsets(torch.tensor(lengths), _CUDA)
+    assert int(offsets[-2]) * per_token > 2**31
+    inputs = {
+        "N": max(lengths),
+        "alpha": dim**-0.5,
+        "q": q,
+        "k": k,
+        "v": v,
+        "seq_offsets": offsets,
+    }
+    options = {"max_attn_len": 512}
+    out, _ = _run_kernel_only(inputs, **options)
+    last = len(lengths) - 1
+    for b in (0, last - 1, last):
+        n = lengths[b]
+        rows = torch.tensor([0, 1, n // 2, n - 2, n - 1], device=_CUDA)
+        s0 = int(offsets[b])
+        ref = _rows_reference(inputs, b, rows, options)
+        assert_hstu_close(out[s0 + rows], ref, "silu")
+
+
+def test_64k_sequence():
+    """A single sequence of 64k tokens at head dim 256 (A9)."""
+    n, heads, dim = 65536, 1, 256
+    gen = torch.Generator(device=_CUDA).manual_seed(19)
+    q, k, v = (
+        (torch.rand(n, heads, dim, generator=gen, device=_CUDA) * 2 - 1).to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    inputs = {
+        "N": n,
+        "alpha": dim**-0.5,
+        "q": q,
+        "k": k,
+        "v": v,
+        "seq_offsets": torch.tensor([0, n], device=_CUDA),
+        "num_targets": torch.tensor([300], device=_CUDA),
+    }
+    rows = torch.tensor([0, 7, 4095, 32768, n - 301, n - 300, n - 1], device=_CUDA)
+    for options in ({}, {"max_attn_len": 2048, "full_attn_size": 1000}):
+        out, _ = _run_kernel_only(inputs, **options)
+        ref = _rows_reference(inputs, 0, rows, options)
+        assert_hstu_close(out[rows], ref, "silu")
+
+
+def _run_kernel_only(inputs, **options):
+    from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+
+    args = _op_args(inputs, **options)
+    return hstu_ragged_fwd(**args)
