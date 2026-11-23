@@ -67,9 +67,10 @@ _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 # above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW,
 # and the tiled kernel otherwise. Interim benchmark, MI350 bf16 D 64/128: the
 # pipelined kernel is 1.1-1.25x faster on causal and windows of 4k+ at
-# N 4k-8k (even at 2k); the tiled one is faster at N <= 1024 and for windows
-# up to about 1k (finer blocks skip more); D 256 is tiled only.
-_PIPELINED_MIN_N = 1024
+# N 4k-8k (even at 2k) and 1.2-1.4x on long softmax; the tiled one is faster
+# at N <= 2048 (by 1.2-1.35x at 2048) and for windows up to about 1k (finer
+# blocks skip more); D 256 is tiled only.
+_PIPELINED_MIN_N = 2048
 _PIPELINED_MIN_WINDOW = 2048
 
 
