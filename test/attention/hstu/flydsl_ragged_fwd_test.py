@@ -318,3 +318,71 @@ def test_softmax_ignores_attn_scale():
     inputs = _inputs(3, 100, seed=14)
     inputs["num_softmax_heads"] = 2
     _check_softmax(inputs, {"attn_scale": torch.tensor(5.0, device=_CUDA)})
+
+
+def _op_args(inputs, **options):
+    args = {
+        "N": inputs["N"],
+        "alpha": inputs["alpha"],
+        "q": inputs["q"],
+        "k": inputs["k"],
+        "v": inputs["v"],
+        "seq_offsets": inputs["seq_offsets"],
+        "invalid_attn_mask_type": "lower_triangular",
+        "num_targets": inputs.get("num_targets"),
+        "attn_scale": None,
+        "max_attn_len": 0,
+        "contextual_seq_len": 0,
+        "full_attn_size": 0,
+        "num_softmax_heads": 0,
+        "shared_kv": inputs.get("shared_kv", False),
+    }
+    args.update(options)
+    return args
+
+
+@pytest.mark.parametrize("softmax", [False, True])
+def test_through_the_op(softmax):
+    """mslk::hstu_ragged_fwd and the public wrapper route to this kernel."""
+    import mslk.attention.hstu as hstu
+
+    inputs = _inputs(4, 180, max_targets=6, seed=16)
+    args = _op_args(
+        inputs,
+        max_attn_len=25,
+        contextual_seq_len=3,
+        num_softmax_heads=2 if softmax else 0,
+    )
+    ref, ref_lse = ragged_hstu_attention_ref(**args)
+    for out, lse in (
+        torch.ops.mslk.hstu_ragged_fwd(**args),
+        hstu.ragged_hstu_attention_fwd(**args),
+    ):
+        if softmax:
+            torch.testing.assert_close(
+                out.float(), ref.float(), atol=1.6e-3, rtol=3.2e-2
+            )
+            torch.testing.assert_close(lse, ref_lse, atol=2e-3, rtol=1e-4)
+        else:
+            assert_hstu_close(out, ref, "silu")
+
+
+def test_cuda_graph_capture():
+    """After a warm-up call, the forward captures and replays in a CUDA
+    graph: no host synchronization and no allocation the graph cannot own."""
+    inputs = _inputs(4, 200, max_targets=5, seed=17)
+    scale = torch.rand(inputs["q"].shape[0], device=_CUDA) + 0.5
+    args = _op_args(inputs, max_attn_len=30, attn_scale=scale)
+    torch.ops.mslk.hstu_ragged_fwd(**args)  # warm up: compile and route
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, _ = torch.ops.mslk.hstu_ragged_fwd(**args)
+    # New values in the same buffers, then replay.
+    for name in ("q", "k", "v"):
+        inputs[name].copy_(torch.rand_like(inputs[name]) * 2 - 1)
+    scale.copy_(torch.rand_like(scale) + 0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref, _ = ragged_hstu_attention_ref(**args)
+    assert_hstu_close(out, ref, "silu")

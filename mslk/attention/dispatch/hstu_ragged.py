@@ -7,7 +7,8 @@
 """Which backend serves ragged HSTU self-attention (``mslk::hstu_ragged_fwd``
 and ``mslk::hstu_ragged_bwd``) on ROCm.
 
-- ``mslk``: MSLK's own kernel, the default and the fallback.
+- ``mslk``: MSLK's own kernel, the default and the fallback: the FlyDSL
+  forward in :mod:`mslk.attention.flydsl.hstu.ragged_fwd`.
 
 Routings are called as ``ROUTING(q, **op_arguments_except_q)``: ``q`` comes
 first because :class:`~mslk.aiter.routing.OpRouting` takes the device from the
@@ -38,9 +39,10 @@ _TABLE = ("mslk.attention.dispatch", "tables/hstu_ragged.csv")
 
 
 def _mslk_fwd(q: torch.Tensor, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
-    raise NotImplementedError(
-        "MSLK has no ragged HSTU forward kernel; no backend can serve this call"
-    )
+    # Imported on call: importing the routing must not import FlyDSL.
+    from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+
+    return hstu_ragged_fwd(q=q, **kwargs)
 
 
 def _mslk_bwd(q: torch.Tensor, **kwargs: Any) -> None:
