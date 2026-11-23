@@ -75,18 +75,20 @@ def _run(inputs, **options):
     return out, ref
 
 
-# Both kernels: the gfx950 pipelined one (D 64/128) and the tiled one.
-KERNELS = ["pipelined", "tiled"]
+# Every kernel: the gfx950 dual-wave pipeline (D 64/128), the generic
+# flash-attention loop (D 64-256) and the tiled kernel.
+KERNELS = ["pipelined", "generic", "tiled"]
 
 
 def _skip_if_declined(kernel, call):
-    if kernel != "pipelined":
+    if kernel not in ("pipelined", "generic"):
         return
-    from mslk.attention.flydsl.hstu import ragged_fwd_gfx950
+    from mslk.attention.flydsl.hstu import ragged_fwd_generic, ragged_fwd_gfx950
     from mslk.attention.flydsl.hstu.ragged_fwd import _arch
 
+    module = ragged_fwd_gfx950 if kernel == "pipelined" else ragged_fwd_generic
     v = call["k"] if call.get("shared_kv") else call["v"]
-    reason = ragged_fwd_gfx950.decline_reason(
+    reason = module.decline_reason(
         call["q"], call["k"], v, call.get("num_softmax_heads", 0) > 0, _arch()
     )
     if reason is not None:
@@ -453,7 +455,7 @@ def _free_gpu_bytes():
 def test_offsets_beyond_2_31_elements(kernel):
     """Packed row offset x token stride crosses 2^31 elements (A9): the last
     sequences start beyond it, so 32-bit address arithmetic would wrap."""
-    heads, dim = (8, 256) if kernel == "tiled" else (16, 128)
+    heads, dim = (16, 128) if kernel == "pipelined" else (8, 256)
     per_token = heads * dim
     total = (2**31) // per_token + 4096  # ~1.05M tokens, ~4.3 GB per tensor
     if _free_gpu_bytes() < 5 * total * per_token * 2:
@@ -493,7 +495,7 @@ def test_offsets_beyond_2_31_elements(kernel):
 @pytest.mark.parametrize("kernel", KERNELS)
 def test_64k_sequence(kernel):
     """A single sequence of 64k tokens at head dim 256 (A9)."""
-    n, heads, dim = 65536, 1, (256 if kernel == "tiled" else 128)
+    n, heads, dim = 65536, 1, (128 if kernel == "pipelined" else 256)
     gen = torch.Generator(device=_CUDA).manual_seed(19)
     q, k, v = (
         (torch.rand(n, heads, dim, generator=gen, device=_CUDA) * 2 - 1).to(

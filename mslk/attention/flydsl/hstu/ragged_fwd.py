@@ -63,10 +63,14 @@ SCALE_TOKEN = "token"
 
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
-# ``kernel="auto"`` takes the pipelined kernel above this max sequence length
-# (interim benchmark on MI350, D 64/128: at N = 512 the tiled kernel is about
-# 5% faster, at N = 1024 the pipelined one 1.8x).
-_PIPELINED_MIN_N = 512
+# ``kernel="auto"`` takes the pipelined kernel when the max sequence length is
+# above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW;
+# the generic one otherwise. Interim benchmark, MI350 bf16 D 64/128: the
+# pipelined kernel is 1.2-1.3x faster on causal and windows of 2k+ at
+# N 4k-8k; the generic one is faster at N <= 1024 (its 64-row blocks waste
+# less) and for windows up to about 1k (it skips more KV tiles).
+_PIPELINED_MIN_N = 1024
+_PIPELINED_MIN_WINDOW = 1024
 
 
 @dataclass(frozen=True)
@@ -938,14 +942,16 @@ def hstu_ragged_fwd(
     """``mslk::hstu_ragged_fwd`` on a FlyDSL kernel; returns ``(out, M)``.
 
     ``kernel``: ``"pipelined"`` is the gfx950 flash-attention pipeline
-    (:mod:`.ragged_fwd_gfx950`), ``"tiled"`` the kernel of this module;
-    ``"auto"`` takes the pipelined one where it accepts the call and no tile
-    ``config`` is given."""
+    (:mod:`.ragged_fwd_gfx950`), ``"generic"`` the generic flash-attention
+    loop (:mod:`.ragged_fwd_generic`), ``"tiled"`` the kernel of this module.
+    ``"auto"`` (no tile ``config``) takes the pipelined kernel for long
+    sequences, else the generic one, else the tiled one, each where it
+    accepts the call."""
     from mslk.flydsl.jit import run_compiled
 
-    from . import ragged_fwd_gfx950 as pipelined
+    from . import ragged_fwd_generic as generic, ragged_fwd_gfx950 as pipelined
 
-    if kernel not in ("auto", "pipelined", "tiled"):
+    if kernel not in ("auto", "pipelined", "generic", "tiled"):
         raise ValueError(f"unknown kernel {kernel!r}")
     if shared_kv:
         v = k
@@ -953,17 +959,26 @@ def hstu_ragged_fwd(
     hidden_dim = v.shape[2]
     arch = _arch()
     softmax = num_softmax_heads > 0
-    use_pipelined = False
-    if kernel != "tiled" and config is None:
+    use_pipelined = use_generic = False
+    if kernel in ("auto", "pipelined") and config is None:
         decline = pipelined.decline_reason(q, k, v, softmax, arch)
         if kernel == "pipelined" and decline is not None:
             raise NotImplementedError(f"FlyDSL pipelined HSTU forward: {decline}")
         # The pipeline works on 256-row blocks of at least four 64-key
-        # tiles; up to N = 512 the tiled kernel is as fast or faster.
+        # tiles; short sequences go to the generic loop's 64-row blocks.
         use_pipelined = decline is None and (
-            kernel == "pipelined" or N > _PIPELINED_MIN_N
+            kernel == "pipelined"
+            or (
+                N > _PIPELINED_MIN_N
+                and (max_attn_len == 0 or max_attn_len > _PIPELINED_MIN_WINDOW)
+            )
         )
-    if not use_pipelined:
+    if kernel in ("auto", "generic") and config is None and not use_pipelined:
+        decline = generic.decline_reason(q, k, v, softmax, arch)
+        if kernel == "generic" and decline is not None:
+            raise NotImplementedError(f"FlyDSL generic HSTU forward: {decline}")
+        use_generic = decline is None
+    if not (use_pipelined or use_generic):
         cfg = config or _first_supported(q, head_dim, hidden_dim, arch)
         reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
         if reason is not None:
@@ -1017,6 +1032,27 @@ def hstu_ragged_fwd(
             softmax,
             out,
             M,
+        )
+        return out, M
+    if use_generic:
+        generic.hstu_ragged_fwd_generic(
+            N,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            spec,
+            seq_offsets if num_targets is None else num_targets,
+            attn_scale,
+            scale_mode,
+            max_attn_len,
+            contextual_seq_len,
+            full_attn_size,
+            softmax,
+            out,
+            M,
+            arch,
         )
         return out, M
 
