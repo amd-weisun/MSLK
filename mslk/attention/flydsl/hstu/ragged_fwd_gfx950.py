@@ -361,12 +361,9 @@ def build_ragged_fwd_gfx950(
         def tile_needs_mask(c0):
             """True unless every score of the tile is visible to every row of
             this wave (uniform across the wave)."""
-            c_last = c0 + fx.Int32(BLOCK_N - 1)
-            need = c_last >= seq_len_i32
-            need = need | (sm.to_id(c_last) >= sm.to_id(wave_row0))
-            if const_expr(HAS_WINDOW):
-                need = need | (sm.to_id(c0) < sm.to_id(wave_row_last) - sm.max_attn_len)
-            return need
+            return sm.tile_needs_mask(
+                wave_row0, wave_row_last, c0, c0 + fx.Int32(BLOCK_N - 1)
+            )
 
         def mask_scores(v_s, c0):
             lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]

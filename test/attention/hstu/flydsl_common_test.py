@@ -117,3 +117,36 @@ def test_kv_tiles_cover_every_visible_key(block_m, block_n):
             skipped += int((~visited).sum())
     # The ranges must actually skip work somewhere (windows, causal).
     assert skipped > 0
+
+
+@pytest.mark.parametrize("block_m,block_n", [(1, 1), (2, 3), (4, 2), (8, 4), (16, 16)])
+def test_tile_needs_mask_is_safe(block_m, block_n):
+    """A tile declared unmasked has every key visible to every row (lower
+    triangular, no contextual prefix), and the check does skip tiles,
+    including full-attention blocks outside their window."""
+    skipped = skipped_full = 0
+    for mask, w, c, f, n, t in _cases():
+        if mask != LOWER or c:
+            continue
+        spec, sm = _host_seq_mask(mask, w, c, f, n, t)
+        ref = ragged_hstu_valid_mask(n, mask, t, w, c, f)
+        for r0 in range(0, n, block_m):
+            r1 = min(r0 + block_m, n) - 1
+            for c0 in range(0, n + block_n, block_n):
+                c1 = c0 + block_n - 1
+                if sm.tile_needs_mask(r0, r1, c0, c1):
+                    continue
+                assert c1 < n and ref[r0 : r1 + 1, c0 : c1 + 1].all(), (
+                    mask,
+                    w,
+                    c,
+                    f,
+                    n,
+                    t,
+                    r0,
+                    c0,
+                )
+                skipped += 1
+                if spec.has_full_attn and sm.to_id(c0) < sm.to_id(r1) - w:
+                    skipped_full += 1
+    assert skipped > 0 and skipped_full > 0

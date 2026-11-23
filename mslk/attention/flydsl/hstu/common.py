@@ -171,6 +171,28 @@ class SeqMask:
             vis = vis | (ctx & self.ctx_on)
         return vis | (m_raw == n_raw)
 
+    def tile_needs_mask(
+        self, row0: Any, row_last: Any, col0: Any, col_last: Any
+    ) -> Any:
+        """False only when every key in ``[col0, col_last]`` is visible to
+        every row in ``[row0, row_last]`` (lower-triangular mask without a
+        contextual prefix; other masks always need it). Uniform across the
+        rows, so a kernel can branch on it.
+
+        Visible everywhere means: inside the sequence, strictly below every
+        row's id, and inside every row's window unless every row is a
+        full-attention row (those see every earlier key)."""
+        spec = self.spec
+        need = (col_last >= self.seq_len) | (self.to_id(col_last) >= self.to_id(row0))
+        if spec.has_window:
+            outside = self.to_id(col0) < self.to_id(row_last) - self.max_attn_len
+            if spec.has_full_attn:
+                outside = outside & (
+                    self.to_id(row0) < self.max_ids - self.full_attn_size
+                )
+            need = need | outside
+        return need
+
     def kv_tiles(
         self, q_start: Any, block_m: int, block_n: int
     ) -> Tuple[Any, Any, Any]:

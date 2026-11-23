@@ -249,6 +249,8 @@ def build_ragged_fwd(
     HAS_FULL_ATTN = spec.has_full_attn
     SCALE_MODE = scale_mode
     SOFTMAX = softmax
+    # Lazy-rescale threshold (log2 domain): p stays below 2^8.
+    LAZY_RESCALE = 8.0
     REVERSE_Q_TILES = reverse_q_tiles
     BLOCK_THREADS = NUM_WAVES * WARP_SIZE
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
@@ -611,6 +613,26 @@ def build_ragged_fwd(
                     ).ir_value()
             return o_acc
 
+        def lazy_scale_o_rows(o_acc, corr_rescale):
+            # Rescale O only on tiles where the wave's reference max moved.
+            corr, rescale = corr_rescale
+
+            def _then(_names, *state):
+                return scale_o_rows(list(state), corr)
+
+            def _else(_names, *state):
+                return list(state)
+
+            return list(
+                scf_if_dispatch(
+                    rescale,
+                    _then,
+                    _else,
+                    state_names=tuple("_ro%d" % i for i in range(len(o_acc))),
+                    state_values=list(o_acc),
+                )
+            )
+
         # ---- KV tiles to visit: [0, prefix_end) then [main_start, main_end) ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
         prefix_end, main_start, main_end = sm.kv_tiles(q_start, BLOCK_M, BLOCK_N)
@@ -780,13 +802,9 @@ def build_ragged_fwd(
         def tile_needs_mask(kv_start):
             """False only when every key of the tile is visible to every row
             of the block (uniform across the block)."""
-            c_last = kv_start + fx.Int32(BLOCK_N - 1)
-            need = (c_last >= seq_len) | (sm.to_id(c_last) >= sm.to_id(q_start))
-            if const_expr(HAS_WINDOW):
-                need = need | (
-                    sm.to_id(kv_start) < sm.to_id(block_row_last) - sm.max_attn_len
-                )
-            return need
+            return sm.tile_needs_mask(
+                q_start, block_row_last, kv_start, kv_start + fx.Int32(BLOCK_N - 1)
+            )
 
         N_SCORES = KV_SUBTILES * Q_SUBTILES * MFMA_ELEMS_PER_LANE
         CAN_SKIP_MASK = MASK_TYPE == LOWER and not HAS_CONTEXTUAL
@@ -829,28 +847,46 @@ def build_ragged_fwd(
                         p_packs[ng][qg] = pack_p(silu_scale_batch(vals(ng, qg)))
                 return p_packs, m_old, l_old, None
 
+            # Lazy rescale (as in MSLK's dual-wave flash attention): the
+            # running max is a reference that moves only when some row of
+            # the wave sees a tile max more than LAZY_RESCALE above it, so the
+            # output accumulator is rescaled on few tiles (a wave-uniform
+            # branch in the caller). p then reaches at most 2^LAZY_RESCALE.
+            # A row with no valid key yet uses reference 0, so masked scores
+            # (the finite sentinel) give p = 0 without a per-score check.
             c_live = fx.Float32(-1.0e29)
-            m_new, l_new, corr = [], [], []
+            c_lazy = fx.Float32(LAZY_RESCALE)
+            tile_maxes = []
+            need_any = None
             for qg in range_constexpr(Q_SUBTILES):
                 tile_max = c_neg_big
                 for ng in range_constexpr(KV_SUBTILES):
                     for x in vals(ng, qg):
                         tile_max = fmax(tile_max, x)
-                m_q = fmax(fx.Float32(m_old[qg]), lanes_max(tile_max))
-                corr_q = fx.exp2(fx.Float32(m_old[qg]) - m_q, fastmath="afn")
+                tile_max = lanes_max(tile_max)
+                tile_maxes.append(tile_max)
+                need = tile_max > fx.Float32(m_old[qg]) + c_lazy
+                need_any = need if need_any is None else (need_any | need)
+            ballot = rocdl.ballot(T.i64, as_mlir_value(need_any))
+            rescale = fx.Int64(ballot) != fx.Int64(0)
+            m_new, l_new, corr = [], [], []
+            for qg in range_constexpr(Q_SUBTILES):
+                m_o = fx.Float32(m_old[qg])
+                m_q = rescale.select(fmax(m_o, tile_maxes[qg]), m_o)
+                corr_q = fx.exp2(m_o - m_q, fastmath="afn")
+                m_ref = (m_q > c_live).select(m_q, c_zero_f)
                 l_q = fx.Float32(l_old[qg]) * corr_q
                 for ng in range_constexpr(KV_SUBTILES):
                     p_vals = []
                     for x in vals(ng, qg):
-                        p = fx.exp2(x - m_q, fastmath="afn")
-                        p = (x > c_live).select(p, c_zero_f)
+                        p = fx.exp2(x - m_ref, fastmath="afn")
                         l_q = l_q + p
                         p_vals.append(p)
                     p_packs[ng][qg] = pack_p(p_vals, round_nearest=True)
                 m_new.append(m_q.ir_value())
                 l_new.append(l_q.ir_value())
                 corr.append(corr_q)
-            return p_packs, m_new, l_new, corr
+            return p_packs, m_new, l_new, (corr, rescale)
 
         def accum_o_tile(o_acc, p_packs):
             """O[m, d] += P[m, n] V[n, d] with A = P, B = V[kv, d]."""
@@ -1090,7 +1126,7 @@ def build_ragged_fwd(
             dma_v(kv_start)
             p_packs, m_new, l_new, corr = compute_p_tile(kv_start, m_old, l_old)
             if const_expr(SOFTMAX):
-                o_acc = scale_o_rows(o_acc, corr)
+                o_acc = lazy_scale_o_rows(o_acc, corr)
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             dma_k(next_start)
@@ -1110,7 +1146,7 @@ def build_ragged_fwd(
             k_next = async_load_k_regs(next_start)
             p_packs, m_new, l_new, corr = compute_p_tile(kv_start, m_old, l_old)
             if const_expr(SOFTMAX):
-                o_acc = scale_o_rows(o_acc, corr)
+                o_acc = lazy_scale_o_rows(o_acc, corr)
             store_v_regs_to_lds(v_vecs)
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
             gpu.barrier()
