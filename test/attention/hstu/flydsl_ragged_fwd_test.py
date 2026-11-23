@@ -11,7 +11,10 @@
 
 import pytest
 import torch
-from mslk.attention.hstu._torch_ref import ragged_hstu_attention_ref
+from mslk.attention.hstu._torch_ref import (
+    ragged_hstu_attention_ref,
+    ragged_hstu_valid_mask,
+)
 from mslk.flydsl.common import is_flydsl_available
 
 from .hstu_test_utils import (
@@ -53,7 +56,7 @@ def _run(inputs, **options):
 
     args = {
         "invalid_attn_mask_type": "lower_triangular",
-        "num_targets": None,
+        "num_targets": inputs.get("num_targets"),
         "attn_scale": None,
         "max_attn_len": 0,
         "contextual_seq_len": 0,
@@ -63,9 +66,10 @@ def _run(inputs, **options):
     call = dict(inputs)
     call.update(args)
     config = call.pop("config", None)
-    out, _ = hstu_ragged_fwd(**call, config=config)
-    call.pop("num_softmax_heads", None)
-    ref, _ = ragged_hstu_attention_ref(**call)
+    out, lse = hstu_ragged_fwd(**call, config=config)
+    ref, ref_lse = ragged_hstu_attention_ref(**call)
+    if call.get("num_softmax_heads", 0):
+        return out, ref, lse, ref_lse
     return out, ref
 
 
@@ -233,3 +237,84 @@ def test_unsupported_dims_are_declined():
     inputs = _inputs(2, 32, dim=48, hidden=80, seed=12)
     with pytest.raises(NotImplementedError, match="FlyDSL ragged HSTU forward"):
         _run(inputs)
+
+
+def _bf16_p_softmax(inputs, options):
+    """Softmax attention as a kernel with bf16 P computes it: fp32 scores and
+    softmax, P rounded to the input dtype, fp32 P @ V, 1/l in fp32."""
+    offsets = inputs["seq_offsets"].tolist()
+    targets = inputs.get("num_targets")
+    q, k, v = (inputs[n].float() for n in ("q", "k", "v"))
+    out = torch.zeros_like(v)
+    for b in range(len(offsets) - 1):
+        s0, e0 = offsets[b], offsets[b + 1]
+        if e0 == s0:
+            continue
+        valid = ragged_hstu_valid_mask(
+            e0 - s0,
+            options.get("invalid_attn_mask_type", "lower_triangular"),
+            None if targets is None else int(targets[b]),
+            options.get("max_attn_len", 0),
+            options.get("contextual_seq_len", 0),
+            options.get("full_attn_size", 0),
+            device=q.device,
+        )
+        scores = inputs["alpha"] * torch.einsum("qhd,khd->hqk", q[s0:e0], k[s0:e0])
+        scores = scores.masked_fill(~valid, float("-inf"))
+        p = torch.exp(scores - scores.amax(-1, keepdim=True))
+        l_sum = p.sum(-1, keepdim=True)
+        p_rounded = p.to(inputs["q"].dtype).float()
+        out[s0:e0] = torch.einsum("hqk,khv->qhv", p_rounded, v[s0:e0]) / l_sum.permute(
+            1, 0, 2
+        )
+    return out.to(inputs["q"].dtype)
+
+
+def _check_softmax(inputs, options):
+    out, ref, lse, ref_lse = _run(inputs, **options)
+    # Against a kernel-precision model (P rounded to bf16/fp16 for P @ V):
+    # within about one output ulp (accumulation orders differ).
+    emulated = _bf16_p_softmax(inputs, options)
+    torch.testing.assert_close(out.float(), emulated.float(), atol=2e-3, rtol=8e-3)
+    # Against T1. Its softmax bound (atol 8e-4, rtol 1.6e-2) is tighter than
+    # rounding P to bf16 allows: the emulation above misses it by up to 1.8x
+    # on rows that see only a few keys. Hence twice T1's bound.
+    torch.testing.assert_close(out.float(), ref.float(), atol=1.6e-3, rtol=3.2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("mask", list(_MASKS))
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_softmax_heads(mask, dim):
+    """All heads softmax (T2 takes num_softmax_heads 0 or H): out and the
+    base-2 LSE M."""
+    inputs = _inputs(5, 260, heads=2, dim=dim, max_targets=8, seed=13)
+    inputs["num_softmax_heads"] = 2
+    _check_softmax(inputs, _MASKS[mask])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_softmax_lengths_and_dtypes(dtype):
+    gen = torch.Generator().manual_seed(15)
+    lengths_t = torch.tensor([0, 1, 2, 127, 300, 0, 64])
+    total = int(lengths_t.sum())
+    q, k, v = (
+        (torch.rand(total, 2, 64, generator=gen) * 2 - 1).to(_CUDA, dtype)
+        for _ in range(3)
+    )
+    inputs = {
+        "N": 300,
+        "alpha": 0.5,
+        "q": q,
+        "k": k,
+        "v": v,
+        "seq_offsets": lengths_to_offsets(lengths_t, _CUDA),
+        "num_softmax_heads": 2,
+    }
+    _check_softmax(inputs, {"max_attn_len": 20, "contextual_seq_len": 4})
+
+
+def test_softmax_ignores_attn_scale():
+    inputs = _inputs(3, 100, seed=14)
+    inputs["num_softmax_heads"] = 2
+    _check_softmax(inputs, {"attn_scale": torch.tensor(5.0, device=_CUDA)})

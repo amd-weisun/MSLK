@@ -199,9 +199,6 @@ def build_ragged_fwd(
 
     from .common import device_ops, seq_mask
 
-    if softmax:
-        raise NotImplementedError("softmax heads are not implemented yet")
-
     # FlyDSL keys its compile cache on the kernel's *scalar* closure values
     # (and types) only: a dataclass captured by the kernel is left out of the
     # key, so two variants would share one cached binary. Unpack every
@@ -215,6 +212,7 @@ def build_ragged_fwd(
     HAS_TARGETS = spec.has_targets
     HAS_FULL_ATTN = spec.has_full_attn
     SCALE_MODE = scale_mode
+    SOFTMAX = softmax
     BLOCK_THREADS = NUM_WAVES * WARP_SIZE
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
     Q_SUBTILES = ROWS_PER_WAVE // MFMA_M
@@ -276,11 +274,12 @@ def build_ragged_fwd(
         num_targets: fx.Tensor,
         attn_scale: fx.Tensor,
         out: fx.Tensor,
+        lse_out: fx.Tensor,
         num_heads: fx.Int32,
         num_q_tiles: fx.Int32,
         hz_per_group: fx.Int32,
         hz_total: fx.Int32,
-        alpha_neg_log2e: fx.Float32,
+        score_scale: fx.Float32,
         out_scale: fx.Float32,
         max_attn_len: fx.Int32,
         contextual_seq_len: fx.Int32,
@@ -398,14 +397,17 @@ def build_ragged_fwd(
             return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
         def silu_scale_batch(s_list):
-            g = [s * alpha_neg_log2e for s in s_list]
+            # SiLU heads: score_scale = alpha * -log2e.
+            g = [s * score_scale for s in s_list]
             emu = [fx.exp2(gi, fastmath="afn") for gi in g]
             sig = [_rcp(c_one_f + e) for e in emu]
             return [g[i] * sig[i] for i in range(len(s_list))]
 
-        def pack_p(vals):
-            """Pack 4 f32 into a bf16/f16 GEMM2 A-operand fragment (bf16 truncates)."""
-            if const_expr(is_bf16):
+        def pack_p(vals, round_nearest=False):
+            """Pack 4 f32 into a bf16/f16 GEMM2 A-operand fragment. bf16
+            truncates unless round_nearest: cheap, and its bias stays inside
+            tolerance for SiLU weights, but not for softmax probabilities."""
+            if const_expr(is_bf16 and not round_nearest):
                 c16 = fx.Int32(16)
                 cmask = fx.Int32(0xFFFF0000)
 
@@ -419,12 +421,55 @@ def build_ragged_fwd(
             elems = [x.to(elem_dtype) for x in vals]
             return Vec.from_elements(elems, elem_dtype).ir_value()
 
+        # ---- Online softmax (softmax heads; score_scale = alpha * log2e) ----
+        # Scores are base 2. Each lane holds one query (lane_mod_16) and four
+        # keys per 16-key subtile; the four lanes sharing a query differ in
+        # lane bits 4 and 5. The row max m is kept reduced across them; the
+        # row sum l is a per-lane partial, reduced once in the epilogue.
+        # Masked scores use a finite sentinel and are zeroed after exp2: the
+        # kernel compiles with fast math, which assumes no infinities.
+        c_neg_big = fx.Float32(-1.0e30)
+
+        def fmax(a, b):
+            return (a > b).select(a, b)
+
+        def lanes_max(x):
+            x = fmax(x, x.shuffle_xor(16, WARP_SIZE))
+            return fmax(x, x.shuffle_xor(32, WARP_SIZE))
+
+        def lanes_sum(x):
+            x = x + x.shuffle_xor(16, WARP_SIZE)
+            return x + x.shuffle_xor(32, WARP_SIZE)
+
+        def acc_layout(x, e):
+            # GEMM2's C fragment holds query lane_div_16*4 + e on this lane;
+            # read that query's value from the lane holding it in GEMM1 layout.
+            src = lane_div_16 * fx.Int32(MFMA_LANE_K) + fx.Int32(e)
+            return fx.Float32(gpu.shuffle_idx(x, src, WARP_SIZE))
+
+        def scale_o_rows(o_acc, row_vals):
+            # o_acc[c*Q + qg] *= row_vals[qg] per query, in GEMM2 layout.
+            for qg in range_constexpr(Q_SUBTILES):
+                per_e = [
+                    acc_layout(row_vals[qg], e)
+                    for e in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
+                for c in range_constexpr(D_CHUNKS):
+                    ov = Vec(o_acc[c * Q_SUBTILES + qg])
+                    o_acc[c * Q_SUBTILES + qg] = Vec.from_elements(
+                        [
+                            ov[e] * per_e[e]
+                            for e in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ],
+                        fx.Float32,
+                    ).ir_value()
+            return o_acc
+
         # ---- KV tiles to visit: [0, prefix_end) then [main_start, main_end) ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
         prefix_end, main_start, main_end = sm.kv_tiles(q_start, BLOCK_M, BLOCK_N)
         active = q_start < seq_len
 
-        N_ACC = D_CHUNKS * Q_SUBTILES
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         k_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_K)
@@ -533,10 +578,21 @@ def build_ragged_fwd(
                 )
             return packs
 
-        def compute_p_tile(kv_start, k_packs_by_ng, apply_mask=True):
+        def compute_p_tile(kv_start, k_packs_by_ng, m_old, l_old, apply_mask=True):
             """GEMM1 with A = K, B = Q, so the C fragment (lane: query
-            lane_mod_16, keys lane_div_16*4 + i) is GEMM2's A operand."""
+            lane_mod_16, keys lane_div_16*4 + i) is GEMM2's A operand.
+
+            Returns P packs and, for softmax heads, the new row max, row-sum
+            partials and the rescale factor of the accumulated output."""
             p_packs = [
+                [None for _ in range_constexpr(Q_SUBTILES)]
+                for _ in range_constexpr(KV_SUBTILES)
+            ]
+            s_all = [
+                [None for _ in range_constexpr(Q_SUBTILES)]
+                for _ in range_constexpr(KV_SUBTILES)
+            ]
+            keep_all = [
                 [None for _ in range_constexpr(Q_SUBTILES)]
                 for _ in range_constexpr(KV_SUBTILES)
             ]
@@ -569,18 +625,58 @@ def build_ragged_fwd(
                         cur = dim_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                     if const_expr(apply_mask):
-                        keep = [
+                        keep_all[ng][qg] = [
                             sm.visible(q_rows[qg], col_raw[i], q_row_ids[qg], col_id[i])
                             & col_in_seq[i]
                             for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                         ]
-                        s_vals = [
-                            keep[i].select(s_vals[i], c_zero_f)
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                    # A masked score of 0 gates to silu(0) = 0.
-                    p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
-            return p_packs
+                    s_all[ng][qg] = s_vals
+
+            if const_expr(not SOFTMAX):
+                for ng in range_constexpr(KV_SUBTILES):
+                    for qg in range_constexpr(Q_SUBTILES):
+                        s_vals = s_all[ng][qg]
+                        if const_expr(apply_mask):
+                            # A masked score of 0 gates to silu(0) = 0.
+                            s_vals = [
+                                keep_all[ng][qg][i].select(s_vals[i], c_zero_f)
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                        p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
+                return p_packs, m_old, l_old, None
+
+            m_new, l_new, corr = [], [], []
+            for qg in range_constexpr(Q_SUBTILES):
+                scaled = [
+                    [
+                        s_all[ng][qg][i] * score_scale
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
+                    for ng in range_constexpr(KV_SUBTILES)
+                ]
+                tile_max = c_neg_big
+                for ng in range_constexpr(KV_SUBTILES):
+                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        x = scaled[ng][i]
+                        if const_expr(apply_mask):
+                            x = keep_all[ng][qg][i].select(x, c_neg_big)
+                        tile_max = fmax(tile_max, x)
+                m_q = fmax(fx.Float32(m_old[qg]), lanes_max(tile_max))
+                corr_q = fx.exp2(fx.Float32(m_old[qg]) - m_q, fastmath="afn")
+                l_q = fx.Float32(l_old[qg]) * corr_q
+                for ng in range_constexpr(KV_SUBTILES):
+                    p_vals = []
+                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        p = fx.exp2(scaled[ng][i] - m_q, fastmath="afn")
+                        if const_expr(apply_mask):
+                            p = keep_all[ng][qg][i].select(p, c_zero_f)
+                        l_q = l_q + p
+                        p_vals.append(p)
+                    p_packs[ng][qg] = pack_p(p_vals, round_nearest=True)
+                m_new.append(m_q.ir_value())
+                l_new.append(l_q.ir_value())
+                corr.append(corr_q)
+            return p_packs, m_new, l_new, corr
 
         def accum_o_tile(o_acc, p_packs):
             """O[m, d] += P[m, n] V[n, d] with A = P, B = V[kv, d]."""
@@ -600,16 +696,34 @@ def build_ragged_fwd(
                     o_acc[acc_off] = cur
             return o_acc
 
-        def run_kv_tile(o_acc, kv_start, apply_mask=True, full_tile=False):
+        N_ACC = D_CHUNKS * Q_SUBTILES
+
+        def split_state(it):
+            it_list = list(it) if isinstance(it, (list, tuple)) else [it]
+            o_acc = [it_list[i] for i in range(N_ACC)]
+            m_old = [it_list[N_ACC + qg] for qg in range(Q_SUBTILES)] if SOFTMAX else []
+            l_old = (
+                [it_list[N_ACC + Q_SUBTILES + qg] for qg in range(Q_SUBTILES)]
+                if SOFTMAX
+                else []
+            )
+            return o_acc, m_old, l_old
+
+        def run_kv_tile(state, kv_start, apply_mask=True, full_tile=False):
             """K staged through registers to swizzled LDS; V's global load
             stays in flight under GEMM1 (counted vmcnt)."""
+            o_acc, m_old, l_old = split_state(state)
             k_vecs = async_load_k_regs(kv_start, full_tile=full_tile)
             v_vecs = async_load_v_regs(kv_start, full_tile=full_tile)
             rocdl.s_waitcnt(vmcnt=NUM_BATCHES_V)
             store_k_regs_to_lds(k_vecs)
             gpu.barrier()
             k_packs = [read_k_packs(ng) for ng in range_constexpr(KV_SUBTILES)]
-            p_packs = compute_p_tile(kv_start, k_packs, apply_mask=apply_mask)
+            p_packs, m_new, l_new, corr = compute_p_tile(
+                kv_start, k_packs, m_old, l_old, apply_mask=apply_mask
+            )
+            if const_expr(SOFTMAX):
+                o_acc = scale_o_rows(o_acc, corr)
             rocdl.s_waitcnt(vmcnt=0)
             store_v_regs_to_lds(v_vecs)
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
@@ -617,7 +731,7 @@ def build_ragged_fwd(
             # The next tile's K barrier fences these V reads from its V
             # store, and this tile's V barrier fenced the K reads above.
             o_acc = accum_o_tile(o_acc, p_packs)
-            return o_acc
+            return o_acc + list(m_new) + list(l_new)
 
         # Unmasked tiles [main_start, unmasked_end): under a plain causal mask
         # every key below min(q_start, max_ids) is visible to every row of the
@@ -633,6 +747,12 @@ def build_ragged_fwd(
 
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
+            if const_expr(SOFTMAX):
+                acc_init = (
+                    acc_init
+                    + [c_neg_big.ir_value() for _ in range(Q_SUBTILES)]
+                    + [c_zero_f.ir_value() for _ in range(Q_SUBTILES)]
+                )
 
             loop_results = acc_init
             # Contextual columns a window would skip.
@@ -642,11 +762,10 @@ def build_ragged_fwd(
                 fx.Int32(1),
                 init=acc_init,
             ):  # ty: ignore
-                it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-                o_acc = [it_list[i] for i in range(N_ACC)]
+                state = list(it) if isinstance(it, (list, tuple)) else [it]
                 kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                o_acc = run_kv_tile(o_acc, kv_start, apply_mask=True)
-                loop_results = yield o_acc
+                state = run_kv_tile(state, kv_start, apply_mask=True)
+                loop_results = yield state
 
             for kv_tile, it in range(
                 fx.Int32(main_start),
@@ -654,11 +773,10 @@ def build_ragged_fwd(
                 fx.Int32(1),
                 init=loop_results,
             ):  # ty: ignore
-                it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-                o_acc = [it_list[i] for i in range(N_ACC)]
+                state = list(it) if isinstance(it, (list, tuple)) else [it]
                 kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                o_acc = run_kv_tile(o_acc, kv_start, apply_mask=False, full_tile=True)
-                loop_results = yield o_acc
+                state = run_kv_tile(state, kv_start, apply_mask=False, full_tile=True)
+                loop_results = yield state
 
             for kv_tile, it in range(
                 fx.Int32(unmasked_end),
@@ -666,19 +784,30 @@ def build_ragged_fwd(
                 fx.Int32(1),
                 init=loop_results,
             ):  # ty: ignore
-                it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-                o_acc = [it_list[i] for i in range(N_ACC)]
+                state = list(it) if isinstance(it, (list, tuple)) else [it]
                 kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                o_acc = run_kv_tile(o_acc, kv_start, apply_mask=True)
-                loop_results = yield o_acc
+                state = run_kv_tile(state, kv_start, apply_mask=True)
+                loop_results = yield state
 
             # ---- Epilogue. GEMM2's C fragment is [d, query]: d = lane_mod_16,
             # query = qg*16 + lane_div_16*4 + e. ----
-            results = (
-                list(loop_results)
-                if isinstance(loop_results, (list, tuple))
-                else [loop_results]
-            )
+            results, m_fin, l_fin = split_state(loop_results)
+            if const_expr(SOFTMAX):
+                # out = o / l; M = m + log2(l), -inf on rows with no key.
+                inv_l = []
+                for qg in range_constexpr(Q_SUBTILES):
+                    l_tot = lanes_sum(fx.Float32(l_fin[qg]))
+                    has_key = l_tot > c_zero_f
+                    safe_l = has_key.select(l_tot, fx.Float32(1.0))
+                    inv_l.append(has_key.select(fx.Float32(1.0) / safe_l, c_zero_f))
+                    lse = fx.Float32(m_fin[qg]) + fx.log2(safe_l, fastmath="afn")
+                    # -inf through its bit pattern; fast math assumes no infs.
+                    lse_bits = has_key.select(lse.bitcast(fx.Int32), fx.Int32(-8388608))
+                    if (lane_div_16 == fx.Int32(0)) & q_in_bounds[qg]:
+                        lse_out[fx.Int64(seq_start + q_rows[qg]), head_idx] = (
+                            lse_bits.bitcast(fx.Float32)
+                        )
+                results = scale_o_rows(results, inv_l)
             row_scale = out_scale
             if const_expr(SCALE_MODE == SCALE_SCALAR):
                 row_scale = out_scale * fx.Float32(attn_scale[fx.Int32(0)])
@@ -711,10 +840,11 @@ def build_ragged_fwd(
         num_targets: fx.Tensor,
         attn_scale: fx.Tensor,
         out: fx.Tensor,
+        lse_out: fx.Tensor,
         num_seqs: fx.Int32,
         num_heads: fx.Int32,
         max_seq_len: fx.Int32,
-        alpha_neg_log2e: fx.Float32,
+        score_scale: fx.Float32,
         out_scale: fx.Float32,
         max_attn_len: fx.Int32,
         contextual_seq_len: fx.Int32,
@@ -734,11 +864,12 @@ def build_ragged_fwd(
             num_targets,
             attn_scale,
             out,
+            lse_out,
             num_heads,
             num_q_tiles,
             hz_per_group,
             hz_total,
-            alpha_neg_log2e,
+            score_scale,
             out_scale,
             max_attn_len,
             contextual_seq_len,
@@ -818,7 +949,8 @@ def hstu_ragged_fwd(
         full_attn_size,
         has_targets=num_targets is not None,
     )
-    if attn_scale is None:
+    if attn_scale is None or softmax:
+        # attn_scale scales SiLU heads only (T1).
         scale_mode = SCALE_INV_N
     elif attn_scale.ndim == 0:
         scale_mode = SCALE_SCALAR
@@ -848,13 +980,17 @@ def hstu_ragged_fwd(
         num_targets = seq_offsets
     else:
         num_targets = num_targets.to(torch.int32)
-    if attn_scale is None:
+    if scale_mode == SCALE_INV_N:
         attn_scale = torch.empty(1, dtype=torch.float32, device=q.device)
     else:
         attn_scale = attn_scale.reshape(-1).to(torch.float32)
-    out_scale = -1.0 / _LOG2E
-    if scale_mode == SCALE_INV_N:
-        out_scale /= N
+    if softmax:
+        score_scale, out_scale = alpha * _LOG2E, 1.0
+    else:
+        # The SiLU gate runs in base 2: -1/log2e undoes the base change.
+        score_scale, out_scale = alpha * -_LOG2E, -1.0 / _LOG2E
+        if scale_mode == SCALE_INV_N:
+            out_scale /= N
     run_compiled(
         launcher,
         q,
@@ -864,10 +1000,11 @@ def hstu_ragged_fwd(
         num_targets,
         attn_scale,
         out,
+        M,
         num_seqs,
         num_heads,
         N,
-        alpha * -_LOG2E,
+        score_scale,
         out_scale,
         max_attn_len,
         contextual_seq_len,
