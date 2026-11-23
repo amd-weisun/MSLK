@@ -553,3 +553,49 @@ def test_schedules(schedule, kernel, mask):
     out, _ = hstu_ragged_fwd(**args, kernel=kernel, schedule=schedule)
     ref, _ = ragged_hstu_attention_ref(**args)
     assert_hstu_close(out, ref, "silu")
+
+
+_AOT_COMPILE = """
+from mslk.attention.flydsl.hstu import ragged_fwd_aot as A
+for c in A.AOT_CONFIGS:
+    if (c["kernel"], c["head_dim"], c["num_heads"], c["mask"], c["scale_mode"], c["softmax"]) == (
+        "tiled", 128, 2, (False, False, True, False), "inv_n", False
+    ):
+        A.compile_aot_config(c, "gfx950")
+"""
+
+_AOT_RUN = """
+import torch
+from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+q = torch.rand(400, 3, 128, device="cuda", dtype=torch.bfloat16)
+off = torch.tensor([0, 150, 400], device="cuda", dtype=torch.int32)
+nt = torch.tensor([2, 9], device="cuda", dtype=torch.int32)
+hstu_ragged_fwd(400, 0.1, q, q, q, off, "lower_triangular", nt, None, 0, 0, 0)
+torch.cuda.synchronize()
+"""
+
+
+def test_aot_cache_serves_real_calls(tmp_path):
+    """A config pre-compiled under COMPILE_ONLY with CPU placeholders serves
+    a real call (other head count, other lengths) with JIT disabled: the
+    placeholder signatures match real ones in FlyDSL's cache key."""
+    import os
+    import subprocess
+    import sys
+
+    from mslk.attention.flydsl.hstu.ragged_fwd import _arch
+
+    if not _arch().startswith("gfx950"):
+        pytest.skip("AOT configs target gfx950")
+    env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path))
+    env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+    subprocess.run(
+        [sys.executable, "-c", _AOT_COMPILE],
+        env=dict(env, COMPILE_ONLY="1"),
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-c", _AOT_RUN],
+        env=dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"),
+        check=True,
+    )
