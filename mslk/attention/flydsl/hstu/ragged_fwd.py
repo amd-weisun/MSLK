@@ -938,6 +938,7 @@ def hstu_ragged_fwd(
     *,
     config: Optional[FwdConfig] = None,
     kernel: str = "auto",
+    schedule: str = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``mslk::hstu_ragged_fwd`` on a FlyDSL kernel; returns ``(out, M)``.
 
@@ -946,13 +947,24 @@ def hstu_ragged_fwd(
     loop (:mod:`.ragged_fwd_generic`), ``"tiled"`` the kernel of this module.
     ``"auto"`` (no tile ``config``) takes the pipelined kernel for long
     sequences, else the generic one, else the tiled one, each where it
-    accepts the call."""
+    accepts the call.
+
+    ``schedule`` (pipelined and generic kernels): ``"reverse"`` runs each
+    sequence's query blocks last first on a lower-triangular mask, so the
+    heaviest causal blocks start earliest; ``"sorted"`` runs sequences longest
+    first (an on-device argsort); ``"sorted_reverse"`` both; ``"plain"``
+    neither. ``"auto"`` is ``"reverse"``: free, and 0.99-1.10x in the
+    interim benchmark, while sorting gained up to 1.17x on some causal batches
+    but lost up to 1.3x elsewhere to its extra launches; revisit with the W5
+    length distribution."""
     from mslk.flydsl.jit import run_compiled
 
     from . import ragged_fwd_generic as generic, ragged_fwd_gfx950 as pipelined
 
     if kernel not in ("auto", "pipelined", "generic", "tiled"):
         raise ValueError(f"unknown kernel {kernel!r}")
+    if schedule not in ("auto", "plain", "sorted", "reverse", "sorted_reverse"):
+        raise ValueError(f"unknown schedule {schedule!r}")
     if shared_kv:
         v = k
     num_tokens, num_heads, head_dim = q.shape
@@ -1014,6 +1026,14 @@ def hstu_ragged_fwd(
     else:
         attn_scale = attn_scale.reshape(-1).to(torch.float32)
 
+    sort_idx = None
+    reverse = (
+        schedule in ("auto", "reverse", "sorted_reverse") and spec.mask_type == LOWER
+    )
+    if schedule in ("sorted", "sorted_reverse") and (use_pipelined or use_generic):
+        # Longest sequence first; computed on the device (no host sync).
+        lengths = seq_offsets[1:] - seq_offsets[:-1]
+        sort_idx = torch.argsort(lengths, descending=True).to(torch.int32)
     if use_pipelined:
         pipelined.hstu_ragged_fwd_gfx950(
             N,
@@ -1032,6 +1052,8 @@ def hstu_ragged_fwd(
             softmax,
             out,
             M,
+            sort_idx,
+            reverse,
         )
         return out, M
     if use_generic:
@@ -1053,6 +1075,8 @@ def hstu_ragged_fwd(
             out,
             M,
             arch,
+            sort_idx,
+            reverse,
         )
         return out, M
 

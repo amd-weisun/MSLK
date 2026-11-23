@@ -524,3 +524,32 @@ def _run_kernel_only(inputs, kernel="auto", **options):
 
     args = _op_args(inputs, **options)
     return hstu_ragged_fwd(**args, kernel=kernel)
+
+
+@pytest.mark.parametrize("schedule", ["plain", "reverse", "sorted", "sorted_reverse"])
+@pytest.mark.parametrize("kernel", ["pipelined", "generic"])
+@pytest.mark.parametrize("mask", ["causal", "upper", "window_contextual_full"])
+def test_schedules(schedule, kernel, mask):
+    """Block orders change only the schedule, not the result."""
+    from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+
+    lengths = torch.tensor([30, 900, 0, 1500, 64, 700, 1200, 5])
+    gen = torch.Generator().manual_seed(20)
+    total = int(lengths.sum())
+    q, k, v = (
+        (torch.rand(total, 2, 128, generator=gen) * 2 - 1).to(_CUDA, torch.bfloat16)
+        for _ in range(3)
+    )
+    inputs = {
+        "N": 1500,
+        "alpha": 128**-0.5,
+        "q": q,
+        "k": k,
+        "v": v,
+        "seq_offsets": lengths_to_offsets(lengths, _CUDA),
+        "num_targets": torch.tensor([3, 10, 0, 40, 0, 1, 7, 2], device=_CUDA),
+    }
+    args = _op_args(inputs, **_MASKS[mask])
+    out, _ = hstu_ragged_fwd(**args, kernel=kernel, schedule=schedule)
+    ref, _ = ragged_hstu_attention_ref(**args)
+    assert_hstu_close(out, ref, "silu")

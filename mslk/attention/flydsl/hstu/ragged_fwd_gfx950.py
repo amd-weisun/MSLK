@@ -87,12 +87,18 @@ def build_ragged_fwd_gfx950(
     has_full_attn: bool,
     scale_mode: str,
     softmax: bool,
+    sorted_order: bool = False,
+    reverse_q_blocks: bool = False,
 ):
-    """Compile-time specialization; returns ``launch(...)``."""
+    """Compile-time specialization; returns ``launch(...)``.
+
+    ``sorted_order``: sequences run longest first (through the ``SortIdx``
+    order), and on a lower-triangular mask a sequence's query blocks run
+    last first, so the heaviest blocks start earliest."""
     import flydsl.compiler as flyc  # pyre-ignore[21]
     import flydsl.expr as fx  # pyre-ignore[21]
     from flydsl.compiler.kernel_function import CompilationContext  # pyre-ignore[21]
-    from flydsl.expr import const_expr, range_constexpr, rocdl  # pyre-ignore[21]
+    from flydsl.expr import const_expr, gpu, range_constexpr, rocdl  # pyre-ignore[21]
     from flydsl.expr.typing import T, Vector as Vec  # pyre-ignore[21]
     from mslk.attention.flydsl._common import tensor_cache_sig as _tensor_cache_sig
     from mslk.attention.flydsl.flash_attn_utils import (
@@ -151,6 +157,8 @@ def build_ragged_fwd_gfx950(
     HAS_FULL_ATTN = has_full_attn
     SCALE_MODE = scale_mode
     SOFTMAX = softmax
+    SORTED = sorted_order
+    REVERSE_Q_BLOCKS = reverse_q_blocks
     ROWS_PER_WAVE = traits.ROWS_PER_WAVE
     # Tiles can skip the per-score mask when the whole tile is visible to the
     # wave's rows; worked out for the lower-triangular mask without a
@@ -166,6 +174,8 @@ def build_ragged_fwd_gfx950(
         HAS_FULL_ATTN,
         SCALE_MODE,
         SOFTMAX,
+        SORTED,
+        REVERSE_Q_BLOCKS,
     )
 
     _lds_elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
@@ -256,6 +266,7 @@ def build_ragged_fwd_gfx950(
         CuSeq: fx.Tensor,
         NumTargets: fx.Tensor,
         AttnScale: fx.Tensor,
+        SortIdx: fx.Tensor,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         score_scale: fx.Float32,
@@ -286,6 +297,11 @@ def build_ragged_fwd_gfx950(
         ctx.init_runtime_indices()
         ctx.init_lds(SharedStorage)
         ctx.init_thread_mapping()
+        if const_expr(SORTED):
+            ctx.batch_idx = fx.Index(fx.Int32(SortIdx[fx.Int32(ctx.batch_idx)]))
+        if const_expr(REVERSE_Q_BLOCKS):
+            ctx.q_block_idx = fx.Index(gpu.grid_dim.y) - fx.Index(1) - ctx.q_block_idx
+            ctx.q_start = ctx.q_block_idx * traits.BLOCK_M
         ctx.init_sequence_lengths()
         ctx.init_descriptors()
         ctx.init_workspace()
@@ -764,6 +780,7 @@ def build_ragged_fwd_gfx950(
         CuSeq: fx.Tensor,
         NumTargets: fx.Tensor,
         AttnScale: fx.Tensor,
+        SortIdx: fx.Tensor,
         num_seqs: fx.Int32,
         max_seq_len: fx.Int32,
         stride_q_n: fx.Int32,
@@ -787,6 +804,7 @@ def build_ragged_fwd_gfx950(
             CuSeq,
             NumTargets,
             AttnScale,
+            SortIdx,
             stride_q_n,
             stride_kv_n,
             score_scale,
@@ -820,7 +838,7 @@ def build_ragged_fwd_gfx950(
     cf_cache = {}
 
     def launch(*args):
-        tensors = args[:8]
+        tensors = args[:9]
         key = tuple(_tensor_cache_sig(t) for t in tensors)
         cf = cf_cache.get(key)
         if cf is not None:
@@ -850,8 +868,11 @@ def hstu_ragged_fwd_gfx950(
     softmax: bool,
     out: torch.Tensor,
     M: torch.Tensor,
+    sort_idx: Optional[torch.Tensor] = None,
+    reverse_q_blocks: bool = False,
 ) -> None:
-    """Run the kernel into ``out`` and ``M``. Arguments as normalized by
+    """Run the kernel into ``out`` and ``M``; ``sort_idx`` (int32, sequences
+    longest first) turns on the sorted schedule. Arguments as normalized by
     :func:`mslk.attention.flydsl.hstu.ragged_fwd.hstu_ragged_fwd`."""
     num_tokens, num_heads, head_dim = q.shape
     # The pipeline addresses heads as head * D and shares one token stride
@@ -879,6 +900,8 @@ def hstu_ragged_fwd_gfx950(
         spec.has_full_attn,
         scale_mode,
         softmax,
+        sort_idx is not None,
+        reverse_q_blocks,
     )
     num_seqs = seq_offsets.shape[0] - 1
     if softmax:
@@ -896,6 +919,7 @@ def hstu_ragged_fwd_gfx950(
         seq_offsets,
         num_targets,
         attn_scale,
+        seq_offsets if sort_idx is None else sort_idx,
         num_seqs,
         N,
         q.stride(0),

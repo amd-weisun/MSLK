@@ -86,8 +86,11 @@ def build_ragged_fwd_generic(
     has_full_attn: bool,
     scale_mode: str,
     softmax: bool,
+    sorted_order: bool = False,
+    reverse_q_blocks: bool = False,
 ):
-    """Compile-time specialization; returns ``launch(...)``."""
+    """Compile-time specialization; returns ``launch(...)``. ``sorted_order``
+    as in :func:`.ragged_fwd_gfx950.build_ragged_fwd_gfx950`."""
     import flydsl.compiler as flyc  # pyre-ignore[21]
     import flydsl.expr as fx  # pyre-ignore[21]
     from flydsl._mlir import ir  # pyre-ignore[21]
@@ -165,6 +168,8 @@ def build_ragged_fwd_generic(
     HAS_FULL_ATTN = has_full_attn
     SCALE_MODE = scale_mode
     SOFTMAX = softmax
+    SORTED = sorted_order
+    REVERSE_Q_BLOCKS = reverse_q_blocks
     K_SUB_N = traits.K_SUB_N
     D_CHUNKS = traits.D_CHUNKS
     CAN_SKIP_MASK = MASK_TYPE == LOWER and not HAS_CONTEXTUAL
@@ -178,6 +183,8 @@ def build_ragged_fwd_generic(
         HAS_FULL_ATTN,
         SCALE_MODE,
         SOFTMAX,
+        SORTED,
+        REVERSE_Q_BLOCKS,
     )
     # Non-vectorized MFMA32 score layout: lane column offsets per register.
     MOFF = (0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27)
@@ -198,6 +205,7 @@ def build_ragged_fwd_generic(
         CuSeq: fx.Tensor,
         NumTargets: fx.Tensor,
         AttnScale: fx.Tensor,
+        SortIdx: fx.Tensor,
         max_seq_len: fx.Int32,
         score_scale: fx.Float32,
         out_scale: fx.Float32,
@@ -222,6 +230,11 @@ def build_ragged_fwd_generic(
         ctx.init_lds_view()
         ctx.init_thread_mapping()
         ctx.init_block_mapping()
+        if const_expr(SORTED):
+            ctx.batch_idx = fx.Index(fx.Int32(SortIdx[fx.Int32(ctx.batch_idx)]))
+        if const_expr(REVERSE_Q_BLOCKS):
+            ctx.q_tile_idx = ctx.num_q_tiles - fx.Index(1) - ctx.q_tile_idx
+            ctx.q_start = ctx.q_tile_idx * traits.BLOCK_M
         ctx.init_sequence_lengths(CuSeq, CuSeq, None)
         ctx.init_load_mapping()
         ctx.init_kv_batch_pointers()
@@ -431,6 +444,7 @@ def build_ragged_fwd_generic(
         CuSeq: fx.Tensor,
         NumTargets: fx.Tensor,
         AttnScale: fx.Tensor,
+        SortIdx: fx.Tensor,
         num_seqs: fx.Int32,
         max_seq_len: fx.Int32,
         score_scale: fx.Float32,
@@ -455,6 +469,7 @@ def build_ragged_fwd_generic(
             CuSeq,
             NumTargets,
             AttnScale,
+            SortIdx,
             max_seq_len,
             score_scale,
             out_scale,
@@ -484,7 +499,7 @@ def build_ragged_fwd_generic(
     cf_cache = {}
 
     def launch(*args):
-        key = tuple(_tensor_cache_sig(t) for t in args[:8])
+        key = tuple(_tensor_cache_sig(t) for t in args[:9])
         cf = cf_cache.get(key)
         if cf is not None:
             return cf(*args)
@@ -514,6 +529,8 @@ def hstu_ragged_fwd_generic(
     out: torch.Tensor,
     M: torch.Tensor,
     arch: str,
+    sort_idx: Optional[torch.Tensor] = None,
+    reverse_q_blocks: bool = False,
 ) -> None:
     """Run the kernel into ``out`` (contiguous) and ``M``. Arguments as
     normalized by :func:`mslk.attention.flydsl.hstu.ragged_fwd.hstu_ragged_fwd`."""
@@ -533,6 +550,8 @@ def hstu_ragged_fwd_generic(
         spec.has_full_attn,
         scale_mode,
         softmax,
+        sort_idx is not None,
+        reverse_q_blocks,
     )
     if softmax:
         score_scale, out_scale = alpha * _LOG2E, 1.0
@@ -549,6 +568,7 @@ def hstu_ragged_fwd_generic(
         seq_offsets,
         num_targets,
         attn_scale,
+        seq_offsets if sort_idx is None else sort_idx,
         seq_offsets.shape[0] - 1,
         N,
         score_scale,
