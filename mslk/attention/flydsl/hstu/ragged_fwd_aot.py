@@ -104,33 +104,27 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
     if config["kernel"] == "tiled":
         from . import ragged_fwd as tiled
 
-        cfg = tiled.default_config(d, d, arch)
-        launcher = tiled.build_ragged_fwd(
-            d, d, "bf16", spec, scale_mode, softmax, cfg, arch, True
-        )
-        with CompilationContext.compile_hints(launcher.compile_hints):
-            flyc.compile(
-                launcher,
+        # Windowed masks also get the small-window tiles.
+        cfgs = {tiled.default_config(d, d, arch)}
+        if spec.has_window:
+            cfgs.add(tiled.default_config(d, d, arch, tiled._SMALL_WINDOW))
+        for cfg in sorted(cfgs, key=repr):
+            _compile_tiled(
+                tiled,
+                flyc,
+                CompilationContext,
+                d,
+                h,
+                spec,
+                scale_mode,
+                softmax,
+                cfg,
+                arch,
                 qkv,
-                qkv,
-                qkv,
-                idx,
                 idx,
                 scale,
                 out,
                 lse,
-                1,
-                h,
-                1,
-                1.0,
-                1.0,
-                0,
-                0,
-                0,
-                h * d,
-                d,
-                h * d,
-                d,
                 stream,
             )
         return
@@ -172,3 +166,51 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
         0,
         stream,
     )
+
+
+def _compile_tiled(
+    tiled,
+    flyc,
+    CompilationContext,
+    d,
+    h,
+    spec,
+    scale_mode,
+    softmax,
+    cfg,
+    arch,
+    qkv,
+    idx,
+    scale,
+    out,
+    lse,
+    stream,
+):
+    launcher = tiled.build_ragged_fwd(
+        d, d, "bf16", spec, scale_mode, softmax, cfg, arch, True
+    )
+    with CompilationContext.compile_hints(launcher.compile_hints):
+        flyc.compile(
+            launcher,
+            qkv,
+            qkv,
+            qkv,
+            idx,
+            idx,
+            scale,
+            out,
+            lse,
+            1,
+            h,
+            1,
+            1.0,
+            1.0,
+            0,
+            0,
+            0,
+            h * d,
+            d,
+            h * d,
+            d,
+            stream,
+        )
