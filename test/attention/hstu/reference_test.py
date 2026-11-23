@@ -18,7 +18,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from hstu_test_utils import (
+from .hstu_test_utils import (
     assert_hstu_close,
     generate_sparse_seq_len,
     HEAD_DIMS,
