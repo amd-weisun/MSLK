@@ -66,12 +66,12 @@ _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 # ``kernel="auto"`` takes the pipelined kernel when the max sequence length is
 # above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW,
 # and the tiled kernel otherwise. Interim benchmark, MI350 bf16 D 64/128: the
-# pipelined kernel is 1.1-1.3x faster on causal and windows of 2k+ at
-# N 4k-8k; the tiled one is faster at N <= 1024 and for windows up to about
-# 1k (finer blocks skip more), and at D 256 everywhere (1.2-1.7x over the
+# pipelined kernel is 1.1-1.25x faster on causal and windows of 4k+ at
+# N 4k-8k (even at 2k); the tiled one is faster at N <= 1024 and for windows
+# up to about 1k (finer blocks skip more), and at D 256 everywhere (1.2-1.7x over the
 # generic kernel, which auto no longer picks).
 _PIPELINED_MIN_N = 1024
-_PIPELINED_MIN_WINDOW = 1536
+_PIPELINED_MIN_WINDOW = 2048
 
 
 @dataclass(frozen=True)
