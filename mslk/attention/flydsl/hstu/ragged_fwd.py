@@ -85,14 +85,13 @@ class FwdConfig:
 
 
 def default_config(head_dim: int, hidden_dim: int, arch: str = "") -> FwdConfig:
-    """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep at N 4096
-    (D 256: 0.40 ms at 128x64x8 waves; D 64-128: 64x32x4). Elsewhere AITER's
-    MI300X heuristic."""
+    """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep (D 256 at
+    N 4096: 0.30 ms). Elsewhere AITER's MI300X heuristic."""
     dim = max(hidden_dim, ((head_dim + 63) // 64) * 64)
     if arch.startswith("gfx950"):
-        if dim >= 256:
-            return FwdConfig(128, 64, 8, 0)
-        return FwdConfig(64, 32, 4, 0)
+        # Best or tied at D 64/128/256 on short, windowed and long shapes; at
+        # D 256 it fits 166 VGPRs, three waves per SIMD.
+        return FwdConfig(64, 64, 4, 3)
     if dim >= 256:
         return FwdConfig(128, 16, 4, 0)
     if dim >= 192:
@@ -216,7 +215,11 @@ def build_ragged_fwd(
         T,
         Vector as Vec,
     )
-    from mslk.attention.flydsl.flash_attn_utils import as_mlir_value, scf_if_dispatch
+    from mslk.attention.flydsl.flash_attn_utils import (
+        _make_rebased_view,
+        as_mlir_value,
+        scf_if_dispatch,
+    )
     from mslk.flydsl import buffer_ops
 
     from .common import device_ops, seq_mask
@@ -276,6 +279,12 @@ def build_ragged_fwd(
     V_ROW_STRIDE = hidden_dim + 16
     # P*V on gfx950's full-rate 16x16x32 MFMA, pairing 16-key subtiles.
     PV_K32 = V_TR and (BLOCK_N // MFMA_N) % 2 == 0
+    # Scheduling fences, gfx950 DMA path: the compiler otherwise issues the
+    # LDS reads of later QK subtiles and P*V column chunks early, keeping
+    # their operands live. With them, D 256 at 64x64x4 waves fits 166 VGPRs
+    # (three waves per SIMD; 214 without) and runs 0.30 ms instead of 0.32.
+    QK_FENCE = V_TR
+    PV_FENCE_CHUNKS = 8 if V_TR else 0
 
     def _load_tiling(dim):
         wide = dim % 8 == 0 and (BLOCK_N * dim) % (BLOCK_THREADS * 8) == 0
@@ -450,10 +459,31 @@ def build_ragged_fwd(
                 # Swizzled chunk of column c*16 + (lane % 4)*4: chunk 2c + j,
                 # j = (lane % 4) // 2, XOR 2 * (row % V_SWZ_ROWS); the row's low
                 # bits are lane-constant (subtiles start at multiples of 16).
-                v_tr_swz = (v_tr_row % fx.Int32(V_SWZ_ROWS)) * fx.Int32(2)
-                v_tr_chunk_lo = (lane_mod_16 % fx.Int32(4)) // fx.Int32(2)
-                v_tr_in_chunk = (lane_mod_16 % fx.Int32(2)) * fx.Int32(4)
-                v_tr_row_off = v_tr_row * fx.Int32(V_ROW_STRIDE)
+                # (2c + j) ^ 2r = 2 (c ^ r) + j, and with c = c_hi * R + c_lo
+                # (R = V_SWZ_ROWS, r < R): c ^ r = c_hi * R + (c_lo ^ r). So a
+                # read is one of R lane-dependent pointers (one per c_lo) plus
+                # a constant (c_hi, and the 16-row subtile ng, which leaves
+                # row % R unchanged) that folds into the DS offset field:
+                # R address registers live instead of one per read.
+                v_tr_r = v_tr_row % fx.Int32(V_SWZ_ROWS)
+                v_tr_lane_byte = v_lds_base + fx.Int64(
+                    (
+                        v_tr_row * fx.Int32(V_ROW_STRIDE)
+                        + ((lane_mod_16 % fx.Int32(4)) // fx.Int32(2)) * fx.Int32(8)
+                        + (lane_mod_16 % fx.Int32(2)) * fx.Int32(4)
+                    )
+                    * fx.Int32(2)
+                )
+                v_tr_ptrs = [
+                    buffer_ops.create_llvm_ptr(
+                        v_tr_lane_byte
+                        + fx.Int64(
+                            ((fx.Int32(c_lo) ^ v_tr_r) * fx.Int32(16)) * fx.Int32(2)
+                        ),
+                        address_space=3,
+                    )
+                    for c_lo in range(V_SWZ_ROWS)
+                ]
         else:
             v_smem = lds.v.view(
                 fx.make_layout(
@@ -706,6 +736,8 @@ def build_ragged_fwd(
                         cur = dim_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
                     for i in range_constexpr(MFMA_ELEMS_PER_LANE):
                         flat.append(Vec(cur)[i])
+                if const_expr(QK_FENCE):
+                    rocdl.sched_barrier(0)
             return flat
 
         # Masked pre-activation value: SiLU scores gate to silu(0) = 0;
@@ -814,15 +846,13 @@ def build_ragged_fwd(
 
             def read_v_pack(c, ng):
                 if const_expr(KV_DMA):
-                    chunk = (fx.Int32(2 * c) + v_tr_chunk_lo) ^ v_tr_swz
-                    elem = (
-                        v_tr_row_off
-                        + fx.Int32(ng * MFMA_M * V_ROW_STRIDE)
-                        + chunk * fx.Int32(8)
-                        + v_tr_in_chunk
-                    )
-                    ptr = buffer_ops.create_llvm_ptr(
-                        v_lds_base + fx.Int64(elem) * fx.Int64(2), address_space=3
+                    c_hi, c_lo = divmod(c, V_SWZ_ROWS)
+                    ptr = buffer_ops.get_element_ptr(
+                        v_tr_ptrs[c_lo],
+                        static_byte_offset=(
+                            c_hi * V_SWZ_ROWS * 16 + ng * MFMA_M * V_ROW_STRIDE
+                        )
+                        * 2,
                     )
                     return rocdl.ds_read_tr16_b64(v_tr_type, ptr).result
                 if const_expr(V_TR):
@@ -862,6 +892,8 @@ def build_ragged_fwd(
                             )
                             cur = mfma_acc_k32(a.ir_value(), v_pairs[j], cur)
                         o_acc[acc_off] = cur
+                    if const_expr(PV_FENCE_CHUNKS and (c + 1) % PV_FENCE_CHUNKS == 0):
+                        rocdl.sched_barrier(0)
                 return o_acc
 
             for c in range_constexpr(D_CHUNKS):
@@ -902,16 +934,21 @@ def build_ragged_fwd(
             lds_ptr_ty = fx.PointerType.get(elem_dtype.ir_type, 2, 16)
             wave_uni = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(wave_id)))
 
+            buf_flags = fx.Int32(buffer_ops._get_buffer_flags())
+
             def rebased_div(t, byte_off, n_elems):
                 # Fold the (64-bit) sequence/head base into the descriptor so
-                # per-lane offsets stay 32-bit.
-                base_iter = fx.get_iter(t)
-                base_i64 = fx.Int64(fx.ptrtoint(base_iter))
-                shifted = fx.inttoptr(base_iter.type, base_i64 + byte_off)
-                buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
-                return fx.logical_divide(
-                    fx.make_view(buf_ptr, fx.make_layout(n_elems, fx.Int32(1))),
-                    fx.make_layout(1, 1),
+                # per-lane offsets stay 32-bit, with num_records bounded to the
+                # sequence: rows past it read as zeros in hardware instead of
+                # running off the end of the allocation (the plain buffer
+                # pointer carries a 4 GiB bound).
+                return _make_rebased_view(
+                    fx.get_iter(t),
+                    byte_off,
+                    fx.Int64(n_elems) * fx.Int64(2),
+                    fx.make_layout(n_elems, fx.Int32(1)),
+                    _buf_flags_i32=buf_flags,
+                    _elem_ir=elem_dtype.ir_type,
                 )
 
             rows_in_seq = ops.max(seq_len, fx.Int32(1))
@@ -951,19 +988,50 @@ def build_ragged_fwd(
                 w, w + NUM_WAVES, ...; lane i of instruction n lands at byte
                 n * 1 KB + 16 i, i.e. row e // row_elems, chunk slot s, which
                 holds global chunk s ^ swz_mul * (row % swz_rows). Rows past
-                the sequence read row 0 (finite; their scores are masked)."""
+                the sequence fall outside the descriptor (bounded to the
+                sequence) and read as zeros: their scores are masked and P is
+                0. The offset is a uniform tile base plus a per-lane constant,
+                so nothing per row stays live across the loop."""
+                tile_base = kv_start * tok_stride
+                # Instruction j's rows are row0 + j * rows_per_j when a wave's
+                # stride over instructions is whole rows; its swizzle then
+                # depends on j only through (j * rows_per_j) % swz_rows, so the
+                # per-lane offset takes at most a few values and the rest is a
+                # uniform (scalar) j * rows_per_j * stride.
+                elems_per_j = NUM_WAVES * DMA_INSTR_BYTES // 2
+                whole_rows = elems_per_j % row_elems == 0
+                rows_per_j = elems_per_j // row_elems
+                e0 = wave_uni * fx.Int32(DMA_INSTR_BYTES // 2) + lane * fx.Int32(8)
+                row0 = e0 // fx.Int32(row_elems)
+                slot0 = (e0 % fx.Int32(row_elems)) // fx.Int32(8)
+                lane_offs = {}
                 for j in range_constexpr(n_instr // NUM_WAVES):
                     n = fx.Int32(j * NUM_WAVES) + wave_uni
-                    e = n * fx.Int32(DMA_INSTR_BYTES // 2) + lane * fx.Int32(8)
-                    row = e // fx.Int32(row_elems)
-                    slot = (e % fx.Int32(row_elems)) // fx.Int32(8)
-                    col = (
-                        slot ^ ((row % fx.Int32(swz_rows)) * fx.Int32(swz_mul))
-                    ) * fx.Int32(8)
-                    tok = kv_start + row
-                    tok = (tok < seq_len).select(tok, fx.Int32(0))
-                    src_elem = tok * tok_stride + col
+                    if const_expr(whole_rows):
+                        jr = (j * rows_per_j) % swz_rows
+                        if jr not in lane_offs:
+                            row_sw = (row0 + fx.Int32(jr)) % fx.Int32(swz_rows)
+                            lane_offs[jr] = row0 * tok_stride + (
+                                slot0 ^ (row_sw * fx.Int32(swz_mul))
+                            ) * fx.Int32(8)
+                        col = None
+                        src_elem = (
+                            tile_base
+                            + fx.Int32(j * rows_per_j) * tok_stride
+                            + lane_offs[jr]
+                        )
+                    else:
+                        e = n * fx.Int32(DMA_INSTR_BYTES // 2) + lane * fx.Int32(8)
+                        row = e // fx.Int32(row_elems)
+                        slot = (e % fx.Int32(row_elems)) // fx.Int32(8)
+                        col = (
+                            slot ^ ((row % fx.Int32(swz_rows)) * fx.Int32(swz_mul))
+                        ) * fx.Int32(8)
+                        src_elem = tile_base + (row * tok_stride + col)
                     if const_expr(col_limit < row_elems):
+                        if const_expr(col is None):
+                            row_sw = (row0 + fx.Int32(jr)) % fx.Int32(swz_rows)
+                            col = (slot0 ^ (row_sw * fx.Int32(swz_mul))) * fx.Int32(8)
                         src_elem = (col < fx.Int32(col_limit)).select(
                             src_elem, fx.Int32(0)
                         )

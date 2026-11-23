@@ -589,6 +589,7 @@ def test_aot_cache_serves_real_calls(tmp_path):
         pytest.skip("AOT configs target gfx950")
     env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path))
     env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+    env.pop("FLYDSL_RUNTIME_ENABLE_CACHE", None)
     subprocess.run(
         [sys.executable, "-c", _AOT_COMPILE],
         env=dict(env, COMPILE_ONLY="1"),
@@ -599,3 +600,34 @@ def test_aot_cache_serves_real_calls(tmp_path):
         env=dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"),
         check=True,
     )
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
+@pytest.mark.parametrize("dim", [128, 256])
+def test_reads_stay_inside_sequences(kernel, dim):
+    """K and V are views of a buffer whose tail after the last token holds
+    NaN: a tile that read past a sequence (and so past the tensor, for the
+    last one) would carry NaN into the output, even times P = 0. Short
+    sequences make every sequence end inside a tile."""
+    lengths = torch.tensor([37, 1, 64, 5, 130, 63])
+    total = int(lengths.sum())
+    gen = torch.Generator().manual_seed(21)
+    tensors = []
+    for _ in range(3):
+        buf = torch.full((total + 256, 2, dim), float("nan"), dtype=torch.bfloat16)
+        buf[:total] = (torch.rand(total, 2, dim, generator=gen) * 2 - 1).to(
+            torch.bfloat16
+        )
+        tensors.append(buf.to(_CUDA)[:total])
+    inputs = {
+        "N": 130,
+        "alpha": dim**-0.5,
+        "q": tensors[0],
+        "k": tensors[1],
+        "v": tensors[2],
+        "seq_offsets": lengths_to_offsets(lengths, _CUDA),
+    }
+    for options in ({}, {"max_attn_len": 20}):
+        out, ref = _run(inputs, kernel=kernel, **options)
+        assert torch.isfinite(out).all()
+        assert_hstu_close(out, ref, "silu")
