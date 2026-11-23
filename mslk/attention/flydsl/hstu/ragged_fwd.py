@@ -68,8 +68,7 @@ _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 # and the tiled kernel otherwise. Interim benchmark, MI350 bf16 D 64/128: the
 # pipelined kernel is 1.1-1.25x faster on causal and windows of 4k+ at
 # N 4k-8k (even at 2k); the tiled one is faster at N <= 1024 and for windows
-# up to about 1k (finer blocks skip more), and at D 256 everywhere (1.2-1.7x over the
-# generic kernel, which auto no longer picks).
+# up to about 1k (finer blocks skip more); D 256 is tiled only.
 _PIPELINED_MIN_N = 1024
 _PIPELINED_MIN_WINDOW = 2048
 
@@ -1299,24 +1298,23 @@ def hstu_ragged_fwd(
     """``mslk::hstu_ragged_fwd`` on a FlyDSL kernel; returns ``(out, M)``.
 
     ``kernel``: ``"pipelined"`` is the gfx950 flash-attention pipeline
-    (:mod:`.ragged_fwd_gfx950`), ``"generic"`` the generic flash-attention
-    loop (:mod:`.ragged_fwd_generic`), ``"tiled"`` the kernel of this module.
+    (:mod:`.ragged_fwd_gfx950`), ``"tiled"`` the kernel of this module.
     ``"auto"`` (no tile ``config``) takes the pipelined kernel for long
     causal or long-window calls it accepts, and the tiled kernel otherwise.
 
-    ``schedule`` (pipelined and generic kernels): ``"reverse"`` runs each
-    sequence's query blocks last first on a lower-triangular mask, so the
-    heaviest causal blocks start earliest; ``"sorted"`` runs sequences longest
-    first (an on-device argsort); ``"sorted_reverse"`` both; ``"plain"``
+    ``schedule``: ``"reverse"`` runs each sequence's query blocks last first
+    on a lower-triangular mask, so the heaviest causal blocks start earliest;
+    ``"sorted"`` (pipelined kernel only) runs sequences longest first (an
+    on-device argsort); ``"sorted_reverse"`` both; ``"plain"``
     neither. ``"auto"`` is ``"reverse"``: free, and 0.99-1.10x in the
     interim benchmark, while sorting gained up to 1.17x on some causal batches
     but lost up to 1.3x elsewhere to its extra launches; revisit with the W5
     length distribution."""
     from mslk.flydsl.jit import run_compiled
 
-    from . import ragged_fwd_generic as generic, ragged_fwd_gfx950 as pipelined
+    from . import ragged_fwd_gfx950 as pipelined
 
-    if kernel not in ("auto", "pipelined", "generic", "tiled"):
+    if kernel not in ("auto", "pipelined", "tiled"):
         raise ValueError(f"unknown kernel {kernel!r}")
     if schedule not in ("auto", "plain", "sorted", "reverse", "sorted_reverse"):
         raise ValueError(f"unknown schedule {schedule!r}")
@@ -1326,13 +1324,13 @@ def hstu_ragged_fwd(
     hidden_dim = v.shape[2]
     arch = _arch()
     softmax = num_softmax_heads > 0
-    use_pipelined = use_generic = False
+    use_pipelined = False
     if kernel in ("auto", "pipelined") and config is None:
         decline = pipelined.decline_reason(q, k, v, softmax, arch)
         if kernel == "pipelined" and decline is not None:
             raise NotImplementedError(f"FlyDSL pipelined HSTU forward: {decline}")
         # The pipeline works on 256-row blocks of at least four 64-key
-        # tiles; short sequences go to the generic loop's 64-row blocks.
+        # tiles; short sequences go to the tiled kernel's 64-row blocks.
         use_pipelined = decline is None and (
             kernel == "pipelined"
             or (
@@ -1340,12 +1338,7 @@ def hstu_ragged_fwd(
                 and (max_attn_len == 0 or max_attn_len > _PIPELINED_MIN_WINDOW)
             )
         )
-    if kernel == "generic" and config is None:
-        decline = generic.decline_reason(q, k, v, softmax, arch)
-        if kernel == "generic" and decline is not None:
-            raise NotImplementedError(f"FlyDSL generic HSTU forward: {decline}")
-        use_generic = decline is None
-    if not (use_pipelined or use_generic):
+    if not use_pipelined:
         cfg = config or _first_supported(q, head_dim, hidden_dim, arch)
         reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
         if reason is not None:
@@ -1385,7 +1378,7 @@ def hstu_ragged_fwd(
     reverse = (
         schedule in ("auto", "reverse", "sorted_reverse") and spec.mask_type == LOWER
     )
-    if schedule in ("sorted", "sorted_reverse") and (use_pipelined or use_generic):
+    if schedule in ("sorted", "sorted_reverse") and use_pipelined:
         # Longest sequence first; computed on the device (no host sync).
         lengths = seq_offsets[1:] - seq_offsets[:-1]
         sort_idx = torch.argsort(lengths, descending=True).to(torch.int32)
@@ -1407,29 +1400,6 @@ def hstu_ragged_fwd(
             softmax,
             out,
             M,
-            sort_idx,
-            reverse,
-        )
-        return out, M
-    if use_generic:
-        generic.hstu_ragged_fwd_generic(
-            N,
-            alpha,
-            q,
-            k,
-            v,
-            seq_offsets,
-            spec,
-            seq_offsets if num_targets is None else num_targets,
-            attn_scale,
-            scale_mode,
-            max_attn_len,
-            contextual_seq_len,
-            full_attn_size,
-            softmax,
-            out,
-            M,
-            arch,
             sort_idx,
             reverse,
         )

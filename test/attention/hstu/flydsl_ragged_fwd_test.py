@@ -75,20 +75,18 @@ def _run(inputs, **options):
     return out, ref
 
 
-# Every kernel: the gfx950 dual-wave pipeline (D 64/128), the generic
-# flash-attention loop (D 64-256) and the tiled kernel.
-KERNELS = ["pipelined", "generic", "tiled"]
+# Both kernels: the gfx950 dual-wave pipeline (D 64/128) and the tiled one.
+KERNELS = ["pipelined", "tiled"]
 
 
 def _skip_if_declined(kernel, call):
-    if kernel not in ("pipelined", "generic"):
+    if kernel != "pipelined":
         return
-    from mslk.attention.flydsl.hstu import ragged_fwd_generic, ragged_fwd_gfx950
+    from mslk.attention.flydsl.hstu import ragged_fwd_gfx950
     from mslk.attention.flydsl.hstu.ragged_fwd import _arch
 
-    module = ragged_fwd_gfx950 if kernel == "pipelined" else ragged_fwd_generic
     v = call["k"] if call.get("shared_kv") else call["v"]
-    reason = module.decline_reason(
+    reason = ragged_fwd_gfx950.decline_reason(
         call["q"], call["k"], v, call.get("num_softmax_heads", 0) > 0, _arch()
     )
     if reason is not None:
@@ -527,7 +525,7 @@ def _run_kernel_only(inputs, kernel="auto", **options):
 
 
 @pytest.mark.parametrize("schedule", ["plain", "reverse", "sorted", "sorted_reverse"])
-@pytest.mark.parametrize("kernel", ["pipelined", "generic"])
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("mask", ["causal", "upper", "window_contextual_full"])
 def test_schedules(schedule, kernel, mask):
     """Block orders change only the schedule, not the result."""
