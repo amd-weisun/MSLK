@@ -64,13 +64,14 @@ SCALE_TOKEN = "token"
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
 # ``kernel="auto"`` takes the pipelined kernel when the max sequence length is
-# above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW;
-# the generic one otherwise. Interim benchmark, MI350 bf16 D 64/128: the
-# pipelined kernel is 1.2-1.3x faster on causal and windows of 2k+ at
-# N 4k-8k; the generic one is faster at N <= 1024 (its 64-row blocks waste
-# less) and for windows up to about 1k (it skips more KV tiles).
+# above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW,
+# and the tiled kernel otherwise. Interim benchmark, MI350 bf16 D 64/128: the
+# pipelined kernel is 1.1-1.3x faster on causal and windows of 2k+ at
+# N 4k-8k; the tiled one is faster at N <= 1024 and for windows up to about
+# 1k (finer blocks skip more), and at D 256 everywhere (1.2-1.7x over the
+# generic kernel, which auto no longer picks).
 _PIPELINED_MIN_N = 1024
-_PIPELINED_MIN_WINDOW = 1024
+_PIPELINED_MIN_WINDOW = 1536
 
 
 @dataclass(frozen=True)
@@ -83,9 +84,15 @@ class FwdConfig:
     waves_per_eu: int = 2
 
 
-def default_config(head_dim: int, hidden_dim: int) -> FwdConfig:
-    """Heuristic tiles until the tuned defaults land (AITER's MI300X sweep)."""
+def default_config(head_dim: int, hidden_dim: int, arch: str = "") -> FwdConfig:
+    """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep at N 4096
+    (D 256: 0.40 ms at 128x64x8 waves; D 64-128: 64x32x4). Elsewhere AITER's
+    MI300X heuristic."""
     dim = max(hidden_dim, ((head_dim + 63) // 64) * 64)
+    if arch.startswith("gfx950"):
+        if dim >= 256:
+            return FwdConfig(128, 64, 8, 0)
+        return FwdConfig(64, 32, 4, 0)
     if dim >= 256:
         return FwdConfig(128, 16, 4, 0)
     if dim >= 192:
@@ -114,7 +121,7 @@ _FALLBACK_CONFIGS = tuple(
 def _first_supported(
     q: torch.Tensor, head_dim: int, hidden_dim: int, arch: str
 ) -> FwdConfig:
-    cfg = default_config(head_dim, hidden_dim)
+    cfg = default_config(head_dim, hidden_dim, arch)
     if check_supported(q, head_dim, hidden_dim, cfg, arch) is None:
         return cfg
     for cfg in _FALLBACK_CONFIGS:
@@ -199,12 +206,18 @@ def build_ragged_fwd(
     softmax: bool,
     cfg: FwdConfig,
     arch: str,
+    reverse_q_tiles: bool = False,
 ):
     """Compile-time specialization of the kernel; returns its host launcher."""
     import flydsl.compiler as flyc  # pyre-ignore[21]
     import flydsl.expr as fx  # pyre-ignore[21]
     from flydsl.expr import const_expr, gpu, range_constexpr, rocdl  # pyre-ignore[21]
-    from flydsl.expr.typing import Vector as Vec  # pyre-ignore[21]
+    from flydsl.expr.typing import (  # pyre-ignore[21]  # pyre-ignore[21]
+        T,
+        Vector as Vec,
+    )
+    from mslk.attention.flydsl.flash_attn_utils import as_mlir_value, scf_if_dispatch
+    from mslk.flydsl import buffer_ops
 
     from .common import device_ops, seq_mask
 
@@ -222,6 +235,7 @@ def build_ragged_fwd(
     HAS_FULL_ATTN = spec.has_full_attn
     SCALE_MODE = scale_mode
     SOFTMAX = softmax
+    REVERSE_Q_TILES = reverse_q_tiles
     BLOCK_THREADS = NUM_WAVES * WARP_SIZE
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
     Q_SUBTILES = ROWS_PER_WAVE // MFMA_M
@@ -238,11 +252,30 @@ def build_ragged_fwd(
     # K's LDS row pitch rounds up to 64 so the XOR swizzle stays in-row; the
     # padding columns load as zero against a zero Q operand.
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
+    # A 16-lane ds_read_b128 phase reads 16 K rows; with K rows a multiple of
+    # 256 B apart, XOR-ing the 16 B column group with row % 16 (when there
+    # are 16+ groups) puts them in 16 distinct bank slots, where row % 8
+    # leaves a 2-way conflict.
+    # The XOR only stays inside the row when the chunk count is a multiple
+    # of the swizzle span.
+    if arch.startswith("gfx950") and (HEAD_DIM_K // 8) % 16 == 0:
+        K_SWZ_ROWS = 16
     K_COL_GUARD = head_dim < HEAD_DIM_K
     K_STEPS_K = HEAD_DIM_K // MFMA_DIM_K
     D_CHUNKS = hidden_dim // MFMA_M
-    # V transposed in LDS ([d, kv]); +8 pads the row against bank conflicts.
+    # gfx950 keeps V in its natural [kv, d] layout in LDS (one vector store
+    # per lane) and reads GEMM2's B operand with the transposing
+    # ds_read_b64_tr_b16. Elsewhere V is scattered transposed ([d, kv]).
+    V_TR = arch.startswith("gfx950")
+    # Transposed layout: +8 pads the [d, kv] row against bank conflicts.
     V_T_STRIDE = BLOCK_N + 8
+    # Natural layout row padding: a 16-lane ds_read_b64_tr phase reads 8
+    # rows x 32 B, conflict-free when the row stride is an odd multiple of
+    # 32 B modulo 256 B; 16 elements of padding gives that for every D that
+    # is a multiple of 128 (64 B multiples otherwise still halve conflicts).
+    V_ROW_STRIDE = hidden_dim + 16
+    # P*V on gfx950's full-rate 16x16x32 MFMA, pairing 16-key subtiles.
+    PV_K32 = V_TR and (BLOCK_N // MFMA_N) % 2 == 0
 
     def _load_tiling(dim):
         wide = dim % 8 == 0 and (BLOCK_N * dim) % (BLOCK_THREADS * 8) == 0
@@ -265,14 +298,39 @@ def build_ragged_fwd(
     )
     assert VEC_K % MFMA_DIM_LANE_K == 0
 
-    # Tiles fully below the diagonal need no per-element mask under a plain
-    # causal mask (targets allowed): see the split in the kernel body.
-    CAUSAL_SPLIT = MASK_TYPE == LOWER and not HAS_WINDOW and not HAS_CONTEXTUAL
+    # Natural V rows, covering load batches that run past BLOCK_N (their
+    # rows hold zeros and are never read).
+    V_ROWS = max(BLOCK_N, ROWS_PER_BATCH_V * NUM_BATCHES_V)
+    # gfx950: K and V tiles go global -> LDS by DMA (buffer_load ... lds, 16 B
+    # per lane, one contiguous KB per wave instruction), so no registers stage
+    # them. Tiles are unpadded; bank conflicts are avoided by XOR swizzles of
+    # 16 B chunks applied through the source addresses instead.
+    DMA_INSTR_BYTES = WARP_SIZE * 16
+    K_DMA_INSTR = BLOCK_N * HEAD_DIM_K * 2 // DMA_INSTR_BYTES
+    V_DMA_INSTR = BLOCK_N * hidden_dim * 2 // DMA_INSTR_BYTES
+    KV_DMA = (
+        V_TR
+        and hidden_dim % 8 == 0
+        and (BLOCK_N * HEAD_DIM_K * 2) % (DMA_INSTR_BYTES * NUM_WAVES) == 0
+        and (BLOCK_N * hidden_dim * 2) % (DMA_INSTR_BYTES * NUM_WAVES) == 0
+    )
+    # V: chunk ^ 2 * (row % V_SWZ_ROWS) keeps each 32 B segment a
+    # ds_read_b64_tr_b16 phase reads contiguous and puts 8 rows in distinct
+    # bank slots when a row has 16+ chunks.
+    # The XOR (up to 2 * V_SWZ_ROWS - 1) must stay inside the row: 2 *
+    # V_SWZ_ROWS divides the row's chunk count.
+    V_SWZ_ROWS = 8
+    while V_SWZ_ROWS > 1 and (hidden_dim // 8) % (2 * V_SWZ_ROWS):
+        V_SWZ_ROWS //= 2
+    if KV_DMA:
+        V_ROW_STRIDE = hidden_dim
+        V_ROWS = BLOCK_N
+    V_LDS_ELEMS = V_ROWS * V_ROW_STRIDE if V_TR else hidden_dim * V_T_STRIDE
 
     @fx.struct
     class SharedStorage:
         k: fx.Array[elem_dtype, BLOCK_N * HEAD_DIM_K, 16]
-        v: fx.Array[elem_dtype, hidden_dim * V_T_STRIDE, 16]
+        v: fx.Array[elem_dtype, V_LDS_ELEMS, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_ragged_fwd_kernel(
@@ -293,13 +351,22 @@ def build_ragged_fwd(
         max_attn_len: fx.Int32,
         contextual_seq_len: fx.Int32,
         full_attn_size: fx.Int32,
+        k_tok_stride: fx.Int32,
+        k_head_stride: fx.Int32,
+        v_tok_stride: fx.Int32,
+        v_head_stride: fx.Int32,
     ) -> None:
         ops = device_ops()
         compute_type = fx.Float32.ir_type
         c_zero_dim_pack = Vec.filled(MFMA_DIM_LANE_K, 0.0, elem_dtype).ir_value()
 
-        dim_mfma_acc, mfma_acc = _bind_mfma_accs(
-            fx, Vec, elem_dtype, (MFMA_DIM_K, MFMA_DIM_LANE_K), (MFMA_K, MFMA_LANE_K)
+        dim_mfma_acc, mfma_acc, mfma_acc_k32 = _bind_mfma_accs(
+            fx,
+            Vec,
+            elem_dtype,
+            (MFMA_DIM_K, MFMA_DIM_LANE_K),
+            (MFMA_K, MFMA_LANE_K),
+            (2 * MFMA_K, 2 * MFMA_LANE_K),
         )
 
         tid = fx.Int32(gpu.thread_idx.x)
@@ -314,6 +381,9 @@ def build_ragged_fwd(
         pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
         local_hz_idx = pos_in_group // num_q_tiles
         q_tile_idx = pos_in_group % num_q_tiles
+        if const_expr(REVERSE_Q_TILES):
+            # Heaviest causal query tiles first.
+            q_tile_idx = num_q_tiles - fx.Int32(1) - q_tile_idx
         hz_idx = grid_group * hz_per_group + local_hz_idx
         # The last group is padded past Z*H; padding programs get seq_len 0.
         block_valid = hz_idx < hz_total
@@ -359,12 +429,38 @@ def build_ragged_fwd(
                 (HEAD_DIM_K, MFMA_DIM_LANE_K, 1),
             )
         )
-        v_smem = lds.v.view(
-            fx.make_layout(
-                (hidden_dim, V_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
-                (V_T_STRIDE, MFMA_LANE_K, 1),
+        if const_expr(V_TR):
+            v_smem = lds.v.view(
+                fx.make_layout(
+                    (V_ROWS, V_ROW_STRIDE // VEC_V, VEC_V),
+                    (V_ROW_STRIDE, VEC_V, 1),
+                )
             )
-        )
+            v_lds_base = fx.Int64(fx.ptrtoint(lds.v.ptr))
+            # ds_read_b64_tr_b16, per group of 16 lanes: lane i addresses row
+            # i // 4 and columns (i % 4) * 4 .. +3 of a 4 x 16 block and gets
+            # column i's four rows back, which is the 16x16x16 MFMA's B
+            # operand (lane: d = lane % 16, kv = (lane // 16) * 4 .. +3).
+            v_tr_row = lane_div_16 * fx.Int32(MFMA_LANE_K) + lane_mod_16 // fx.Int32(4)
+            v_tr_lane_off = v_tr_row * fx.Int32(V_ROW_STRIDE) + (
+                lane_mod_16 % fx.Int32(4)
+            ) * fx.Int32(4)
+            v_tr_type = Vec.make_type(MFMA_LANE_K, elem_dtype)
+            if const_expr(KV_DMA):
+                # Swizzled chunk of column c*16 + (lane % 4)*4: chunk 2c + j,
+                # j = (lane % 4) // 2, XOR 2 * (row % V_SWZ_ROWS); the row's low
+                # bits are lane-constant (subtiles start at multiples of 16).
+                v_tr_swz = (v_tr_row % fx.Int32(V_SWZ_ROWS)) * fx.Int32(2)
+                v_tr_chunk_lo = (lane_mod_16 % fx.Int32(4)) // fx.Int32(2)
+                v_tr_in_chunk = (lane_mod_16 % fx.Int32(2)) * fx.Int32(4)
+                v_tr_row_off = v_tr_row * fx.Int32(V_ROW_STRIDE)
+        else:
+            v_smem = lds.v.view(
+                fx.make_layout(
+                    (hidden_dim, V_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                    (V_T_STRIDE, MFMA_LANE_K, 1),
+                )
+            )
 
         def k_swz_grp(tile_row, col_grp):
             # col ^ ((row & (ROWS-1)) << SHIFT), in MFMA_DIM_LANE_K-group units.
@@ -568,7 +664,14 @@ def build_ragged_fwd(
             return vecs
 
         def store_v_regs_to_lds(vecs):
-            """V scattered transposed to [d, kv] so GEMM2 reads 4 kv per ds_read_b64."""
+            """gfx950: one vector store per lane into natural [kv, d] rows.
+            Otherwise V scattered transposed to [d, kv] so GEMM2 reads 4 kv
+            per ds_read_b64."""
+            if const_expr(V_TR):
+                for b in range_constexpr(NUM_BATCHES_V):
+                    kv_row = v_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_V)
+                    v_smem[kv_row, v_load_lane_in_row, None].store(Vec(vecs[b]))
+                return
             for b in range_constexpr(NUM_BATCHES_V):
                 kv_row = v_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_V)
                 kv_grp = kv_row // fx.Int32(MFMA_LANE_K)
@@ -587,98 +690,117 @@ def build_ragged_fwd(
                 )
             return packs
 
-        def compute_p_tile(kv_start, k_packs_by_ng, m_old, l_old, apply_mask=True):
+        def tile_scores():
             """GEMM1 with A = K, B = Q, so the C fragment (lane: query
             lane_mod_16, keys lane_div_16*4 + i) is GEMM2's A operand.
-
-            Returns P packs and, for softmax heads, the new row max, row-sum
-            partials and the rescale factor of the accumulated output."""
-            p_packs = [
-                [None for _ in range_constexpr(Q_SUBTILES)]
-                for _ in range_constexpr(KV_SUBTILES)
-            ]
-            s_all = [
-                [None for _ in range_constexpr(Q_SUBTILES)]
-                for _ in range_constexpr(KV_SUBTILES)
-            ]
-            keep_all = [
-                [None for _ in range_constexpr(Q_SUBTILES)]
-                for _ in range_constexpr(KV_SUBTILES)
-            ]
+            Returns the scores flat, index (ng * Q_SUBTILES + qg) * 4 + i."""
+            flat = []
             for ng in range_constexpr(KV_SUBTILES):
-                k_packs = [
-                    Vec(k_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)
-                ]
-                if const_expr(apply_mask):
-                    kv_base = (
-                        kv_start
-                        + fx.Int32(ng * MFMA_M)
-                        + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                    )
-                    col_raw = [
-                        kv_base + fx.Int32(i)
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
-                    col_in_seq = [
-                        col_raw[i] < seq_len
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
-                    col_id = [
-                        sm.to_id(col_raw[i])
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
+                # Read this subtile's K packs just before its MFMAs, so only
+                # one subtile's packs are live (D 256: 32 VGPRs, not 128).
+                k_packs = [Vec(x) for x in read_k_packs(ng)]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = c_zero_v4f32
                     for ks in range_constexpr(K_STEPS_K):
                         q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
                         cur = dim_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
-                    s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                    if const_expr(apply_mask):
-                        keep_all[ng][qg] = [
-                            sm.visible(q_rows[qg], col_raw[i], q_row_ids[qg], col_id[i])
-                            & col_in_seq[i]
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                    s_all[ng][qg] = s_vals
+                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        flat.append(Vec(cur)[i])
+            return flat
 
+        # Masked pre-activation value: SiLU scores gate to silu(0) = 0;
+        # softmax's scaled scores take a finite sentinel (fast math assumes
+        # no infinities) and their p is zeroed below.
+        masked_value = c_neg_big if SOFTMAX else c_zero_f
+
+        def mask_values(kv_start, values):
+            out = list(values)
+            for ng in range_constexpr(KV_SUBTILES):
+                kv_base = (
+                    kv_start
+                    + fx.Int32(ng * MFMA_M)
+                    + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                )
+                for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                    col = kv_base + fx.Int32(i)
+                    col_id = sm.to_id(col)
+                    for qg in range_constexpr(Q_SUBTILES):
+                        keep = sm.visible(q_rows[qg], col, q_row_ids[qg], col_id) & (
+                            col < seq_len
+                        )
+                        idx = (ng * Q_SUBTILES + qg) * MFMA_ELEMS_PER_LANE + i
+                        out[idx] = keep.select(fx.Float32(out[idx]), masked_value)
+            return [fx.Float32(x).ir_value() for x in out]
+
+        block_row_last = q_start + fx.Int32(BLOCK_M - 1)
+
+        def tile_needs_mask(kv_start):
+            """False only when every key of the tile is visible to every row
+            of the block (uniform across the block)."""
+            c_last = kv_start + fx.Int32(BLOCK_N - 1)
+            need = (c_last >= seq_len) | (sm.to_id(c_last) >= sm.to_id(q_start))
+            if const_expr(HAS_WINDOW):
+                need = need | (
+                    sm.to_id(kv_start) < sm.to_id(block_row_last) - sm.max_attn_len
+                )
+            return need
+
+        N_SCORES = KV_SUBTILES * Q_SUBTILES * MFMA_ELEMS_PER_LANE
+        CAN_SKIP_MASK = MASK_TYPE == LOWER and not HAS_CONTEXTUAL
+
+        def masked_values(kv_start, values):
+            if const_expr(not CAN_SKIP_MASK):
+                return mask_values(kv_start, values)
+
+            def _apply(_names, *vals):
+                return mask_values(kv_start, vals)
+
+            return list(
+                scf_if_dispatch(
+                    tile_needs_mask(kv_start),
+                    _apply,
+                    state_names=tuple("_hm%d" % i for i in range(N_SCORES)),
+                    state_values=[fx.Float32(x).ir_value() for x in values],
+                )
+            )
+
+        def compute_p_tile(kv_start, m_old, l_old):
+            """Scores, mask, activation. Returns P packs and, for softmax heads,
+            the new row max, row-sum partials and the output rescale factor."""
+            flat = tile_scores()
+            if const_expr(SOFTMAX):
+                flat = [fx.Float32(x) * score_scale for x in flat]
+            flat = [fx.Float32(x) for x in masked_values(kv_start, flat)]
+
+            def vals(ng, qg):
+                base = (ng * Q_SUBTILES + qg) * MFMA_ELEMS_PER_LANE
+                return flat[base : base + MFMA_ELEMS_PER_LANE]
+
+            p_packs = [
+                [None for _ in range_constexpr(Q_SUBTILES)]
+                for _ in range_constexpr(KV_SUBTILES)
+            ]
             if const_expr(not SOFTMAX):
                 for ng in range_constexpr(KV_SUBTILES):
                     for qg in range_constexpr(Q_SUBTILES):
-                        s_vals = s_all[ng][qg]
-                        if const_expr(apply_mask):
-                            # A masked score of 0 gates to silu(0) = 0.
-                            s_vals = [
-                                keep_all[ng][qg][i].select(s_vals[i], c_zero_f)
-                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                            ]
-                        p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
+                        p_packs[ng][qg] = pack_p(silu_scale_batch(vals(ng, qg)))
                 return p_packs, m_old, l_old, None
 
+            c_live = fx.Float32(-1.0e29)
             m_new, l_new, corr = [], [], []
             for qg in range_constexpr(Q_SUBTILES):
-                scaled = [
-                    [
-                        s_all[ng][qg][i] * score_scale
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
-                    for ng in range_constexpr(KV_SUBTILES)
-                ]
                 tile_max = c_neg_big
                 for ng in range_constexpr(KV_SUBTILES):
-                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        x = scaled[ng][i]
-                        if const_expr(apply_mask):
-                            x = keep_all[ng][qg][i].select(x, c_neg_big)
+                    for x in vals(ng, qg):
                         tile_max = fmax(tile_max, x)
                 m_q = fmax(fx.Float32(m_old[qg]), lanes_max(tile_max))
                 corr_q = fx.exp2(fx.Float32(m_old[qg]) - m_q, fastmath="afn")
                 l_q = fx.Float32(l_old[qg]) * corr_q
                 for ng in range_constexpr(KV_SUBTILES):
                     p_vals = []
-                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        p = fx.exp2(scaled[ng][i] - m_q, fastmath="afn")
-                        if const_expr(apply_mask):
-                            p = keep_all[ng][qg][i].select(p, c_zero_f)
+                    for x in vals(ng, qg):
+                        p = fx.exp2(x - m_q, fastmath="afn")
+                        p = (x > c_live).select(p, c_zero_f)
                         l_q = l_q + p
                         p_vals.append(p)
                     p_packs[ng][qg] = pack_p(p_vals, round_nearest=True)
@@ -691,9 +813,56 @@ def build_ragged_fwd(
             """O[m, d] += P[m, n] V[n, d] with A = P, B = V[kv, d]."""
 
             def read_v_pack(c, ng):
+                if const_expr(KV_DMA):
+                    chunk = (fx.Int32(2 * c) + v_tr_chunk_lo) ^ v_tr_swz
+                    elem = (
+                        v_tr_row_off
+                        + fx.Int32(ng * MFMA_M * V_ROW_STRIDE)
+                        + chunk * fx.Int32(8)
+                        + v_tr_in_chunk
+                    )
+                    ptr = buffer_ops.create_llvm_ptr(
+                        v_lds_base + fx.Int64(elem) * fx.Int64(2), address_space=3
+                    )
+                    return rocdl.ds_read_tr16_b64(v_tr_type, ptr).result
+                if const_expr(V_TR):
+                    elem = v_tr_lane_off + fx.Int32(
+                        ng * MFMA_M * V_ROW_STRIDE + c * MFMA_M
+                    )
+                    ptr = buffer_ops.create_llvm_ptr(
+                        v_lds_base + fx.Int64(elem) * fx.Int64(2), address_space=3
+                    )
+                    return rocdl.ds_read_tr16_b64(v_tr_type, ptr).result
                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
                 kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
                 return v_smem[d_col, kv_grp, None].load().ir_value()
+
+            if const_expr(PV_K32):
+                # 16x16x32 MFMAs over pairs of 16-key subtiles: A is the two
+                # P fragments back to back (keys g*4.. and 16 + g*4.. for lane
+                # group g), B the V rows of the same keys from two transposing
+                # reads. The K order only has to agree between A and B.
+                for c in range_constexpr(D_CHUNKS):
+                    v_pairs = []
+                    for j in range_constexpr(KV_SUBTILES // 2):
+                        lo = read_v_pack(c, 2 * j)
+                        hi = read_v_pack(c, 2 * j + 1)
+                        v_pairs.append(
+                            Vec(lo)
+                            .shuffle(Vec(hi), list(range(2 * MFMA_LANE_K)))
+                            .ir_value()
+                        )
+                    for qg in range_constexpr(Q_SUBTILES):
+                        acc_off = c * Q_SUBTILES + qg
+                        cur = o_acc[acc_off]
+                        for j in range_constexpr(KV_SUBTILES // 2):
+                            a = Vec(p_packs[2 * j][qg]).shuffle(
+                                Vec(p_packs[2 * j + 1][qg]),
+                                list(range(2 * MFMA_LANE_K)),
+                            )
+                            cur = mfma_acc_k32(a.ir_value(), v_pairs[j], cur)
+                        o_acc[acc_off] = cur
+                return o_acc
 
             for c in range_constexpr(D_CHUNKS):
                 v_packs = [read_v_pack(c, ng) for ng in range_constexpr(KV_SUBTILES)]
@@ -706,6 +875,8 @@ def build_ragged_fwd(
             return o_acc
 
         N_ACC = D_CHUNKS * Q_SUBTILES
+        # Accumulator state: O, then the softmax row max and sum partials.
+        N_STATE = N_ACC + (2 * Q_SUBTILES if SOFTMAX else 0)
 
         def split_state(it):
             it_list = list(it) if isinstance(it, (list, tuple)) else [it]
@@ -718,41 +889,157 @@ def build_ragged_fwd(
             )
             return o_acc, m_old, l_old
 
-        def run_kv_tile(state, kv_start, apply_mask=True, full_tile=False):
-            """K staged through registers to swizzled LDS; V's global load
-            stays in flight under GEMM1 (counted vmcnt)."""
-            o_acc, m_old, l_old = split_state(state)
-            k_vecs = async_load_k_regs(kv_start, full_tile=full_tile)
-            v_vecs = async_load_v_regs(kv_start, full_tile=full_tile)
-            rocdl.s_waitcnt(vmcnt=NUM_BATCHES_V)
-            store_k_regs_to_lds(k_vecs)
-            gpu.barrier()
-            k_packs = [read_k_packs(ng) for ng in range_constexpr(KV_SUBTILES)]
-            p_packs, m_new, l_new, corr = compute_p_tile(
-                kv_start, k_packs, m_old, l_old, apply_mask=apply_mask
+        # Logical KV tiles: the contextual prefix [0, prefix_end), then the
+        # main range from main_start.
+        n_logical = prefix_end + (main_end - main_start)
+        tile_gap = main_start - prefix_end
+
+        def tile_start(t):
+            return (t < prefix_end).select(t, t + tile_gap) * fx.Int32(BLOCK_N)
+
+        if const_expr(KV_DMA):
+            dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(128), 128)
+            lds_ptr_ty = fx.PointerType.get(elem_dtype.ir_type, 2, 16)
+            wave_uni = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(wave_id)))
+
+            def rebased_div(t, byte_off, n_elems):
+                # Fold the (64-bit) sequence/head base into the descriptor so
+                # per-lane offsets stay 32-bit.
+                base_iter = fx.get_iter(t)
+                base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+                shifted = fx.inttoptr(base_iter.type, base_i64 + byte_off)
+                buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
+                return fx.logical_divide(
+                    fx.make_view(buf_ptr, fx.make_layout(n_elems, fx.Int32(1))),
+                    fx.make_layout(1, 1),
+                )
+
+            rows_in_seq = ops.max(seq_len, fx.Int32(1))
+            k_div = rebased_div(
+                k,
+                (
+                    fx.Int64(seq_start) * fx.Int64(k_tok_stride)
+                    + fx.Int64(head_idx) * fx.Int64(k_head_stride)
+                )
+                * fx.Int64(2),
+                rows_in_seq * k_tok_stride,
             )
+            v_div = rebased_div(
+                v,
+                (
+                    fx.Int64(seq_start) * fx.Int64(v_tok_stride)
+                    + fx.Int64(head_idx) * fx.Int64(v_head_stride)
+                )
+                * fx.Int64(2),
+                rows_in_seq * v_tok_stride,
+            )
+            k_lds_byte = fx.Int32(fx.ptrtoint(lds.k.ptr))
+            v_lds_byte = fx.Int32(v_lds_base)
+
+            def dma_tile(
+                div,
+                lds_byte,
+                row_elems,
+                n_instr,
+                swz_rows,
+                swz_mul,
+                tok_stride,
+                col_limit,
+                kv_start,
+            ):
+                """Tile rows kv_start.. into LDS; wave w issues instructions
+                w, w + NUM_WAVES, ...; lane i of instruction n lands at byte
+                n * 1 KB + 16 i, i.e. row e // row_elems, chunk slot s, which
+                holds global chunk s ^ swz_mul * (row % swz_rows). Rows past
+                the sequence read row 0 (finite; their scores are masked)."""
+                for j in range_constexpr(n_instr // NUM_WAVES):
+                    n = fx.Int32(j * NUM_WAVES) + wave_uni
+                    e = n * fx.Int32(DMA_INSTR_BYTES // 2) + lane * fx.Int32(8)
+                    row = e // fx.Int32(row_elems)
+                    slot = (e % fx.Int32(row_elems)) // fx.Int32(8)
+                    col = (
+                        slot ^ ((row % fx.Int32(swz_rows)) * fx.Int32(swz_mul))
+                    ) * fx.Int32(8)
+                    tok = kv_start + row
+                    tok = (tok < seq_len).select(tok, fx.Int32(0))
+                    src_elem = tok * tok_stride + col
+                    if const_expr(col_limit < row_elems):
+                        src_elem = (col < fx.Int32(col_limit)).select(
+                            src_elem, fx.Int32(0)
+                        )
+                    dst_byte = lds_byte + n * fx.Int32(DMA_INSTR_BYTES)
+                    dst = fx.make_view(
+                        fx.inttoptr(lds_ptr_ty, dst_byte), fx.make_layout(1, 1)
+                    )
+                    fx.copy(dma_atom, fx.slice(div, (None, src_elem)), dst)
+
+            def dma_k(kv_start):
+                dma_tile(
+                    k_div,
+                    k_lds_byte,
+                    HEAD_DIM_K,
+                    K_DMA_INSTR,
+                    K_SWZ_ROWS,
+                    1,
+                    k_tok_stride,
+                    head_dim,
+                    kv_start,
+                )
+
+            def dma_v(kv_start):
+                dma_tile(
+                    v_div,
+                    v_lds_byte,
+                    hidden_dim,
+                    V_DMA_INSTR,
+                    V_SWZ_ROWS,
+                    2,
+                    v_tok_stride,
+                    hidden_dim,
+                    kv_start,
+                )
+
+        def run_kv_tile_dma(state, kv_start, next_start):
+            """One KV tile, K and V by DMA into single LDS buffers: K(t) was
+            issued by the previous tile; V(t) is issued once K(t) is in and
+            overlaps GEMM1; K(t+1) is issued once V(t) is in and overlaps
+            GEMM2. The barriers also fence each buffer's reads from the next
+            write."""
+            o_acc, m_old, l_old = split_state(state)
+            rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            dma_v(kv_start)
+            p_packs, m_new, l_new, corr = compute_p_tile(kv_start, m_old, l_old)
             if const_expr(SOFTMAX):
                 o_acc = scale_o_rows(o_acc, corr)
             rocdl.s_waitcnt(vmcnt=0)
-            store_v_regs_to_lds(v_vecs)
-            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
             gpu.barrier()
-            # The next tile's K barrier fences these V reads from its V
-            # store, and this tile's V barrier fenced the K reads above.
+            dma_k(next_start)
             o_acc = accum_o_tile(o_acc, p_packs)
             return o_acc + list(m_new) + list(l_new)
 
-        # Unmasked tiles [main_start, unmasked_end): under a plain causal mask
-        # every key below min(q_start, max_ids) is visible to every row of the
-        # tile (targets clamp ids at max_ids). Computed outside the dynamic
-        # `if` below: FlyDSL carries any local whose method a region calls.
-        unmasked_end = main_start
-        if const_expr(CAUSAL_SPLIT):
-            split_pos = q_start
-            if const_expr(HAS_TARGETS):
-                split_pos = ops.min(q_start, sm.max_ids)
-            unmasked_end = ops.max(split_pos // fx.Int32(BLOCK_N), main_start)
-            unmasked_end = ops.min(unmasked_end, main_end)
+        def run_kv_tile(state, kv_start, next_start):
+            """One KV tile, software-pipelined: this tile's K and V arrive in
+            registers from the previous iteration; the next tile's K load is
+            issued once K is in LDS and its V load once V is, so both overlap
+            this tile's GEMMs. LLVM places the waits at first use."""
+            o_acc, m_old, l_old = split_state(state)
+            k_vecs = state[N_STATE : N_STATE + NUM_BATCHES_K]
+            v_vecs = state[N_STATE + NUM_BATCHES_K :]
+            store_k_regs_to_lds(k_vecs)
+            gpu.barrier()
+            k_next = async_load_k_regs(next_start)
+            p_packs, m_new, l_new, corr = compute_p_tile(kv_start, m_old, l_old)
+            if const_expr(SOFTMAX):
+                o_acc = scale_o_rows(o_acc, corr)
+            store_v_regs_to_lds(v_vecs)
+            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
+            gpu.barrier()
+            v_next = async_load_v_regs(next_start)
+            # The next tile's K barrier fences these V reads from its V
+            # store, and this tile's V barrier fenced the K reads above.
+            o_acc = accum_o_tile(o_acc, p_packs)
+            return o_acc + list(m_new) + list(l_new) + list(k_next) + list(v_next)
 
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
@@ -762,40 +1049,33 @@ def build_ragged_fwd(
                     + [c_neg_big.ir_value() for _ in range(Q_SUBTILES)]
                     + [c_zero_f.ir_value() for _ in range(Q_SUBTILES)]
                 )
+            first = tile_start(fx.Int32(0))
+            if const_expr(KV_DMA):
+                dma_k(first)
+            else:
+                acc_init = (
+                    acc_init
+                    + list(async_load_k_regs(first))
+                    + list(async_load_v_regs(first))
+                )
 
             loop_results = acc_init
-            # Contextual columns a window would skip.
             for kv_tile, it in range(
                 fx.Int32(0),
-                fx.Int32(prefix_end),
+                fx.Int32(n_logical),
                 fx.Int32(1),
                 init=acc_init,
             ):  # ty: ignore
                 state = list(it) if isinstance(it, (list, tuple)) else [it]
-                kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                state = run_kv_tile(state, kv_start, apply_mask=True)
-                loop_results = yield state
-
-            for kv_tile, it in range(
-                fx.Int32(main_start),
-                fx.Int32(unmasked_end),
-                fx.Int32(1),
-                init=loop_results,
-            ):  # ty: ignore
-                state = list(it) if isinstance(it, (list, tuple)) else [it]
-                kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                state = run_kv_tile(state, kv_start, apply_mask=False, full_tile=True)
-                loop_results = yield state
-
-            for kv_tile, it in range(
-                fx.Int32(unmasked_end),
-                fx.Int32(main_end),
-                fx.Int32(1),
-                init=loop_results,
-            ):  # ty: ignore
-                state = list(it) if isinstance(it, (list, tuple)) else [it]
-                kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)
-                state = run_kv_tile(state, kv_start, apply_mask=True)
+                t = fx.Int32(kv_tile)
+                if const_expr(KV_DMA):
+                    state = run_kv_tile_dma(
+                        state, tile_start(t), tile_start(t + fx.Int32(1))
+                    )
+                else:
+                    state = run_kv_tile(
+                        state, tile_start(t), tile_start(t + fx.Int32(1))
+                    )
                 loop_results = yield state
 
             # ---- Epilogue. GEMM2's C fragment is [d, query]: d = lane_mod_16,
@@ -858,6 +1138,10 @@ def build_ragged_fwd(
         max_attn_len: fx.Int32,
         contextual_seq_len: fx.Int32,
         full_attn_size: fx.Int32,
+        k_tok_stride: fx.Int32,
+        k_head_stride: fx.Int32,
+        v_tok_stride: fx.Int32,
+        v_head_stride: fx.Int32,
         stream: fx.Stream,
     ) -> None:
         c_ngg = fx.Int32(NUM_GRID_GROUPS)
@@ -883,6 +1167,10 @@ def build_ragged_fwd(
             max_attn_len,
             contextual_seq_len,
             full_attn_size,
+            k_tok_stride,
+            k_head_stride,
+            v_tok_stride,
+            v_head_stride,
             value_attrs={
                 "rocdl.waves_per_eu": WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
@@ -946,8 +1234,7 @@ def hstu_ragged_fwd(
     (:mod:`.ragged_fwd_gfx950`), ``"generic"`` the generic flash-attention
     loop (:mod:`.ragged_fwd_generic`), ``"tiled"`` the kernel of this module.
     ``"auto"`` (no tile ``config``) takes the pipelined kernel for long
-    sequences, else the generic one, else the tiled one, each where it
-    accepts the call.
+    causal or long-window calls it accepts, and the tiled kernel otherwise.
 
     ``schedule`` (pipelined and generic kernels): ``"reverse"`` runs each
     sequence's query blocks last first on a lower-triangular mask, so the
@@ -985,7 +1272,7 @@ def hstu_ragged_fwd(
                 and (max_attn_len == 0 or max_attn_len > _PIPELINED_MIN_WINDOW)
             )
         )
-    if kernel in ("auto", "generic") and config is None and not use_pipelined:
+    if kernel == "generic" and config is None:
         decline = generic.decline_reason(q, k, v, softmax, arch)
         if kernel == "generic" and decline is not None:
             raise NotImplementedError(f"FlyDSL generic HSTU forward: {decline}")
@@ -1089,6 +1376,7 @@ def hstu_ragged_fwd(
         softmax,
         cfg,
         arch,
+        reverse,
     )
     if num_targets is None:
         num_targets = seq_offsets
@@ -1117,6 +1405,10 @@ def hstu_ragged_fwd(
         max_attn_len,
         contextual_seq_len,
         full_attn_size,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
         torch.cuda.current_stream(q.device),
     )
     return out, M

@@ -88,6 +88,8 @@ def build_ragged_fwd_generic(
     softmax: bool,
     sorted_order: bool = False,
     reverse_q_blocks: bool = False,
+    block_m: int = BLOCK_M,
+    waves_per_eu: int = 0,
 ):
     """Compile-time specialization; returns ``launch(...)``. ``sorted_order``
     as in :func:`.ragged_fwd_gfx950.build_ragged_fwd_gfx950`."""
@@ -116,7 +118,9 @@ def build_ragged_fwd_generic(
     from .common import device_ops, seq_mask
 
     # D 256 is VGPR-bound; one wave per EU lets the compiler avoid spills.
-    waves_per_eu = 1 if head_dim >= 256 else 2
+    if waves_per_eu == 0:
+        waves_per_eu = 1 if head_dim >= 256 else 2
+    BLOCK_M_ = block_m
     traits = _make_flash_attn_generic_traits(
         num_heads,
         num_heads,
@@ -124,8 +128,8 @@ def build_ragged_fwd_generic(
         arch,
         causal=False,
         dtype_str=dtype_str,
-        flat_work_group_size=128,
-        block_m=BLOCK_M,
+        flat_work_group_size=block_m * 2,
+        block_m=block_m,
         path_tag="N32",
         varlen=True,
         cross_seqlen=False,
@@ -155,7 +159,7 @@ def build_ragged_fwd_generic(
         head_dim_qk=None,
         head_dim_v=None,
     )
-    assert traits.BLOCK_M == BLOCK_M and traits.BLOCK_N == BLOCK_N
+    assert traits.BLOCK_M == block_m and traits.BLOCK_N == BLOCK_N
     assert traits.N_SUBTILES == 1 and not traits.ENABLE_DMA
     assert not traits.ENABLE_GFX942_KV_GPFETCH and not traits.ENABLE_PREFETCH_3BUF
 
@@ -185,6 +189,8 @@ def build_ragged_fwd_generic(
         SOFTMAX,
         SORTED,
         REVERSE_Q_BLOCKS,
+        BLOCK_M_,
+        waves_per_eu,
     )
     # Non-vectorized MFMA32 score layout: lane column offsets per register.
     MOFF = (0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27)
@@ -262,13 +268,13 @@ def build_ragged_fwd_generic(
             full_attn_size=full_attn_size,
         )
         q_start_i32 = fx.Int32(ctx.q_start)
-        prefix_end, main_start, main_end = sm.kv_tiles(q_start_i32, BLOCK_M, BLOCK_N)
+        prefix_end, main_start, main_end = sm.kv_tiles(q_start_i32, BLOCK_M_, BLOCK_N)
         n_logical = prefix_end + (main_end - main_start)
         tile_gap = main_start - prefix_end
 
         q_row_i32 = ctx.q_row_i32
         q_row_id = sm.to_id(q_row_i32)
-        block_row_last = q_start_i32 + fx.Int32(BLOCK_M - 1)
+        block_row_last = q_start_i32 + fx.Int32(BLOCK_M_ - 1)
         col_lane_base = fx.Int32(ctx.lane_div_32) * fx.Int32(4)
         masked_score = ctx.c_neg_inf if SOFTMAX else ctx.c_zero_f
 
@@ -458,7 +464,7 @@ def build_ragged_fwd_generic(
         cctx = CompilationContext.get_current()
         with ir.InsertionPoint(cctx.gpu_module_body):
             allocator.finalize()
-        num_q_tiles = (fx.Index(max_seq_len) + BLOCK_M - 1) // BLOCK_M
+        num_q_tiles = (fx.Index(max_seq_len) + BLOCK_M_ - 1) // BLOCK_M_
         grid_x = fx.Index(num_seqs) * num_q_tiles * traits.NUM_HEADS_Q
         hstu_ragged_fwd_generic_kernel(
             Q,
@@ -531,6 +537,8 @@ def hstu_ragged_fwd_generic(
     arch: str,
     sort_idx: Optional[torch.Tensor] = None,
     reverse_q_blocks: bool = False,
+    block_m: int = BLOCK_M,
+    waves_per_eu: int = 0,
 ) -> None:
     """Run the kernel into ``out`` (contiguous) and ``M``. Arguments as
     normalized by :func:`mslk.attention.flydsl.hstu.ragged_fwd.hstu_ragged_fwd`."""
@@ -552,6 +560,8 @@ def hstu_ragged_fwd_generic(
         softmax,
         sort_idx is not None,
         reverse_q_blocks,
+        block_m,
+        waves_per_eu,
     )
     if softmax:
         score_scale, out_scale = alpha * _LOG2E, 1.0
