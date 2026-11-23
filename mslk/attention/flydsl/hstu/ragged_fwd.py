@@ -63,6 +63,11 @@ SCALE_TOKEN = "token"
 
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
+# ``kernel="auto"`` takes the pipelined kernel above this max sequence length
+# (interim benchmark on MI350, D 64/128: at N = 512 the tiled kernel is about
+# 5% faster, at N = 1024 the pipelined one 1.8x).
+_PIPELINED_MIN_N = 512
+
 
 @dataclass(frozen=True)
 class FwdConfig:
@@ -928,20 +933,41 @@ def hstu_ragged_fwd(
     shared_kv: bool = False,
     *,
     config: Optional[FwdConfig] = None,
+    kernel: str = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``mslk::hstu_ragged_fwd`` on the FlyDSL kernel; returns ``(out, M)``."""
+    """``mslk::hstu_ragged_fwd`` on a FlyDSL kernel; returns ``(out, M)``.
+
+    ``kernel``: ``"pipelined"`` is the gfx950 flash-attention pipeline
+    (:mod:`.ragged_fwd_gfx950`), ``"tiled"`` the kernel of this module;
+    ``"auto"`` takes the pipelined one where it accepts the call and no tile
+    ``config`` is given."""
     from mslk.flydsl.jit import run_compiled
 
+    from . import ragged_fwd_gfx950 as pipelined
+
+    if kernel not in ("auto", "pipelined", "tiled"):
+        raise ValueError(f"unknown kernel {kernel!r}")
     if shared_kv:
         v = k
     num_tokens, num_heads, head_dim = q.shape
     hidden_dim = v.shape[2]
     arch = _arch()
-    cfg = config or _first_supported(q, head_dim, hidden_dim, arch)
-    reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
-    if reason is not None:
-        raise NotImplementedError(f"FlyDSL ragged HSTU forward: {reason}")
     softmax = num_softmax_heads > 0
+    use_pipelined = False
+    if kernel != "tiled" and config is None:
+        decline = pipelined.decline_reason(q, k, v, softmax, arch)
+        if kernel == "pipelined" and decline is not None:
+            raise NotImplementedError(f"FlyDSL pipelined HSTU forward: {decline}")
+        # The pipeline works on 256-row blocks of at least four 64-key
+        # tiles; up to N = 512 the tiled kernel is as fast or faster.
+        use_pipelined = decline is None and (
+            kernel == "pipelined" or N > _PIPELINED_MIN_N
+        )
+    if not use_pipelined:
+        cfg = config or _first_supported(q, head_dim, hidden_dim, arch)
+        reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
+        if reason is not None:
+            raise NotImplementedError(f"FlyDSL ragged HSTU forward: {reason}")
     spec = MaskSpec.from_args(
         invalid_attn_mask_type,
         max_attn_len,
@@ -965,6 +991,35 @@ def hstu_ragged_fwd(
         M.fill_(float("-inf"))
         return out, M
 
+    seq_offsets = seq_offsets.to(torch.int32)
+    if num_targets is not None:
+        num_targets = num_targets.to(torch.int32)
+    if scale_mode == SCALE_INV_N:
+        attn_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+    else:
+        attn_scale = attn_scale.reshape(-1).to(torch.float32)
+
+    if use_pipelined:
+        pipelined.hstu_ragged_fwd_gfx950(
+            N,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            spec,
+            seq_offsets if num_targets is None else num_targets,
+            attn_scale,
+            scale_mode,
+            max_attn_len,
+            contextual_seq_len,
+            full_attn_size,
+            softmax,
+            out,
+            M,
+        )
+        return out, M
+
     launcher = build_ragged_fwd(
         head_dim,
         hidden_dim,
@@ -975,15 +1030,8 @@ def hstu_ragged_fwd(
         cfg,
         arch,
     )
-    seq_offsets = seq_offsets.to(torch.int32)
     if num_targets is None:
         num_targets = seq_offsets
-    else:
-        num_targets = num_targets.to(torch.int32)
-    if scale_mode == SCALE_INV_N:
-        attn_scale = torch.empty(1, dtype=torch.float32, device=q.device)
-    else:
-        attn_scale = attn_scale.reshape(-1).to(torch.float32)
     if softmax:
         score_scale, out_scale = alpha * _LOG2E, 1.0
     else:

@@ -66,11 +66,31 @@ def _run(inputs, **options):
     call = dict(inputs)
     call.update(args)
     config = call.pop("config", None)
-    out, lse = hstu_ragged_fwd(**call, config=config)
+    kernel = call.pop("kernel", "auto")
+    _skip_if_declined(kernel, call)
+    out, lse = hstu_ragged_fwd(**call, config=config, kernel=kernel)
     ref, ref_lse = ragged_hstu_attention_ref(**call)
     if call.get("num_softmax_heads", 0):
         return out, ref, lse, ref_lse
     return out, ref
+
+
+# Both kernels: the gfx950 pipelined one (D 64/128) and the tiled one.
+KERNELS = ["pipelined", "tiled"]
+
+
+def _skip_if_declined(kernel, call):
+    if kernel != "pipelined":
+        return
+    from mslk.attention.flydsl.hstu import ragged_fwd_gfx950
+    from mslk.attention.flydsl.hstu.ragged_fwd import _arch
+
+    v = call["k"] if call.get("shared_kv") else call["v"]
+    reason = ragged_fwd_gfx950.decline_reason(
+        call["q"], call["k"], v, call.get("num_softmax_heads", 0) > 0, _arch()
+    )
+    if reason is not None:
+        pytest.skip(f"pipelined kernel declines: {reason}")
 
 
 def _inputs(batch, max_len, heads=2, dim=64, hidden=None, sparsity=0.6, **kw):
@@ -88,9 +108,10 @@ def _inputs(batch, max_len, heads=2, dim=64, hidden=None, sparsity=0.6, **kw):
 
 @pytest.mark.parametrize("mask", list(_MASKS))
 @pytest.mark.parametrize("targets", [False, True])
-def test_mask_features(mask, targets):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_mask_features(mask, targets, kernel):
     inputs = _inputs(6, 300, max_targets=20 if targets else 0, seed=1)
-    out, ref = _run(inputs, **_MASKS[mask])
+    out, ref = _run(inputs, kernel=kernel, **_MASKS[mask])
     assert_hstu_close(out, ref, "silu")
 
 
@@ -99,29 +120,32 @@ def test_mask_features(mask, targets):
     [(d, d) for d in HEAD_DIMS] + [(64, 128), (128, 64), (48, 96), (64, 160)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_head_dims(dim, hidden, dtype):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_head_dims(dim, hidden, dtype, kernel):
     inputs = _inputs(4, 200, heads=3, dim=dim, hidden=hidden, dtype=dtype, seed=2)
-    out, ref = _run(inputs, max_attn_len=50, contextual_seq_len=3)
+    out, ref = _run(inputs, kernel=kernel, max_attn_len=50, contextual_seq_len=3)
     assert_hstu_close(out, ref, "silu")
 
 
 @pytest.mark.parametrize("form", ["scalar", "token"])
-def test_attn_scale(form):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_attn_scale(form, kernel):
     inputs = _inputs(5, 160, seed=3)
     total = inputs["q"].shape[0]
     if form == "scalar":
         scale = torch.tensor(0.37, device=_CUDA)
     else:
         scale = torch.rand(total, device=_CUDA, dtype=torch.bfloat16) + 0.5
-    out, ref = _run(inputs, attn_scale=scale)
+    out, ref = _run(inputs, kernel=kernel, attn_scale=scale)
     assert_hstu_close(out, ref, "silu")
 
 
-def test_alpha_is_a_runtime_value():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_alpha_is_a_runtime_value(kernel):
     inputs = _inputs(3, 100, seed=4)
     for alpha in (0.05, 0.5, 2.0):
         inputs["alpha"] = alpha
-        out, ref = _run(inputs)
+        out, ref = _run(inputs, kernel=kernel)
         assert_hstu_close(out, ref, "silu")
 
 
@@ -136,7 +160,8 @@ def test_alpha_is_a_runtime_value():
         [2048, 3, 900],
     ],
 )
-def test_lengths(lengths):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_lengths(lengths, kernel):
     gen = torch.Generator().manual_seed(5)
     lengths_t = torch.tensor(lengths)
     total = int(lengths_t.sum())
@@ -157,7 +182,7 @@ def test_lengths(lengths):
         {"max_attn_len": 7},
         {"max_attn_len": 7, "contextual_seq_len": 3},
     ):
-        out, ref = _run(inputs, **options)
+        out, ref = _run(inputs, kernel=kernel, **options)
         assert_hstu_close(out, ref, "silu")
 
 
@@ -170,15 +195,17 @@ def test_n_larger_than_longest_sequence():
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_index_dtypes(index_dtype):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_index_dtypes(index_dtype, kernel):
     inputs = _inputs(4, 120, max_targets=5, seed=7)
     inputs["seq_offsets"] = inputs["seq_offsets"].to(index_dtype)
     targets = inputs["num_targets"].to(index_dtype)
-    out, ref = _run(inputs, num_targets=targets, max_attn_len=9)
+    out, ref = _run(inputs, kernel=kernel, num_targets=targets, max_attn_len=9)
     assert_hstu_close(out, ref, "silu")
 
 
-def test_strided_views():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_strided_views(kernel):
     """q, k and v slices of one packed qkv tensor, so token strides differ
     from the head-dim extent."""
     base = _inputs(5, 150, seed=8)
@@ -188,13 +215,14 @@ def test_strided_views():
     inputs["q"] = qkv[:, :, :dim]
     inputs["k"] = qkv[:, :, dim : 2 * dim]
     inputs["v"] = qkv[:, :, 2 * dim + 16 :]
-    out, ref = _run(inputs, max_attn_len=20)
+    out, ref = _run(inputs, kernel=kernel, max_attn_len=20)
     assert_hstu_close(out, ref, "silu")
 
 
-def test_shared_kv():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_shared_kv(kernel):
     inputs = _inputs(4, 140, shared_kv=True, seed=9)
-    out, ref = _run(inputs)
+    out, ref = _run(inputs, kernel=kernel)
     assert_hstu_close(out, ref, "silu")
 
 
@@ -215,7 +243,8 @@ def test_tile_configs(config):
         assert_hstu_close(out, ref, "silu")
 
 
-def test_variants_do_not_share_a_compiled_kernel():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_variants_do_not_share_a_compiled_kernel(kernel):
     """FlyDSL keys its compile cache on scalar closure values only. Variants
     that differ only in compile-time mask features must each get their own
     binary (a regression served the upper-triangular binary to a windowed
@@ -227,7 +256,7 @@ def test_variants_do_not_share_a_compiled_kernel():
         {},
         {"max_attn_len": 1000, "contextual_seq_len": 1},
     ):
-        out, ref = _run(inputs, **options)
+        out, ref = _run(inputs, kernel=kernel, **options)
         assert_hstu_close(out, ref, "silu")
 
 
@@ -285,16 +314,18 @@ def _check_softmax(inputs, options):
 
 @pytest.mark.parametrize("mask", list(_MASKS))
 @pytest.mark.parametrize("dim", HEAD_DIMS)
-def test_softmax_heads(mask, dim):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_softmax_heads(mask, dim, kernel):
     """All heads softmax (T2 takes num_softmax_heads 0 or H): out and the
     base-2 LSE M."""
     inputs = _inputs(5, 260, heads=2, dim=dim, max_targets=8, seed=13)
     inputs["num_softmax_heads"] = 2
-    _check_softmax(inputs, _MASKS[mask])
+    _check_softmax(inputs, dict(_MASKS[mask], kernel=kernel))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_softmax_lengths_and_dtypes(dtype):
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_softmax_lengths_and_dtypes(dtype, kernel):
     gen = torch.Generator().manual_seed(15)
     lengths_t = torch.tensor([0, 1, 2, 127, 300, 0, 64])
     total = int(lengths_t.sum())
@@ -311,7 +342,9 @@ def test_softmax_lengths_and_dtypes(dtype):
         "seq_offsets": lengths_to_offsets(lengths_t, _CUDA),
         "num_softmax_heads": 2,
     }
-    _check_softmax(inputs, {"max_attn_len": 20, "contextual_seq_len": 4})
+    _check_softmax(
+        inputs, {"max_attn_len": 20, "contextual_seq_len": 4, "kernel": kernel}
+    )
 
 
 def test_softmax_ignores_attn_scale():
@@ -416,10 +449,11 @@ def _free_gpu_bytes():
     return free
 
 
-def test_offsets_beyond_2_31_elements():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_offsets_beyond_2_31_elements(kernel):
     """Packed row offset x token stride crosses 2^31 elements (A9): the last
     sequences start beyond it, so 32-bit address arithmetic would wrap."""
-    heads, dim = 8, 256
+    heads, dim = (8, 256) if kernel == "tiled" else (16, 128)
     per_token = heads * dim
     total = (2**31) // per_token + 4096  # ~1.05M tokens, ~4.3 GB per tensor
     if _free_gpu_bytes() < 5 * total * per_token * 2:
@@ -446,7 +480,7 @@ def test_offsets_beyond_2_31_elements():
         "seq_offsets": offsets,
     }
     options = {"max_attn_len": 512}
-    out, _ = _run_kernel_only(inputs, **options)
+    out, _ = _run_kernel_only(inputs, kernel=kernel, **options)
     last = len(lengths) - 1
     for b in (0, last - 1, last):
         n = lengths[b]
@@ -456,9 +490,10 @@ def test_offsets_beyond_2_31_elements():
         assert_hstu_close(out[s0 + rows], ref, "silu")
 
 
-def test_64k_sequence():
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_64k_sequence(kernel):
     """A single sequence of 64k tokens at head dim 256 (A9)."""
-    n, heads, dim = 65536, 1, 256
+    n, heads, dim = 65536, 1, (256 if kernel == "tiled" else 128)
     gen = torch.Generator(device=_CUDA).manual_seed(19)
     q, k, v = (
         (torch.rand(n, heads, dim, generator=gen, device=_CUDA) * 2 - 1).to(
@@ -477,13 +512,13 @@ def test_64k_sequence():
     }
     rows = torch.tensor([0, 7, 4095, 32768, n - 301, n - 300, n - 1], device=_CUDA)
     for options in ({}, {"max_attn_len": 2048, "full_attn_size": 1000}):
-        out, _ = _run_kernel_only(inputs, **options)
+        out, _ = _run_kernel_only(inputs, kernel=kernel, **options)
         ref = _rows_reference(inputs, 0, rows, options)
         assert_hstu_close(out[rows], ref, "silu")
 
 
-def _run_kernel_only(inputs, **options):
+def _run_kernel_only(inputs, kernel="auto", **options):
     from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
 
     args = _op_args(inputs, **options)
-    return hstu_ragged_fwd(**args)
+    return hstu_ragged_fwd(**args, kernel=kernel)
