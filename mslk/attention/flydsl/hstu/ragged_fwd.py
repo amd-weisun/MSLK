@@ -88,10 +88,15 @@ class FwdConfig:
 # re-reads fewer K/V rows around its window, which is what bounds such calls
 # (memory-bound: a 16-key window at D 128 runs at about 35 TFLOPS).
 _SMALL_WINDOW = 64
+_SHORT_SEQ = 1024
 
 
 def default_config(
-    head_dim: int, hidden_dim: int, arch: str = "", max_attn_len: int = 0
+    head_dim: int,
+    hidden_dim: int,
+    arch: str = "",
+    max_attn_len: int = 0,
+    max_seq_len: int = 0,
 ) -> FwdConfig:
     """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep (D 256 at
     N 4096: 0.30 ms). Elsewhere AITER's MI300X heuristic."""
@@ -102,6 +107,10 @@ def default_config(
         # tiles (MI350, 16-key window, D 128: 2.79 vs 3.16 ms).
         if 0 < max_attn_len <= _SMALL_WINDOW:
             return FwdConfig(64, 32, 4, 0)
+        # D 256, short sequences: 32-key tiles, 3-6% faster at N <= 1024
+        # (fewer KV tiles per block), tied from N 2048.
+        if dim >= 256 and 0 < max_seq_len <= _SHORT_SEQ:
+            return FwdConfig(64, 32, 4, 3)
         return FwdConfig(64, 64, 4, 3)
     if dim >= 256:
         return FwdConfig(128, 16, 4, 0)
@@ -129,9 +138,14 @@ _FALLBACK_CONFIGS = tuple(
 
 
 def _first_supported(
-    q: torch.Tensor, head_dim: int, hidden_dim: int, arch: str, max_attn_len: int = 0
+    q: torch.Tensor,
+    head_dim: int,
+    hidden_dim: int,
+    arch: str,
+    max_attn_len: int = 0,
+    max_seq_len: int = 0,
 ) -> FwdConfig:
-    cfg = default_config(head_dim, hidden_dim, arch, max_attn_len)
+    cfg = default_config(head_dim, hidden_dim, arch, max_attn_len, max_seq_len)
     if check_supported(q, head_dim, hidden_dim, cfg, arch) is None:
         return cfg
     for cfg in _FALLBACK_CONFIGS:
@@ -1387,7 +1401,7 @@ def hstu_ragged_fwd(
             )
         )
     if not use_pipelined:
-        cfg = config or _first_supported(q, head_dim, hidden_dim, arch, max_attn_len)
+        cfg = config or _first_supported(q, head_dim, hidden_dim, arch, max_attn_len, N)
         reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
         if reason is not None:
             raise NotImplementedError(f"FlyDSL ragged HSTU forward: {reason}")
