@@ -250,6 +250,68 @@ class SeqMask:
             prefix_end = o.select(active, prefix_end, o.const(0))
         return prefix_end, main_start, main_end
 
+    def q_tiles(
+        self, k_start: Any, block_n: int, block_m: int
+    ) -> Tuple[Any, Any, Any, Any, Any]:
+        """Query tiles that see some key of the KV tile at ``k_start`` (the
+        backward's loop): ``[0, prefix_end)``, ``[main_start, main_end)`` and
+        ``[tail_start, tail_end)``, ordered and disjoint.
+
+        Lower-triangular: the prefix is the contextual rows (id 0, which see
+        every key), the main range runs from the tile's diagonal to the last
+        row whose window still reaches the tile, and the tail is the
+        full-attention rows (which see every earlier key). A tile holding
+        contextual keys (id 0) is seen by every row. Upper-triangular: the
+        rows up to the tile's last key. Other masks: every tile.
+        """
+        spec, o = self.spec, self.ops
+        seq_len = self.seq_len
+        all_tiles = o.cdiv(seq_len, block_m)
+        zero = o.const(0)
+        k_last = o.min(k_start + o.const(block_n), seq_len) - o.const(1)
+        active = k_start < seq_len
+        if spec.mask_type != LOWER:
+            end = o.select(active, all_tiles, zero)
+            if spec.mask_type == UPPER and not spec.has_contextual:
+                # Rows at or before the tile's last key.
+                end = o.select(active, o.cdiv(k_last + o.const(1), block_m), zero)
+            return zero, zero, end, end, end
+        hi = seq_len
+        if spec.has_window:
+            reach = self.to_id(k_last) + self.max_attn_len
+            hi = o.select(
+                reach >= self.max_ids,
+                seq_len,
+                o.min(self._first_raw_with_id(reach + o.const(1)), seq_len),
+            )
+        main_start = k_start // o.const(block_m)
+        main_end = o.cdiv(hi, block_m)
+        prefix_end = zero
+        tail_start = all_tiles
+        if spec.has_contextual:
+            ctx_rows = o.min(self.contextual_seq_len, seq_len)
+            prefix_end = o.cdiv(ctx_rows, block_m)
+            # Contextual keys (id 0) are seen by every row.
+            ctx_keys = k_start < self.contextual_seq_len
+            main_start = o.select(ctx_keys, zero, main_start)
+            main_end = o.select(ctx_keys, all_tiles, main_end)
+        if spec.has_full_attn:
+            first_full = self.max_ids - self.full_attn_size
+            tail_row = o.select(
+                first_full >= self.max_ids + o.const(1),
+                seq_len,
+                o.min(self._first_raw_with_id(o.max(first_full, zero)), seq_len),
+            )
+            tail_start = tail_row // o.const(block_m)
+        # Order and clip: prefix <= main <= tail, empty when inactive.
+        main_end = o.select(active, main_end, zero)
+        prefix_end = o.select(active, prefix_end, zero)
+        main_start = o.min(o.max(main_start, prefix_end), main_end)
+        tail_start = o.max(tail_start, main_end)
+        tail_end = o.select(active, all_tiles, zero)
+        tail_start = o.min(tail_start, tail_end)
+        return prefix_end, main_start, main_end, tail_start, tail_end
+
 
 def seq_mask(
     spec: MaskSpec,

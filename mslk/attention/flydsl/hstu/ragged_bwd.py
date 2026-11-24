@@ -172,10 +172,13 @@ def hstu_ragged_bwd(
     as_i16 = lambda t: t.view(torch.int16)  # noqa: E731
     seqstart = seq_offsets.to(torch.int32)
     targets = num_targets.to(torch.int32) if num_targets is not None else seqstart
-    grad_elems = num_tokens * num_heads * dim
-    dq_f32 = torch.zeros(grad_elems, 1, dtype=torch.float32, device=q.device)
-    dk_f32 = torch.zeros(grad_elems, 1, dtype=torch.float32, device=q.device)
-    dv_f32 = torch.zeros(grad_elems, 1, dtype=torch.float32, device=q.device)
+    # f32 scratch as [T * H, dim]: FlyDSL passes each dim as an int32, and the
+    # flat element count of a packed batch can pass 2^31 (the kernel
+    # addresses these buffers by byte offset, not through their shape).
+    grad_shape = (num_tokens * num_heads, dim)
+    dq_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
+    dk_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
+    dv_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
     placeholder_f32 = torch.zeros(1, dtype=torch.float32, device=q.device)
     run_compiled(
         launcher,

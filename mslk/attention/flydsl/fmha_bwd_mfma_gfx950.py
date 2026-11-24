@@ -1368,18 +1368,34 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
             m_tile_start = m_tile_start_full
             m_tile_end = n_M_tiles_idx
+
+            # The loop index is LOGICAL (it drives the double-buffer parity and
+            # the next-tile handoff); _phys maps it to the query tile it loads.
+            def _phys(m_tile_logical):
+                return m_tile_logical
+
             if const_expr(HSTU):
-                # This sequence's own query tiles (lengths are ragged).
-                m_tile_end = (this_seqlen_q + fx.Index(BLOCK_M - 1)) // fx.Index(
-                    BLOCK_M
+                # Only the query tiles that see this KV tile (common.q_tiles):
+                # the contextual rows, the band from the diagonal to the last
+                # row the window reaches, and the full-attention rows.
+                q_pre, q_lo, q_hi, q_tail, q_end = hstu_sm.q_tiles(
+                    fx.Int32(n_tile * BLOCK_N), BLOCK_N, BLOCK_M
                 )
-                # Lower-triangular without a contextual prefix: ids are
-                # non-decreasing in the position, so a row before the key tile
-                # sees none of its keys (only the diagonal, m == n).
-                if const_expr(HSTU_MASK[0] == "lower_triangular" and not HSTU_MASK[2]):
-                    m_tile_start = (n_tile * BLOCK_N) // BLOCK_M
-                    m_tile_start = (m_tile_start < m_tile_end).select(
-                        m_tile_start, m_tile_end
+                q_main_n = q_hi - q_lo
+                m_tile_start = fx.Index(0)
+                m_tile_end = fx.Index(q_pre + q_main_n + (q_end - q_tail))
+
+                def _phys(m_tile_logical):  # noqa: F811
+                    t = fx.Int32(m_tile_logical)
+                    in_main = t - q_pre
+                    in_tail = in_main - q_main_n
+                    return fx.Index(
+                        (t < q_pre).select(
+                            t,
+                            (in_main < q_main_n).select(
+                                q_lo + in_main, q_tail + in_tail
+                            ),
+                        )
                     )
 
             # Prologue: prefetch tile m_tile_start's Q/dO for this block's query head.
@@ -1389,13 +1405,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             # tolerance as the existing last-M-tile prefetch, clamped in-bounds by
             # _load_qdo_item).
             prologue_buf = (m_tile_start & fx.Index(1)) * fx.Index(LDS_Q_ELEMS)
-            prologue_q, prologue_do = _load_qdo_regs(head_idx, m_tile_start)
+            prologue_q, prologue_do = _load_qdo_regs(head_idx, _phys(m_tile_start))
             _store_qdo_regs_to_lds(prologue_q, prologue_do, prologue_buf)
             # Same prologue treatment as Q/dO: seed the start tile's LSE/D
             # into its double-buffer slot before the hot loop begins, so
             # the first tile's epiB barrier also waits on data with lead
             # time instead of a load issued moments earlier.
-            prologue_lse, prologue_dm = _load_lse_item(head_idx, m_tile_start)
+            prologue_lse, prologue_dm = _load_lse_item(head_idx, _phys(m_tile_start))
             prologue_lse_buf = (m_tile_start & fx.Index(1)) * fx.Index(LDS_LSE_ELEMS)
             _store_lse_regs_to_lds(prologue_lse, prologue_dm, prologue_lse_buf)
             entry_state = list(loop_results[0 : 2 * DV_DK_ACCS_PER_WAVE + 1])
@@ -1450,7 +1466,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         return cond & active
                     return cond
 
-                m_start = m_tile * BLOCK_M
+                m_start = _phys(m_tile) * BLOCK_M
                 cur_buf_elems = (m_tile & fx.Index(1)) * fx.Index(LDS_Q_ELEMS)
                 cur_lse_buf = (m_tile & fx.Index(1)) * fx.Index(LDS_LSE_ELEMS)
 
@@ -1580,7 +1596,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 do_handoff and _next_load_it < ITEMS_PER_LANE
                             ):
                                 q_v, do_v = _load_qdo_item(
-                                    head_idx, m_tile + fx.Index(1), _next_load_it
+                                    head_idx, _phys(m_tile + fx.Index(1)), _next_load_it
                                 )
                                 next_q[_next_load_it] = q_v
                                 next_do[_next_load_it] = do_v
@@ -1592,7 +1608,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 # the real tile shapes, but handled by the elif chain
                                 # either way).
                                 next_lse, next_dm = _load_lse_item(
-                                    head_idx, m_tile + fx.Index(1)
+                                    head_idx, _phys(m_tile + fx.Index(1))
                                 )
                                 _lse_issued = True
                             rocdl.sched_group_barrier(_VMEM_MASK, 1, 0)
@@ -1607,7 +1623,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                             for _pad_it in range_constexpr(ITEMS_PER_LANE):
                                 if const_expr(_pad_it >= _next_load_it):
                                     q_v, do_v = _load_qdo_item(
-                                        head_idx, m_tile + fx.Index(1), _pad_it
+                                        head_idx, _phys(m_tile + fx.Index(1)), _pad_it
                                     )
                                     next_q[_pad_it] = q_v
                                     next_do[_pad_it] = do_v
@@ -1616,7 +1632,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 # (e.g. K_STEPS==0 at some D) -- issue plainly, still
                                 # ahead of the store below.
                                 next_lse, next_dm = _load_lse_item(
-                                    head_idx, m_tile + fx.Index(1)
+                                    head_idx, _phys(m_tile + fx.Index(1))
                                 )
                                 _lse_issued = True
 
