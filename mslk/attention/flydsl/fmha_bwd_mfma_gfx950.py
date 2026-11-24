@@ -112,6 +112,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     dropout_p: float = 0.0,
     hstu=None,
     hstu_softmax: bool = False,
+    hstu_grouped: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -193,6 +194,14 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     # below, with the forward's LSE and D = rowsum(dO * O).
     HSTU = hstu is not None
     HSTU_SILU = HSTU and not hstu_softmax
+    # Grouped HSTU (mslk.attention.flydsl.hstu.grouped_bwd): per-group lengths
+    # stay on the device, so the grid is a KV-tile map, not B x max tiles.
+    # hstu_targets then holds, as int32: from 0, each tile slot's sequence (B
+    # past the last tile); from SLOTS, the exclusive prefix sum of KV tiles
+    # per sequence; from SLOTS + B + 1, per sequence (num_targets,
+    # max_attn_len, contextual_seq_len, full_attn_size). SLOTS =
+    # ceil(total_m / BLOCK_N) + B; the hstu_* ints are unused.
+    HSTU_GROUPED = HSTU and hstu_grouped
     if HSTU:
         assert varlen and causal_mode == CAUSAL_NONE and window_left < 0
         assert not (has_bias or emit_dbias or has_dropout or heads_per_kv != 1)
@@ -478,6 +487,31 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         head_idx = bh_idx % n_heads_idx
         kv_head_idx = head_idx // fx.Index(heads_per_kv)
 
+        hstu_slot_valid = None
+        if const_expr(HSTU_GROUPED):
+            from mslk.flydsl import buffer_ops as _grp_bops
+
+            hstu_meta_rsrc = _grp_bops.create_buffer_resource(hstu_targets)
+
+            def _hstu_meta(idx):
+                return fx.Index(
+                    _grp_bops.buffer_load(
+                        hstu_meta_rsrc, fx.Index(idx), vec_width=1, dtype=fx.Int32
+                    )
+                )
+
+            hstu_slots = (total_m_idx + fx.Index(BLOCK_N - 1)) // fx.Index(
+                BLOCK_N
+            ) + fx.Index(batch_size)
+            head_idx = bid_idx % n_heads_idx
+            kv_head_idx = head_idx
+            hstu_slot = bid_idx // n_heads_idx
+            hstu_seq = _hstu_meta(hstu_slot)
+            hstu_slot_valid = hstu_seq < fx.Index(batch_size)
+            batch_idx = hstu_slot_valid.select(hstu_seq, fx.Index(0))
+            n_tile = hstu_slot - _hstu_meta(hstu_slots + batch_idx)
+            n_tile = hstu_slot_valid.select(n_tile, fx.Index(0))
+
         n_start = n_tile * BLOCK_N
 
         # varlen: q_start/k_start (packed-row-offset bases) and this_seqlen_q/
@@ -507,6 +541,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             this_seqlen_q = seq_M_idx
             this_seqlen_k = seq_N_idx
 
+        if const_expr(HSTU_GROUPED):
+            # Surplus tile slots: an empty sequence (nothing visits, nothing is
+            # stored).
+            this_seqlen_q = hstu_slot_valid.select(this_seqlen_q, fx.Index(0))
+            this_seqlen_k = hstu_slot_valid.select(this_seqlen_k, fx.Index(0))
+
         # Last row of the sequence, where out-of-range loads are clamped. HSTU
         # sequences may be empty: clamp to row 0 there (in bounds of the
         # packed tensors or past them, where buffer loads return 0; the
@@ -526,7 +566,21 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             )
 
             hstu_num_target = fx.Int32(0)
-            if const_expr(HSTU_MASK[3]):
+            hstu_window = hstu_max_attn_len
+            hstu_context = hstu_contextual_seq_len
+            hstu_full = hstu_full_attn_size
+            if const_expr(HSTU_GROUPED):
+                settings = (
+                    hstu_slots
+                    + fx.Index(batch_size)
+                    + fx.Index(1)
+                    + batch_idx * fx.Index(4)
+                )
+                hstu_num_target = fx.Int32(_hstu_meta(settings))
+                hstu_window = fx.Int32(_hstu_meta(settings + fx.Index(1)))
+                hstu_context = fx.Int32(_hstu_meta(settings + fx.Index(2)))
+                hstu_full = fx.Int32(_hstu_meta(settings + fx.Index(3)))
+            elif const_expr(HSTU_MASK[3]):
                 hstu_targets_rsrc = _seq_bops.create_buffer_resource(hstu_targets)
                 hstu_num_target = fx.Int32(
                     _seq_bops.buffer_load(
@@ -541,9 +595,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 _hstu_ops(),
                 fx.Int32(this_seqlen_q),
                 num_targets=hstu_num_target,
-                max_attn_len=hstu_max_attn_len,
-                contextual_seq_len=hstu_contextual_seq_len,
-                full_attn_size=hstu_full_attn_size,
+                max_attn_len=hstu_window,
+                contextual_seq_len=hstu_context,
+                full_attn_size=hstu_full,
             )
 
         def _hstu_visible(m_row_abs, n_row_abs):
@@ -2410,6 +2464,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # dV/dK partials combined via atomic-add. varlen: B already collapsed to 1 by
         # the caller.
         grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_N_tiles)
+        if const_expr(HSTU_GROUPED):
+            # One block per (KV-tile slot, head); see HSTU_GROUPED.
+            grid_x = fx.Int32(
+                (
+                    (fx.Index(total_m) + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+                    + fx.Index(B)
+                )
+                * fx.Index(H)
+            )
         fmha_bwd_dqdkdv_mfma_gfx950_kernel(
             Q,
             K,

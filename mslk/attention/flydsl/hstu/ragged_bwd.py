@@ -69,6 +69,7 @@ def build_ragged_bwd(
     spec: MaskSpec,
     arch: str,
     softmax: bool = False,
+    grouped: bool = False,
 ):
     from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
         compile_fmha_bwd_dqdkdv_mfma_gfx950,
@@ -87,6 +88,7 @@ def build_ragged_bwd(
         D_V=dim_v,
         hstu=spec,
         hstu_softmax=softmax,
+        hstu_grouped=grouped,
     )
 
 
@@ -127,7 +129,6 @@ def hstu_ragged_bwd(
     neither); ``sort_by_length_indices`` is unused. Every sequence must be at
     most ``N`` tokens."""
     from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import gfx950_tile_defaults
-    from mslk.flydsl.jit import run_compiled
 
     if shared_kv:
         v = k
@@ -198,13 +199,62 @@ def hstu_ragged_bwd(
             )
         row_scale = per_token.expand(num_heads, num_tokens).contiguous().view(-1, 1)
 
+    targets = num_targets.to(torch.int32) if num_targets is not None else None
+    launch_bwd(
+        launcher,
+        dout,
+        q,
+        k,
+        v,
+        dq,
+        dk,
+        dv,
+        seq_offsets,
+        N,
+        block_m,
+        row_scale,
+        d_vec,
+        targets,
+        (max_attn_len, contextual_seq_len, full_attn_size),
+        shared_kv,
+    )
+
+
+def launch_bwd(
+    launcher,
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: Optional[torch.Tensor],
+    seq_offsets: torch.Tensor,
+    N: int,
+    block_m: int,
+    row_scale: torch.Tensor,
+    d_vec: Optional[torch.Tensor],
+    hstu_meta: Optional[torch.Tensor],
+    hstu_ints,
+    shared_kv: bool,
+) -> None:
+    """Run a launcher of :func:`build_ragged_bwd` (or the grouped one) and
+    write the f32 gradients into dq, dk and dv. ``row_scale``: the kernel's
+    LSE slot ([H, T]); ``d_vec``: softmax's D ([T, H], None for SiLU);
+    ``hstu_meta``: per-sequence targets (ragged) or the grouped tile map;
+    ``hstu_ints``: (max_attn_len, contextual_seq_len, full_attn_size)."""
+    from mslk.flydsl.jit import run_compiled
+
+    num_tokens, num_heads, dim_qk = q.shape
+    dim_v = v.shape[2]
+    dim = next(d for d in _DIMS if d >= max(dim_qk, dim_v))
+    num_seqs = seq_offsets.shape[0] - 1
     q4, k4, v4, do4 = (
         _rows(t, d).unsqueeze(0)
         for t, d in ((q, dim_qk), (k, dim_qk), (v, dim_v), (dout, dim_v))
     )
     as_i16 = lambda t: t.view(torch.int16)  # noqa: E731
     seqstart = seq_offsets.to(torch.int32)
-    targets = num_targets.to(torch.int32) if num_targets is not None else seqstart
     # f32 scratch as [T * H, dim]: FlyDSL passes each dim as an int32, and the
     # flat element count of a packed batch can pass 2^31 (the kernel
     # addresses these buffers by byte offset, not through their shape).
@@ -223,7 +273,7 @@ def hstu_ragged_bwd(
         dk_f32,
         dq_f32,
         row_scale,  # LSE: the forward's LSE, or SiLU's per-row output scale
-        d_vec if softmax else row_scale,  # D_vec (unused by SiLU heads)
+        row_scale if d_vec is None else d_vec,  # D_vec (unused by SiLU heads)
         num_seqs,  # the grid's batch count (tensors are packed, batch 1)
         N,
         N,
@@ -245,10 +295,8 @@ def hstu_ragged_bwd(
         0,
         0,
         0,
-        targets,
-        max_attn_len,
-        contextual_seq_len,
-        full_attn_size,
+        seqstart if hstu_meta is None else hstu_meta,
+        *hstu_ints,
         torch.cuda.current_stream(q.device),
     )
     shape = (num_tokens, num_heads, dim)
