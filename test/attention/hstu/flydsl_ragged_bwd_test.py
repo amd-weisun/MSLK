@@ -416,3 +416,39 @@ def test_packed_gradients_past_4gib():
     dq_t, dk_t = run(q[lo:].clone(), k[lo:].clone(), dout[lo:].clone(), off[-4:] - lo)
     torch.testing.assert_close(dq[lo:], dq_t, atol=0, rtol=0)
     torch.testing.assert_close(dk[lo:], dk_t, atol=0, rtol=0)
+
+
+def test_strided_gradient_outputs():
+    """Non-contiguous dq/dk/dv take the f32-scratch path (contiguous ones
+    are stored by the kernel directly)."""
+    from mslk.attention.flydsl.hstu.ragged_bwd import hstu_ragged_bwd
+
+    inputs = make_ragged_inputs(3, 160, 2, 64, 64, 0.6, device=_CUDA, seed=14)
+    args = _args(inputs, max_attn_len=20)
+    q, k, v = inputs["q"], inputs["k"], inputs["v"]
+    dout = torch.randn_like(v)
+    T = q.shape[0]
+    grads = torch.empty(T, 2, 3 * 64, device=_CUDA, dtype=q.dtype)
+    dq, dk, dv = grads[..., :64], grads[..., 64:128], grads[..., 128:]
+    hstu_ragged_bwd(
+        dout,
+        q,
+        k,
+        v,
+        dq,
+        dk,
+        dv,
+        args["seq_offsets"],
+        None,
+        None,
+        args["N"],
+        args["alpha"],
+        args["max_attn_len"],
+        "lower_triangular",
+        0,
+        None,
+        0,
+    )
+    ref = _reference_grads(inputs, dout, args)
+    for name, got, want in (("dq", dq, ref[0]), ("dk", dk, ref[1]), ("dv", dv, ref[2])):
+        assert_hstu_close(got, want, "silu", name)

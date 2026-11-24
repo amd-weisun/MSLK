@@ -23,6 +23,7 @@ nothing waits on the host (the call captures in a CUDA graph):
   or a ``[T, ...]`` scale per token (its first column), as in the forward.
 """
 
+import functools
 from typing import Optional
 
 import torch
@@ -167,7 +168,8 @@ def hstu_grouped_bwd(
         has_full_attn=lower,
     )
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "f16"
-    launcher = build_ragged_bwd(
+    launcher = functools.partial(
+        build_ragged_bwd,
         dim,
         dim_qk,
         dim_v,

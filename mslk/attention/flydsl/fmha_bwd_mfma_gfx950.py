@@ -113,6 +113,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     hstu=None,
     hstu_softmax: bool = False,
     hstu_grouped: bool = False,
+    hstu_direct_dkv: bool = False,
+    hstu_shared_dkv: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -202,6 +204,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     # max_attn_len, contextual_seq_len, full_attn_size). SLOTS =
     # ceil(total_m / BLOCK_N) + B; the hstu_* ints are unused.
     HSTU_GROUPED = HSTU and hstu_grouped
+    # HSTU_DIRECT: dK/dV are the caller's contiguous [T, H, D_QK] / [T, H, D_V]
+    # tensors in the input dtype, stored converted (no f32 scratch, no zero
+    # fill: every row has exactly one writer). HSTU_SHARED: shared K/V, dK + dV
+    # stored to dK.
+    HSTU_DIRECT = HSTU and hstu_direct_dkv
+    HSTU_SHARED = HSTU_DIRECT and hstu_shared_dkv
+    if HSTU_DIRECT:
+        assert D_QK % 4 == 0 and D_V % 4 == 0 and not deterministic
+        assert not HSTU_SHARED or D_QK == D_V
     if HSTU:
         assert varlen and causal_mode == CAUSAL_NONE and window_left < 0
         assert not (has_bias or emit_dbias or has_dropout or heads_per_kv != 1)
@@ -855,7 +866,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # ptr<8> ordinary buffer_store descriptor (buffer_ops.buffer_store), distinct
         # from the raw <4xi32> atomic rsrc built above for the GQA-combine path.
         if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
-            if const_expr(HSTU):
+            if const_expr(HSTU_DIRECT):
+                dk_store_rsrc = _rebased(dK, k_start, n_heads_idx * fx.Index(D_QK), 2)
+                dv_store_rsrc = _rebased(dV, k_start, n_heads_idx * fx.Index(D_V), 2)
+            elif const_expr(HSTU):
                 dv_store_rsrc = _rebased(dV, k_start, _out_pitch, 4)
                 dk_store_rsrc = _rebased(dK, k_start, _out_pitch, 4)
             else:
@@ -2370,7 +2384,36 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 d_col_abs0 = d_full * fx.Index(16) + lane_div_16 * 4
                 d_ok0 = d_col_abs0 < fx.Index(D)
                 flat_col0 = fx.Int32(fx.Index(kv_row_g) * fx.Index(D) + d_col_abs0)
-                if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
+                if const_expr(HSTU_DIRECT):
+                    # Converted 4-column stores into the caller's tensors.
+                    hstu_dk_vals = [
+                        Vec(dk_finals[acc_i])[r] * store_scale_cst for r in range(4)
+                    ]
+                    hstu_dv_vals = [Vec(dv_finals[acc_i])[r] for r in range(4)]
+                    if const_expr(HSTU_SHARED):
+                        hstu_dk_vals = [
+                            hstu_dk_vals[r] + hstu_dv_vals[r] for r in range(4)
+                        ]
+                    if n_ok & (d_col_abs0 < fx.Index(D_QK)):
+                        _bops.buffer_store(
+                            Vec.from_elements(hstu_dk_vals, fx.Float32)
+                            .to(elem_dtype)
+                            .ir_value(),
+                            dk_store_rsrc,
+                            fx.Int32(fx.Index(kv_row_g) * fx.Index(D_QK) + d_col_abs0),
+                        )
+                    if const_expr(not HSTU_SHARED):
+                        if n_ok & (d_col_abs0 < fx.Index(D_V)):
+                            _bops.buffer_store(
+                                Vec.from_elements(hstu_dv_vals, fx.Float32)
+                                .to(elem_dtype)
+                                .ir_value(),
+                                dv_store_rsrc,
+                                fx.Int32(
+                                    fx.Index(kv_row_g) * fx.Index(D_V) + d_col_abs0
+                                ),
+                            )
+                elif const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
                     if n_ok & d_ok0:
                         dk_vals = [
                             fx.Float32(

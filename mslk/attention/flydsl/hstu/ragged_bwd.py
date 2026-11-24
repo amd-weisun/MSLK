@@ -70,6 +70,8 @@ def build_ragged_bwd(
     arch: str,
     softmax: bool = False,
     grouped: bool = False,
+    direct: bool = False,
+    shared: bool = False,
 ):
     from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
         compile_fmha_bwd_dqdkdv_mfma_gfx950,
@@ -89,6 +91,8 @@ def build_ragged_bwd(
         hstu=spec,
         hstu_softmax=softmax,
         hstu_grouped=grouped,
+        hstu_direct_dkv=direct,
+        hstu_shared_dkv=shared,
     )
 
 
@@ -162,7 +166,8 @@ def hstu_ragged_bwd(
     )
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "f16"
     softmax = num_softmax_heads > 0
-    launcher = build_ragged_bwd(
+    launcher = functools.partial(
+        build_ragged_bwd,
         dim,
         dim_qk,
         dim_v,
@@ -238,8 +243,10 @@ def launch_bwd(
     hstu_ints,
     shared_kv: bool,
 ) -> None:
-    """Run a launcher of :func:`build_ragged_bwd` (or the grouped one) and
-    write the f32 gradients into dq, dk and dv. ``row_scale``: the kernel's
+    """Build (``launcher``: :func:`build_ragged_bwd` with all but its
+    ``direct``/``shared`` arguments bound) and run the backward into dq, dk
+    and dv. Contiguous dk/dv with head dims a multiple of 4 are stored by the
+    kernel directly in the input dtype; otherwise through f32 scratch. ``row_scale``: the kernel's
     LSE slot ([H, T]); ``d_vec``: softmax's D ([T, H], None for SiLU);
     ``hstu_meta``: per-sequence targets (ragged) or the grouped tile map;
     ``hstu_ints``: (max_attn_len, contextual_seq_len, full_attn_size)."""
@@ -255,22 +262,33 @@ def launch_bwd(
     )
     as_i16 = lambda t: t.view(torch.int16)  # noqa: E731
     seqstart = seq_offsets.to(torch.int32)
+    direct = (
+        dim_qk % 4 == 0
+        and dim_v % 4 == 0
+        and dk.is_contiguous()
+        and (shared_kv or dv.is_contiguous())
+    )
     # f32 scratch as [T * H, dim]: FlyDSL passes each dim as an int32, and the
     # flat element count of a packed batch can pass 2^31 (the kernel
     # addresses these buffers by byte offset, not through their shape).
     grad_shape = (num_tokens * num_heads, dim)
     dq_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
-    dk_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
-    dv_f32 = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
+    if direct:
+        # Every (token, head) row has one writer: no zero fill.
+        dk_out = as_i16(dk).view(num_tokens * num_heads, dim_qk)
+        dv_out = dk_out if shared_kv else as_i16(dv).view(-1, dim_v)
+    else:
+        dk_out = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
+        dv_out = torch.zeros(grad_shape, dtype=torch.float32, device=q.device)
     placeholder_f32 = torch.zeros(1, dtype=torch.float32, device=q.device)
     run_compiled(
-        launcher,
+        launcher(direct=direct, shared=direct and shared_kv),
         as_i16(q4),
         as_i16(k4),
         as_i16(v4),
         as_i16(do4),
-        dv_f32,
-        dk_f32,
+        dv_out,
+        dk_out,
         dq_f32,
         row_scale,  # LSE: the forward's LSE, or SiLU's per-row output scale
         row_scale if d_vec is None else d_vec,  # D_vec (unused by SiLU heads)
@@ -301,6 +319,9 @@ def launch_bwd(
     )
     shape = (num_tokens, num_heads, dim)
     dq.copy_(dq_f32.view(shape)[..., :dim_qk])
+    if direct:
+        return
+    dk_f32, dv_f32 = dk_out, dv_out
     if shared_kv:
         dk.copy_(dk_f32.view(shape)[..., :dim_qk] + dv_f32.view(shape)[..., :dim_v])
     else:
