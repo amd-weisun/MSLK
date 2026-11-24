@@ -28,6 +28,9 @@ import torch
 from .common import MaskSpec
 
 _DIMS = (32, 64, 128, 256)
+# Windows up to this many keys take 64-key tiles (the smallest the kernel's
+# wave layout allows).
+_SMALL_WINDOW = 512
 
 
 def _arch() -> str:
@@ -137,6 +140,11 @@ def hstu_ragged_bwd(
 
     dim = next(d for d in _DIMS if d >= max(dim_qk, dim_v))
     block_m, block_n = gfx950_tile_defaults(dim, N, arch)
+    if 0 < max_attn_len <= _SMALL_WINDOW:
+        # A KV tile's query band is about BLOCK_N + window rows, mostly masked
+        # for small windows: 64-key tiles waste less (MI350, 16-key window,
+        # D 128: 6.27 -> 5.11 ms; 256-key window: 9.16 -> 8.85 ms).
+        block_m, block_n = 32, 64
     spec = MaskSpec.from_args(
         invalid_attn_mask_type,
         max_attn_len,
