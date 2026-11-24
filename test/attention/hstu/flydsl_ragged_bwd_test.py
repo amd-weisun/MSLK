@@ -248,32 +248,123 @@ def test_cuda_graph_capture():
         assert_hstu_close(got, want, "silu", name)
 
 
-def test_softmax_heads_not_supported_yet():
+def _check_softmax(inputs, **options):
+    """Softmax heads: M and Out from T1's forward, gradients against
+    autograd on T1."""
     from mslk.attention.flydsl.hstu.ragged_bwd import hstu_ragged_bwd
 
-    inputs = make_ragged_inputs(2, 64, 2, 64, 64, 0.6, device=_CUDA, seed=9)
+    args = _args(inputs, **options)
     q, k, v = inputs["q"], inputs["k"], inputs["v"]
-    with pytest.raises(NotImplementedError, match="softmax"):
-        hstu_ragged_bwd(
-            torch.zeros_like(v),
-            q,
-            k,
-            v,
-            torch.empty_like(q),
-            torch.empty_like(k),
-            torch.empty_like(v),
-            inputs["seq_offsets"],
-            None,
-            None,
-            inputs["N"],
-            inputs["alpha"],
-            0,
-            "lower_triangular",
-            0,
-            None,
-            0,
-            num_softmax_heads=2,
-        )
+    H = q.shape[1]
+    with torch.no_grad():
+        out, lse = ragged_hstu_attention_ref(q=q, k=k, v=v, num_softmax_heads=H, **args)
+    gen = torch.Generator(device=_CUDA).manual_seed(0)
+    dout = torch.randn(out.shape, device=_CUDA, generator=gen).to(q.dtype)
+    qr, kr, vr = (x.detach().float().requires_grad_() for x in (q, k, v))
+    ref_out, _ = ragged_hstu_attention_ref(
+        q=qr, k=kr, v=vr, num_softmax_heads=H, **args
+    )
+    ref_out.backward(dout.float())
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    hstu_ragged_bwd(
+        dout,
+        q,
+        k,
+        v,
+        dq,
+        dk,
+        dv,
+        args["seq_offsets"],
+        args["num_targets"],
+        None,
+        args["N"],
+        args["alpha"],
+        args["max_attn_len"],
+        args["invalid_attn_mask_type"],
+        args["contextual_seq_len"],
+        None,
+        args["full_attn_size"],
+        num_softmax_heads=H,
+        M=lse,
+        Out=out,
+    )
+    # Softmax gradients are normalized; scale the SiLU bound by each max.
+    for name, got, want in (
+        ("dq", dq, qr.grad),
+        ("dk", dk, kr.grad),
+        ("dv", dv, vr.grad),
+    ):
+        assert_hstu_close(got, want, "silu", name)
+
+
+@pytest.mark.parametrize(
+    "mask", ["causal", "window", "contextual", "window_contextual_full"]
+)
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_softmax_heads(mask, dim):
+    inputs = make_ragged_inputs(
+        4, 260, 2, dim, dim, 0.6, device=_CUDA, seed=11, max_targets=8
+    )
+    inputs["alpha"] = dim**-0.5
+    _check_softmax(inputs, **_MASKS[mask])
+
+
+def test_softmax_short_and_empty_sequences():
+    lengths = torch.tensor([0, 1, 2, 127, 300, 0, 64])
+    total = int(lengths.sum())
+    gen = torch.Generator().manual_seed(12)
+    q, k, v = (
+        (torch.rand(total, 2, 64, generator=gen) * 2 - 1).to(_CUDA, torch.bfloat16)
+        for _ in range(3)
+    )
+    inputs = {
+        "N": 300,
+        "alpha": 0.5,
+        "q": q,
+        "k": k,
+        "v": v,
+        "seq_offsets": lengths_to_offsets(lengths, _CUDA),
+    }
+    _check_softmax(inputs, max_attn_len=20, contextual_seq_len=4)
+
+
+def test_softmax_through_autograd():
+    """T2's autograd with softmax heads: the FlyDSL forward's M and Out."""
+    import mslk.attention.hstu as api
+
+    inputs = make_ragged_inputs(3, 150, 2, 64, 64, 0.6, device=_CUDA, seed=13)
+    args = _args(inputs, max_attn_len=12)
+    q, k, v = (inputs[n].detach().clone().requires_grad_() for n in ("q", "k", "v"))
+    out = api.ragged_hstu_attention(
+        args["N"],
+        64**-0.5,
+        q,
+        k,
+        v,
+        args["seq_offsets"],
+        args["invalid_attn_mask_type"],
+        None,
+        None,
+        args["max_attn_len"],
+        0,
+        0,
+        2,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    qr, kr, vr = (inputs[n].detach().float().requires_grad_() for n in ("q", "k", "v"))
+    ref, _ = ragged_hstu_attention_ref(
+        q=qr, k=kr, v=vr, num_softmax_heads=2, **dict(args, alpha=64**-0.5)
+    )
+    ref.backward(dout.float())
+    for name, got, want in (
+        ("dq", q.grad, qr.grad),
+        ("dk", k.grad, kr.grad),
+        ("dv", v.grad, vr.grad),
+    ):
+        assert_hstu_close(got, want, "silu", name)
 
 
 def test_packed_gradients_past_4gib():

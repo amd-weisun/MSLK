@@ -111,6 +111,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     has_dropout: bool = False,
     dropout_p: float = 0.0,
     hstu=None,
+    hstu_softmax: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -184,12 +185,14 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     D_QK = D if D_QK is None else D_QK
     D_V = D if D_V is None else D_V
-    # HSTU SiLU heads (mslk.attention.flydsl.hstu.ragged_bwd): `hstu` is the
-    # compile-time MaskSpec. P = silu(scale * S) * row_scale on HSTU's mask, dS
-    # = dP * row_scale * silu'(scale * S); the per-row output scale arrives in
-    # the LSE slot (D_vec is unused), and the per-sequence mask values in the
-    # hstu_* arguments.
+    # HSTU (mslk.attention.flydsl.hstu.ragged_bwd): `hstu` is the compile-time
+    # MaskSpec, applied with the per-sequence values of the hstu_* arguments.
+    # SiLU heads: P = silu(scale * S) * row_scale, dS = dP * row_scale *
+    # silu'(scale * S); the per-row output scale arrives in the LSE slot and
+    # D_vec is unused. Softmax heads (hstu_softmax): the softmax backward
+    # below, with the forward's LSE and D = rowsum(dO * O).
     HSTU = hstu is not None
+    HSTU_SILU = HSTU and not hstu_softmax
     if HSTU:
         assert varlen and causal_mode == CAUSAL_NONE and window_left < 0
         assert not (has_bias or emit_dbias or has_dropout or heads_per_kv != 1)
@@ -543,21 +546,22 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 full_attn_size=hstu_full_attn_size,
             )
 
-        def _hstu_p_grad(s_val, row_scale, valid, m_row_abs, n_row_abs):
+        def _hstu_visible(m_row_abs, n_row_abs):
+            m_i = fx.Int32(m_row_abs)
+            n_i = fx.Int32(n_row_abs)
+            return hstu_sm.visible(m_i, n_i, hstu_sm.to_id(m_i), hstu_sm.to_id(n_i))
+
+        def _hstu_p_grad(s_val, row_scale, valid):
             """HSTU SiLU: with x = scale * S, P = silu(x) * row_scale on the
             mask and the dS factor g = row_scale * silu'(x), silu'(x) =
             sig(x) * (1 + x * (1 - sig(x))). The finished dQ/dK carry the
             other `scale` factor (see _grad_ds_unscaled)."""
-            m_i = fx.Int32(m_row_abs)
-            n_i = fx.Int32(n_row_abs)
-            vis = hstu_sm.visible(m_i, n_i, hstu_sm.to_id(m_i), hstu_sm.to_id(n_i))
-            valid = valid & vis
             x = s_val * fx.Float32(scale)
             e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
             sig = fx.Float32(1.0) / (fx.Float32(1.0) + e)
             p_val = valid.select(x * sig * row_scale, fx.Float32(0.0))
             g = row_scale * sig * (fx.Float32(1.0) + x * (fx.Float32(1.0) - sig))
-            return valid, p_val, g
+            return p_val, g
 
         wave = fx.Index(tid // WARP_SIZE)
         lane = fx.Index(tid % WARP_SIZE)
@@ -666,6 +670,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # n_heads_idx regardless of Q's own stride; q_start already unifies both
         # cases the same way as _q_row_out above.
         def _dvec_row(q_pos, head_idx):
+            if const_expr(HSTU):
+                # D_vec is [T, H], not rebased (H * T floats).
+                return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
             return _q_row_out(q_pos, head_idx)
 
         from mslk.flydsl import buffer_ops as _bops
@@ -1768,6 +1775,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                     [b_elem], elem_dtype
                                                 ).to(fx.Float32)[0]
                                             valid_mn = bias_load_valid
+                                            if const_expr(HSTU):
+                                                valid_mn = valid_mn & _hstu_visible(
+                                                    m_row_abs, n_row_abs
+                                                )
                                             if const_expr(
                                                 causal_mode == CAUSAL_TOP_LEFT
                                             ):
@@ -1826,15 +1837,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                 valid_mn,
                                                 fm,
                                             )
-                                            if const_expr(HSTU):
+                                            if const_expr(HSTU_SILU):
                                                 # SiLU in place of softmax (the
                                                 # exp2/LSE work above is dead).
-                                                valid_mn, p_val, hstu_g = _hstu_p_grad(
-                                                    s_val,
-                                                    lse_val,
-                                                    valid_mn,
-                                                    m_row_abs,
-                                                    n_row_abs,
+                                                p_val, hstu_g = _hstu_p_grad(
+                                                    s_val, lse_val, valid_mn
                                                 )
                                                 _epi_hstu_g[(n_grp, m_half, r)] = hstu_g
                                             _epi_p_vals[(n_grp, m_half, r)] = p_val
@@ -1894,7 +1901,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             ds_val = _grad_ds_unscaled(
                                                 p_val, dp_val, dm_val, valid_mn, fm
                                             )
-                                            if const_expr(HSTU):
+                                            if const_expr(HSTU_SILU):
                                                 ds_val = valid_mn.select(
                                                     dp_val
                                                     * _epi_hstu_g[(n_grp, m_half, r)],

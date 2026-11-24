@@ -18,9 +18,13 @@ launch per KV tile computes dQ (f32 atomics), dK and dV, with T1's mask
 - dQ = alpha * dS K and dK = alpha * dS^T Q.
 
 c is 1/N, ``attn_scale`` (0-dim) or ``attn_scale[token]``, as in the forward.
+
+Softmax heads use the kernel's softmax backward on the same mask, from the
+forward's LSE ``M`` (base 2) and D = rowsum(dO * Out).
 """
 
 import functools
+import math
 from typing import Optional
 
 import torch
@@ -46,8 +50,8 @@ def decline_reason(
         return f"needs gfx950, got {arch!r}"
     if q.dtype not in (torch.bfloat16, torch.float16):
         return f"unsupported dtype {q.dtype}"
-    if num_softmax_heads:
-        return "softmax heads are not supported yet"
+    if num_softmax_heads not in (0, q.shape[1]):
+        return f"num_softmax_heads must be 0 or H, got {num_softmax_heads}"
     if max(q.shape[2], v.shape[2]) > _DIMS[-1] or q.shape[2] % 2 or v.shape[2] % 2:
         return f"unsupported head dims {q.shape[2]}, {v.shape[2]}"
     return None
@@ -64,6 +68,7 @@ def build_ragged_bwd(
     alpha: float,
     spec: MaskSpec,
     arch: str,
+    softmax: bool = False,
 ):
     from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
         compile_fmha_bwd_dqdkdv_mfma_gfx950,
@@ -81,6 +86,7 @@ def build_ragged_bwd(
         D_QK=dim_qk,
         D_V=dim_v,
         hstu=spec,
+        hstu_softmax=softmax,
     )
 
 
@@ -117,8 +123,9 @@ def hstu_ragged_bwd(
 ) -> None:
     """``mslk::hstu_ragged_bwd``: writes dq, dk and dv in place (with
     ``shared_kv``, dK + dV into dk). Arguments as validated by T2;
-    ``sort_by_length_indices``, ``M`` and ``Out`` are not needed for SiLU
-    heads. Every sequence must be at most ``N`` tokens."""
+    softmax heads need the forward's ``M`` and ``Out`` (SiLU heads use
+    neither); ``sort_by_length_indices`` is unused. Every sequence must be at
+    most ``N`` tokens."""
     from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import gfx950_tile_defaults
     from mslk.flydsl.jit import run_compiled
 
@@ -153,12 +160,30 @@ def hstu_ragged_bwd(
         has_targets=num_targets is not None,
     )
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "f16"
+    softmax = num_softmax_heads > 0
     launcher = build_ragged_bwd(
-        dim, dim_qk, dim_v, dtype_str, block_m, block_n, float(alpha), spec, arch
+        dim,
+        dim_qk,
+        dim_v,
+        dtype_str,
+        block_m,
+        block_n,
+        float(alpha),
+        spec,
+        arch,
+        softmax,
     )
 
-    # The per-row output scale, in the kernel's LSE layout [H, T].
-    if attn_scale is None:
+    d_vec = None
+    if softmax:
+        # The forward's base-2 LSE M [T, H] as the kernel's natural-log LSE
+        # [H, T], and D = rowsum(dO * O) [T, H]; attn_scale does not apply.
+        if M is None or Out is None:
+            raise ValueError("softmax heads need the forward's M and Out")
+        row_scale = (M.to(torch.float32) * math.log(2.0)).t().contiguous().view(-1, 1)
+        d_vec = (dout.to(torch.float32) * Out.to(torch.float32)).sum(-1).view(-1, 1)
+    # SiLU heads: the per-row output scale, in the kernel's LSE layout [H, T].
+    elif attn_scale is None:
         row_scale = torch.full(
             (num_heads * num_tokens, 1), 1.0 / N, dtype=torch.float32, device=q.device
         )
@@ -197,8 +222,8 @@ def hstu_ragged_bwd(
         dv_f32,
         dk_f32,
         dq_f32,
-        row_scale,  # LSE slot: the per-row output scale
-        row_scale,  # D_vec slot: unused by HSTU
+        row_scale,  # LSE: the forward's LSE, or SiLU's per-row output scale
+        d_vec if softmax else row_scale,  # D_vec (unused by SiLU heads)
         num_seqs,  # the grid's batch count (tensors are packed, batch 1)
         N,
         N,
