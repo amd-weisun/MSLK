@@ -96,6 +96,32 @@ def build_ragged_bwd(
     )
 
 
+@functools.lru_cache(maxsize=16)
+def _build_preprocess(dim_v: int, dtype_str: str):
+    from mslk.attention.flydsl.fmha_bwd_preprocess import compile_fmha_bwd_preprocess
+
+    return compile_fmha_bwd_preprocess(D=dim_v, dtype_str=dtype_str)
+
+
+def _softmax_d(dout: torch.Tensor, out: torch.Tensor, dtype_str: str) -> torch.Tensor:
+    """D = rowsum(dO * Out) per (token, head), [T * H, 1] f32, in one pass
+    (the FMHA backward's preprocess kernel)."""
+    from mslk.flydsl.jit import run_compiled
+
+    num_tokens, num_heads, dim_v = dout.shape
+    rows = num_tokens * num_heads
+    d_vec = torch.empty(rows, 1, dtype=torch.float32, device=dout.device)
+    run_compiled(
+        _build_preprocess(dim_v, dtype_str),
+        dout.contiguous().view(torch.int16).view(rows, dim_v),
+        out.to(dout.dtype).contiguous().view(torch.int16).view(rows, dim_v),
+        d_vec,
+        rows,
+        torch.cuda.current_stream(dout.device),
+    )
+    return d_vec
+
+
 def _rows(t: torch.Tensor, dim: int) -> torch.Tensor:
     """A [T, H, dim] tensor with unit-stride rows of ``dim`` per head (the
     kernel takes a token pitch but not a head pitch)."""
@@ -187,7 +213,7 @@ def hstu_ragged_bwd(
         if M is None or Out is None:
             raise ValueError("softmax heads need the forward's M and Out")
         row_scale = (M.to(torch.float32) * math.log(2.0)).t().contiguous().view(-1, 1)
-        d_vec = (dout.to(torch.float32) * Out.to(torch.float32)).sum(-1).view(-1, 1)
+        d_vec = _softmax_d(dout, Out, dtype_str)
     # SiLU heads: the per-row output scale, in the kernel's LSE layout [H, T].
     elif attn_scale is None:
         row_scale = torch.full(
