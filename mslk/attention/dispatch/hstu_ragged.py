@@ -46,9 +46,10 @@ def _mslk_fwd(q: torch.Tensor, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tenso
 
 
 def _mslk_bwd(q: torch.Tensor, **kwargs: Any) -> None:
-    raise NotImplementedError(
-        "MSLK has no ragged HSTU backward kernel; no backend can serve this call"
-    )
+    # Imported on call: importing the routing must not import FlyDSL.
+    from mslk.attention.flydsl.hstu.ragged_bwd import hstu_ragged_bwd
+
+    hstu_ragged_bwd(q=q, **kwargs)
 
 
 def key(

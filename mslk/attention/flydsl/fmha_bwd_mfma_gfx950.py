@@ -110,6 +110,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     D_V: int | None = None,
     has_dropout: bool = False,
     dropout_p: float = 0.0,
+    hstu=None,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -183,6 +184,24 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     D_QK = D if D_QK is None else D_QK
     D_V = D if D_V is None else D_V
+    # HSTU SiLU heads (mslk.attention.flydsl.hstu.ragged_bwd): `hstu` is the
+    # compile-time MaskSpec. P = silu(scale * S) * row_scale on HSTU's mask, dS
+    # = dP * row_scale * silu'(scale * S); the per-row output scale arrives in
+    # the LSE slot (D_vec is unused), and the per-sequence mask values in the
+    # hstu_* arguments.
+    HSTU = hstu is not None
+    if HSTU:
+        assert varlen and causal_mode == CAUSAL_NONE and window_left < 0
+        assert not (has_bias or emit_dbias or has_dropout or heads_per_kv != 1)
+        HSTU_MASK = (
+            hstu.mask_type,
+            hstu.has_window,
+            hstu.has_contextual,
+            hstu.has_targets,
+            hstu.has_full_attn,
+        )
+    else:
+        HSTU_MASK = None
     assert 0 < D_QK <= D and 0 < D_V <= D and D_QK % 2 == 0 and D_V % 2 == 0
     if scale is None:
         scale = 1.0 / _pm.sqrt(D_QK)
@@ -404,6 +423,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
         drop_stride_q: fx.Int32,
+        hstu_targets: fx.Tensor,
+        hstu_max_attn_len: fx.Int32,
+        hstu_contextual_seq_len: fx.Int32,
+        hstu_full_attn_size: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -480,6 +503,61 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             k_start = batch_idx * seq_N_idx
             this_seqlen_q = seq_M_idx
             this_seqlen_k = seq_N_idx
+
+        # Last row of the sequence, where out-of-range loads are clamped. HSTU
+        # sequences may be empty: clamp to row 0 there (in bounds of the
+        # packed tensors or past them, where buffer loads return 0; the
+        # value is masked off either way).
+        seq_q_last = this_seqlen_q - fx.Index(1)
+        seq_k_last = this_seqlen_k - fx.Index(1)
+        if const_expr(HSTU):
+            seq_q_last = (this_seqlen_q > fx.Index(0)).select(seq_q_last, fx.Index(0))
+            seq_k_last = (this_seqlen_k > fx.Index(0)).select(seq_k_last, fx.Index(0))
+
+        hstu_sm = None
+        if const_expr(HSTU):
+            from mslk.attention.flydsl.hstu.common import (
+                device_ops as _hstu_ops,
+                MaskSpec as _HstuSpec,
+                seq_mask as _hstu_seq_mask,
+            )
+
+            hstu_num_target = fx.Int32(0)
+            if const_expr(HSTU_MASK[3]):
+                hstu_targets_rsrc = _seq_bops.create_buffer_resource(hstu_targets)
+                hstu_num_target = fx.Int32(
+                    _seq_bops.buffer_load(
+                        hstu_targets_rsrc,
+                        fx.Index(batch_idx),
+                        vec_width=1,
+                        dtype=fx.Int32,
+                    )
+                )
+            hstu_sm = _hstu_seq_mask(
+                _HstuSpec(*HSTU_MASK),
+                _hstu_ops(),
+                fx.Int32(this_seqlen_q),
+                num_targets=hstu_num_target,
+                max_attn_len=hstu_max_attn_len,
+                contextual_seq_len=hstu_contextual_seq_len,
+                full_attn_size=hstu_full_attn_size,
+            )
+
+        def _hstu_p_grad(s_val, row_scale, valid, m_row_abs, n_row_abs):
+            """HSTU SiLU: with x = scale * S, P = silu(x) * row_scale on the
+            mask and the dS factor g = row_scale * silu'(x), silu'(x) =
+            sig(x) * (1 + x * (1 - sig(x))). The finished dQ/dK carry the
+            other `scale` factor (see _grad_ds_unscaled)."""
+            m_i = fx.Int32(m_row_abs)
+            n_i = fx.Int32(n_row_abs)
+            vis = hstu_sm.visible(m_i, n_i, hstu_sm.to_id(m_i), hstu_sm.to_id(n_i))
+            valid = valid & vis
+            x = s_val * fx.Float32(scale)
+            e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
+            sig = fx.Float32(1.0) / (fx.Float32(1.0) + e)
+            p_val = valid.select(x * sig * row_scale, fx.Float32(0.0))
+            g = row_scale * sig * (fx.Float32(1.0) + x * (fx.Float32(1.0) - sig))
+            return valid, p_val, g
 
         wave = fx.Index(tid // WARP_SIZE)
         lane = fx.Index(tid % WARP_SIZE)
@@ -833,7 +911,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             n_global_band_base = n_start + band_safe * 32
             n_row_abs_kv = n_global_band_base + lane_mod_32
             n_valid_kv = band_in_range & (n_row_abs_kv < this_seqlen_k)
-            n_safe_kv = n_valid_kv.select(n_row_abs_kv, this_seqlen_k - fx.Index(1))
+            n_safe_kv = n_valid_kv.select(n_row_abs_kv, seq_k_last)
             kv_row_g_pre = _kv_row(n_safe_kv)
             n_local_k_row_band = band_safe * 32 + lane_mod_32
 
@@ -1161,7 +1239,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
             m_global_ld = m_start_p + row_in_tile
             m_valid_ld = m_global_ld < this_seqlen_q
-            m_safe_ld = m_valid_ld.select(m_global_ld, this_seqlen_q - fx.Index(1))
+            m_safe_ld = m_valid_ld.select(m_global_ld, seq_q_last)
             q_row_g = _q_row(m_safe_ld, head_idx_p)
             do_row_g = _do_row(m_safe_ld, head_idx_p)
             col_off_ld = cv_i * fx.Index(MFMA_LK)
@@ -1189,7 +1267,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             tid_idx = fx.Index(tid)
             m_g_ls = m_start_p + tid_idx
             m_ok_ls = m_g_ls < this_seqlen_q
-            m_sf_ls = m_ok_ls.select(m_g_ls, this_seqlen_q - fx.Index(1))
+            m_sf_ls = m_ok_ls.select(m_g_ls, seq_q_last)
             return (
                 _load_f32_row(LSE_buf, _lse_row(m_sf_ls, head_idx_p)),
                 _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls, head_idx_p)),
@@ -1243,6 +1321,19 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
             m_tile_start = m_tile_start_full
             m_tile_end = n_M_tiles_idx
+            if const_expr(HSTU):
+                # This sequence's own query tiles (lengths are ragged).
+                m_tile_end = (this_seqlen_q + fx.Index(BLOCK_M - 1)) // fx.Index(
+                    BLOCK_M
+                )
+                # Lower-triangular without a contextual prefix: ids are
+                # non-decreasing in the position, so a row before the key tile
+                # sees none of its keys (only the diagonal, m == n).
+                if const_expr(HSTU_MASK[0] == "lower_triangular" and not HSTU_MASK[2]):
+                    m_tile_start = (n_tile * BLOCK_N) // BLOCK_M
+                    m_tile_start = (m_tile_start < m_tile_end).select(
+                        m_tile_start, m_tile_end
+                    )
 
             # Prologue: prefetch tile m_tile_start's Q/dO for this block's query head.
             # NOTE: if m_tile_start == m_tile_end (empty range, causal with the whole
@@ -1538,6 +1629,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # order differs.
                         _epi_passes = 2
                         _epi_p_vals, _epi_valids, _epi_keeps = {}, {}, {}
+                        _epi_hstu_g = {}
                         for _epi_pass in range_constexpr(_epi_passes):
                             _epi_do_p = _epi_pass == 0
                             _epi_do_ds = _epi_pass == 1
@@ -1671,6 +1763,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                 valid_mn,
                                                 fm,
                                             )
+                                            if const_expr(HSTU):
+                                                # SiLU in place of softmax (the
+                                                # exp2/LSE work above is dead).
+                                                valid_mn, p_val, hstu_g = _hstu_p_grad(
+                                                    s_val,
+                                                    lse_val,
+                                                    valid_mn,
+                                                    m_row_abs,
+                                                    n_row_abs,
+                                                )
+                                                _epi_hstu_g[(n_grp, m_half, r)] = hstu_g
                                             _epi_p_vals[(n_grp, m_half, r)] = p_val
                                             _epi_valids[(n_grp, m_half, r)] = valid_mn
                                             # dV uses the dropped, rescaled P; dS and
@@ -1728,6 +1831,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             ds_val = _grad_ds_unscaled(
                                                 p_val, dp_val, dm_val, valid_mn, fm
                                             )
+                                            if const_expr(HSTU):
+                                                ds_val = valid_mn.select(
+                                                    dp_val
+                                                    * _epi_hstu_g[(n_grp, m_half, r)],
+                                                    fx.Float32(0.0),
+                                                )
                                         # Register-only handoff for GEMM2 (dV/dK): stash P/dS
                                         # into per-(ai,r) rmem; the N-split GEMM2 reads these
                                         # instead of lds_p/lds_ds. BUT dS ALSO feeds GEMM4/dQ,
@@ -2126,7 +2235,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 + n_start
             )
             n_ok = n_row_abs < this_seqlen_k
-            n_safe = n_ok.select(n_row_abs, this_seqlen_k - fx.Index(1))
+            n_safe = n_ok.select(n_row_abs, seq_k_last)
             kv_row_g = (
                 _kv_row_out_per_qhead(n_safe)
                 if const_expr(_use_ck_scope_dvdk)
@@ -2210,6 +2319,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
         drop_stride_q: fx.Int32,
+        hstu_targets: fx.Tensor,
+        hstu_max_attn_len: fx.Int32,
+        hstu_contextual_seq_len: fx.Int32,
+        hstu_full_attn_size: fx.Int32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2258,6 +2371,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             drop_stride_b,
             drop_stride_h,
             drop_stride_q,
+            hstu_targets,
+            hstu_max_attn_len,
+            hstu_contextual_seq_len,
+            hstu_full_attn_size,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),
