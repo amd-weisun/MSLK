@@ -454,10 +454,22 @@ def build_ragged_fwd(
             # the exclusive prefix sum of query tiles per sequence; from
             # meta_settings_base, per group: max_seq_len, max_attn_len,
             # full_attn_size, contextual_seq_len. ----
-            head_idx = block_id % num_heads
-            prog = block_id // num_heads
+            # Programs run as (head, tile slot), slots fastest, so a
+            # sequence's tiles are consecutive; each XCD (block_id % 8)
+            # takes a contiguous share, keeping a sequence's K/V in one L2.
+            n_progs = meta_prefix_base * num_heads
+            per_xcd = (n_progs + fx.Int32(NUM_GRID_GROUPS - 1)) // fx.Int32(
+                NUM_GRID_GROUPS
+            )
+            order = (block_id % fx.Int32(NUM_GRID_GROUPS)) * per_xcd + (
+                block_id // fx.Int32(NUM_GRID_GROUPS)
+            )
+            in_range = order < n_progs
+            order = in_range.select(order, fx.Int32(0))
+            head_idx = order // meta_prefix_base
+            prog = order % meta_prefix_base
             seq = fx.Int32(group_meta[prog])
-            block_valid = seq < hz_total
+            block_valid = in_range & (seq < hz_total)
             batch_idx = block_valid.select(seq, fx.Int32(0))
             tile0 = fx.Int32(group_meta[meta_prefix_base + batch_idx])
             q_tile_idx = prog - tile0
@@ -895,7 +907,8 @@ def build_ragged_fwd(
             )
 
         N_SCORES = KV_SUBTILES * Q_SUBTILES * MFMA_ELEMS_PER_LANE
-        CAN_SKIP_MASK = MASK_TYPE == LOWER and not HAS_CONTEXTUAL
+        # A run-time contextual length > 0 makes tile_needs_mask true.
+        CAN_SKIP_MASK = MASK_TYPE == LOWER
 
         def masked_values(kv_start, values):
             if const_expr(not CAN_SKIP_MASK):
@@ -1390,10 +1403,15 @@ def build_ragged_fwd(
         hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
         grid_blocks = num_q_tiles * hz_per_group * c_ngg
         if const_expr(GROUPED):
-            # One program per (tile slot, head); meta_prefix_base is the
-            # number of tile slots. hz_total carries the sequence count.
+            # One program per (tile slot, head), rounded up to the XCD count;
+            # meta_prefix_base is the number of tile slots. hz_total carries
+            # the sequence count.
             hz_total = num_seqs
-            grid_blocks = meta_prefix_base * num_heads
+            grid_blocks = (
+                (meta_prefix_base * num_heads + fx.Int32(NUM_GRID_GROUPS - 1))
+                // c_ngg
+                * c_ngg
+            )
         hstu_ragged_fwd_kernel(
             q,
             k,
