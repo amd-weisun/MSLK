@@ -159,6 +159,14 @@ def hstu_grouped_bwd(
     # Tiles from the mean sequence length (the per-group lengths are on the
     # device).
     block_m, block_n = gfx950_tile_defaults(dim, num_tokens // num_seqs, arch)
+    if dim <= 64:
+        # D 64: 64-key tiles win at every length tried (per-group windows are
+        # not known here; they favor them too). MI350, 256-key windows over 11
+        # groups: 79.3 -> 59.9 ms; full causal, 4 groups x 128 sequences, N
+        # 2048: 11.2 -> 9.0 ms, N 8192: 141 -> 133 ms. D 128 keeps the
+        # defaults (64-key tiles are 1.3-1.7x slower on full causal there).
+        # 16-row tiles at D 64 give wrong dQ in this kernel; keep 32.
+        block_m, block_n = 32, 64
     lower = invalid_attn_mask_type == LOWER
     spec = MaskSpec(
         invalid_attn_mask_type,

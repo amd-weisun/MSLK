@@ -178,6 +178,11 @@ def hstu_ragged_bwd(
 
     dim = next(d for d in _DIMS if d >= max(dim_qk, dim_v))
     block_m, block_n = gfx950_tile_defaults(dim, N, arch)
+    if dim <= 64 and N <= 1024:
+        # D 64, short sequences: 64-key tiles (MI350, B 512 H 4 N 512: 1.05
+        # -> 0.95 ms; slower from N 2048). 16-row tiles at D 64 give wrong dQ
+        # in this kernel; keep 32.
+        block_m, block_n = 32, 64
     if 0 < max_attn_len <= _SMALL_WINDOW:
         # A KV tile's query band is about BLOCK_N + window rows, mostly masked
         # for small windows: 64-key tiles waste less (MI350, 16-key window,
