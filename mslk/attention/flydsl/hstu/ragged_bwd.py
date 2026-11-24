@@ -34,7 +34,7 @@ from .common import MaskSpec
 _DIMS = (32, 64, 128, 256)
 # Windows up to this many keys take 64-key tiles (the smallest the kernel's
 # wave layout allows).
-_SMALL_WINDOW = 512
+_SMALL_WINDOW = 64
 
 
 def _arch() -> str:
@@ -187,8 +187,10 @@ def hstu_ragged_bwd(
         block_m, block_n = 32, 64
     if 0 < max_attn_len <= _SMALL_WINDOW:
         # A KV tile's query band is about BLOCK_N + window rows, mostly masked
-        # for small windows: 64-key tiles waste less (MI350, 16-key window,
-        # D 128: 6.27 -> 5.11 ms; 256-key window: 9.16 -> 8.85 ms).
+        # for small windows: 64-key tiles waste less (MI350, D 128, 16-key
+        # window: 6.27 -> 5.11 ms). From 256-key windows the default tiles are
+        # as fast or faster (B 512 H 4 N 2048: 7.14 ms at 32x64, 6.27 at
+        # 32x128).
         block_m, block_n = 32, 64
     spec = MaskSpec.from_args(
         invalid_attn_mask_type,
