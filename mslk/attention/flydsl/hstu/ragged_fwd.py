@@ -60,6 +60,8 @@ MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE
 SCALE_INV_N = "inv_n"
 SCALE_SCALAR = "scalar"
 SCALE_TOKEN = "token"
+# Grouped calls only: one scale per group.
+SCALE_GROUP = "group"
 
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
@@ -241,6 +243,7 @@ def build_ragged_fwd(
     arch: str,
     reverse_q_tiles: bool = False,
     single_head: bool = False,
+    grouped: bool = False,
 ):
     """Compile-time specialization of the kernel; returns its host launcher.
 
@@ -283,6 +286,9 @@ def build_ragged_fwd(
     # Lazy-rescale threshold (log2 domain): p stays below 2^8.
     LAZY_RESCALE = 8.0
     REVERSE_Q_TILES = reverse_q_tiles
+    # Grouped calls (T11): programs map to (sequence, query tile) through
+    # group_meta, and each program loads its group's settings.
+    GROUPED = grouped
     BLOCK_THREADS = NUM_WAVES * WARP_SIZE
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
     Q_SUBTILES = ROWS_PER_WAVE // MFMA_M
@@ -402,6 +408,7 @@ def build_ragged_fwd(
         attn_scale: fx.Tensor,
         out: fx.Tensor,
         lse_out: fx.Tensor,
+        group_meta: fx.Tensor,
         num_heads: fx.Int32,
         num_q_tiles: fx.Int32,
         hz_per_group: fx.Int32,
@@ -415,6 +422,9 @@ def build_ragged_fwd(
         k_head_stride: fx.Int32,
         v_tok_stride: fx.Int32,
         v_head_stride: fx.Int32,
+        group_size: fx.Int32,
+        meta_prefix_base: fx.Int32,
+        meta_settings_base: fx.Int32,
     ) -> None:
         ops = device_ops()
         compute_type = fx.Float32.ir_type
@@ -435,21 +445,53 @@ def build_ragged_fwd(
         lane_mod_16 = lane % fx.Int32(MFMA_N)
         lane_div_16 = lane // fx.Int32(MFMA_N)
 
-        # ---- Group-major grid decode -> (sequence, head, query tile) ----
         block_id = fx.Int32(gpu.block_idx.x)
-        grid_group = block_id % fx.Int32(NUM_GRID_GROUPS)
-        pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
-        local_hz_idx = pos_in_group // num_q_tiles
-        q_tile_idx = pos_in_group % num_q_tiles
-        if const_expr(REVERSE_Q_TILES):
-            # Heaviest causal query tiles first.
-            q_tile_idx = num_q_tiles - fx.Int32(1) - q_tile_idx
-        hz_idx = grid_group * hz_per_group + local_hz_idx
-        # The last group is padded past Z*H; padding programs get seq_len 0.
-        block_valid = hz_idx < hz_total
-        hz_idx = block_valid.select(hz_idx, fx.Int32(0))
-        batch_idx = hz_idx // num_heads
-        head_idx = hz_idx % num_heads
+        group_idx = fx.Int32(0)
+        group_max_len = fx.Int32(1)
+        if const_expr(GROUPED):
+            # ---- Grouped decode: group_meta holds, from 0, each program's
+            # sequence (num_seqs past the last tile); from meta_prefix_base,
+            # the exclusive prefix sum of query tiles per sequence; from
+            # meta_settings_base, per group: max_seq_len, max_attn_len,
+            # full_attn_size, contextual_seq_len. ----
+            head_idx = block_id % num_heads
+            prog = block_id // num_heads
+            seq = fx.Int32(group_meta[prog])
+            block_valid = seq < hz_total
+            batch_idx = block_valid.select(seq, fx.Int32(0))
+            tile0 = fx.Int32(group_meta[meta_prefix_base + batch_idx])
+            q_tile_idx = prog - tile0
+            if const_expr(REVERSE_Q_TILES):
+                n_tiles = (
+                    fx.Int32(group_meta[meta_prefix_base + batch_idx + fx.Int32(1)])
+                    - tile0
+                )
+                q_tile_idx = n_tiles - fx.Int32(1) - q_tile_idx
+            # Surplus slots decode against sequence 0 with a meaningless
+            # (possibly negative) tile; tile 0 with seq_len 0 keeps them
+            # inactive.
+            q_tile_idx = block_valid.select(q_tile_idx, fx.Int32(0))
+            group_idx = batch_idx // group_size
+            settings = meta_settings_base + group_idx * fx.Int32(4)
+            group_max_len = fx.Int32(group_meta[settings])
+            max_attn_len = fx.Int32(group_meta[settings + fx.Int32(1)])
+            full_attn_size = fx.Int32(group_meta[settings + fx.Int32(2)])
+            contextual_seq_len = fx.Int32(group_meta[settings + fx.Int32(3)])
+        else:
+            # ---- Group-major grid decode -> (sequence, head, query tile) ----
+            grid_group = block_id % fx.Int32(NUM_GRID_GROUPS)
+            pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
+            local_hz_idx = pos_in_group // num_q_tiles
+            q_tile_idx = pos_in_group % num_q_tiles
+            if const_expr(REVERSE_Q_TILES):
+                # Heaviest causal query tiles first.
+                q_tile_idx = num_q_tiles - fx.Int32(1) - q_tile_idx
+            hz_idx = grid_group * hz_per_group + local_hz_idx
+            # The last group is padded past Z*H; padding programs get seq_len 0.
+            block_valid = hz_idx < hz_total
+            hz_idx = block_valid.select(hz_idx, fx.Int32(0))
+            batch_idx = hz_idx // num_heads
+            head_idx = hz_idx % num_heads
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
@@ -1290,6 +1332,10 @@ def build_ragged_fwd(
             row_scale = out_scale
             if const_expr(SCALE_MODE == SCALE_SCALAR):
                 row_scale = out_scale * fx.Float32(attn_scale[fx.Int32(0)])
+            if const_expr(GROUPED and SCALE_MODE == SCALE_INV_N):
+                row_scale = out_scale / fx.Float32(group_max_len)
+            if const_expr(SCALE_MODE == SCALE_GROUP):
+                row_scale = out_scale * fx.Float32(attn_scale[group_idx])
             for qg in range_constexpr(Q_SUBTILES):
                 q_row_base = (
                     q_wave_base
@@ -1320,6 +1366,7 @@ def build_ragged_fwd(
         attn_scale: fx.Tensor,
         out: fx.Tensor,
         lse_out: fx.Tensor,
+        group_meta: fx.Tensor,
         num_seqs: fx.Int32,
         num_heads: fx.Int32,
         max_seq_len: fx.Int32,
@@ -1332,6 +1379,9 @@ def build_ragged_fwd(
         k_head_stride: fx.Int32,
         v_tok_stride: fx.Int32,
         v_head_stride: fx.Int32,
+        group_size: fx.Int32,
+        meta_prefix_base: fx.Int32,
+        meta_settings_base: fx.Int32,
         stream: fx.Stream,
     ) -> None:
         c_ngg = fx.Int32(NUM_GRID_GROUPS)
@@ -1339,6 +1389,11 @@ def build_ragged_fwd(
         hz_total = num_seqs * num_heads
         hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
         grid_blocks = num_q_tiles * hz_per_group * c_ngg
+        if const_expr(GROUPED):
+            # One program per (tile slot, head); meta_prefix_base is the
+            # number of tile slots. hz_total carries the sequence count.
+            hz_total = num_seqs
+            grid_blocks = meta_prefix_base * num_heads
         hstu_ragged_fwd_kernel(
             q,
             k,
@@ -1348,6 +1403,7 @@ def build_ragged_fwd(
             attn_scale,
             out,
             lse_out,
+            group_meta,
             num_heads,
             num_q_tiles,
             hz_per_group,
@@ -1361,6 +1417,9 @@ def build_ragged_fwd(
             k_head_stride,
             v_tok_stride,
             v_head_stride,
+            group_size,
+            meta_prefix_base,
+            meta_settings_base,
             value_attrs={
                 "rocdl.waves_per_eu": WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
@@ -1579,6 +1638,7 @@ def hstu_ragged_fwd(
         attn_scale,
         out,
         M,
+        seq_offsets,  # group_meta: unused by ragged calls
         num_seqs,
         num_heads,
         N,
@@ -1591,6 +1651,9 @@ def hstu_ragged_fwd(
         k.stride(1),
         v.stride(0),
         v.stride(1),
+        1,
+        0,
+        0,
         torch.cuda.current_stream(q.device),
     )
     return out, M

@@ -22,6 +22,10 @@ no mask, other feature combinations, and pipelined head counts outside
 - the pipelined kernel, which compiles the head count in: D 64/128 at
   H 1/2/4/8.
 
+Grouped calls (:mod:`.grouped_fwd`) take the tiled kernel compiled with every
+lower-triangular mask feature: D 64/128/256, with and without targets, and
+the three grouped scale modes.
+
 Each config compiles under FlyDSL's ``COMPILE_ONLY`` with CPU placeholder
 tensors (FlyDSL treats non-device tensors as compile placeholders; the
 kernels take dynamic layouts, so the cache key matches real calls).
@@ -56,33 +60,52 @@ _HEADS: Tuple[Tuple[str, bool], ...] = (
 )
 _PIPELINED_HEADS = (1, 2, 4, 8)
 
-AOT_CONFIGS: List[Dict[str, Any]] = [
-    {
-        "kernel": "tiled",
-        "head_dim": d,
-        "num_heads": h,
-        "mask": m,
-        "scale_mode": sc,
-        "softmax": sm,
-    }
-    for d in (64, 128, 256)
-    for h in (1, 2)
-    for m in _MASKS
-    for sc, sm in _HEADS
-] + [
-    {
-        "kernel": "pipelined",
-        "head_dim": d,
-        "num_heads": h,
-        "mask": m,
-        "scale_mode": sc,
-        "softmax": sm,
-    }
-    for d in (64, 128)
-    for h in _PIPELINED_HEADS
-    for m in _MASKS
-    for sc, sm in _HEADS
-]
+AOT_CONFIGS: List[Dict[str, Any]] = (
+    [
+        {
+            "kernel": "tiled",
+            "head_dim": d,
+            "num_heads": h,
+            "mask": m,
+            "scale_mode": sc,
+            "softmax": sm,
+        }
+        for d in (64, 128, 256)
+        for h in (1, 2)
+        for m in _MASKS
+        for sc, sm in _HEADS
+    ]
+    + [
+        {
+            "kernel": "pipelined",
+            "head_dim": d,
+            "num_heads": h,
+            "mask": m,
+            "scale_mode": sc,
+            "softmax": sm,
+        }
+        for d in (64, 128)
+        for h in _PIPELINED_HEADS
+        for m in _MASKS
+        for sc, sm in _HEADS
+    ]
+    + [
+        # Grouped calls (mslk::hstu_grouped_fwd) on the tiled kernel: compiled
+        # with every lower-triangular feature, SiLU; the head count does not
+        # change the binary (M is a fixed [1, 1] placeholder).
+        {
+            "kernel": "grouped",
+            "head_dim": d,
+            "num_heads": 2,
+            "mask": (True, True, targets, True),
+            "scale_mode": sc,
+            "softmax": False,
+        }
+        for d in (64, 128, 256)
+        for targets in (False, True)
+        for sc in ("inv_n", "group", "token")
+    ]
+)
 
 
 def _spec(mask: Tuple[bool, bool, bool, bool]) -> MaskSpec:
@@ -106,6 +129,45 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
     idx = torch.empty(2, dtype=torch.int32, device=cpu)
     scale = torch.empty(1, dtype=torch.float32, device=cpu)
     stream = fx.Stream(None)
+
+    if config["kernel"] == "grouped":
+        from . import ragged_fwd as tiled
+
+        cfg = tiled.default_config(d, d, arch)
+        launcher = tiled.build_ragged_fwd(
+            d, d, "bf16", spec, scale_mode, False, cfg, arch, True, False, True
+        )
+        lse_placeholder = torch.empty(1, 1, dtype=torch.float32, device=cpu)
+        with CompilationContext.compile_hints(launcher.compile_hints):
+            flyc.compile(
+                launcher,
+                qkv,
+                qkv,
+                qkv,
+                idx,
+                idx,
+                scale,
+                out,
+                lse_placeholder,
+                idx,
+                1,
+                h,
+                0,
+                1.0,
+                1.0,
+                0,
+                0,
+                0,
+                h * d,
+                d,
+                h * d,
+                d,
+                1,
+                1,
+                1,
+                stream,
+            )
+        return
 
     if config["kernel"] == "tiled":
         from . import ragged_fwd as tiled
@@ -206,6 +268,7 @@ def _compile_tiled(
             scale,
             out,
             lse,
+            idx,
             1,
             h,
             1,
@@ -218,5 +281,8 @@ def _compile_tiled(
             d,
             h * d,
             d,
+            1,
+            0,
+            0,
             stream,
         )

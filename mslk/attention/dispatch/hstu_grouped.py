@@ -32,9 +32,10 @@ _TABLE = ("mslk.attention.dispatch", "tables/hstu_grouped.csv")
 
 
 def _mslk_fwd(q: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    raise NotImplementedError(
-        "MSLK has no grouped HSTU forward kernel; no backend can serve this call"
-    )
+    # Imported on call: importing the routing must not import FlyDSL.
+    from mslk.attention.flydsl.hstu.grouped_fwd import hstu_grouped_fwd
+
+    return hstu_grouped_fwd(q=q, **kwargs)
 
 
 def _mslk_bwd(q: torch.Tensor, **kwargs: Any) -> None:
