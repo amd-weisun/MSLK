@@ -452,3 +452,20 @@ def test_strided_gradient_outputs():
     ref = _reference_grads(inputs, dout, args)
     for name, got, want in (("dq", dq, ref[0]), ("dk", dk, ref[1]), ("dv", dv, ref[2])):
         assert_hstu_close(got, want, "silu", name)
+
+
+def test_softmax_d_past_4gib():
+    """D = rowsum(dO * Out) for inputs past 4 GiB (the preprocess kernel's
+    offsets are 32-bit; it runs on row chunks)."""
+    from mslk.attention.flydsl.hstu.ragged_bwd import _softmax_d
+
+    T, D = (2**32) // (128 * 2) + 4096, 128
+    gen = torch.Generator(device=_CUDA).manual_seed(15)
+    dout, out = (
+        torch.randn(T, 1, D, device=_CUDA, generator=gen).to(torch.bfloat16)
+        for _ in range(2)
+    )
+    got = _softmax_d(dout, out, "bf16").view(-1)
+    for lo, hi in ((0, 4096), (T - 8192, T)):
+        want = (dout[lo:hi].float() * out[lo:hi].float()).sum(-1).view(-1)
+        torch.testing.assert_close(got[lo:hi], want, atol=1e-3, rtol=1e-4)

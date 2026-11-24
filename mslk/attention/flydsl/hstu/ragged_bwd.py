@@ -111,14 +111,16 @@ def _softmax_d(dout: torch.Tensor, out: torch.Tensor, dtype_str: str) -> torch.T
     num_tokens, num_heads, dim_v = dout.shape
     rows = num_tokens * num_heads
     d_vec = torch.empty(rows, 1, dtype=torch.float32, device=dout.device)
-    run_compiled(
-        _build_preprocess(dim_v, dtype_str),
-        dout.contiguous().view(torch.int16).view(rows, dim_v),
-        out.to(dout.dtype).contiguous().view(torch.int16).view(rows, dim_v),
-        d_vec,
-        rows,
-        torch.cuda.current_stream(dout.device),
-    )
+    do2 = dout.contiguous().view(torch.int16).view(rows, dim_v)
+    o2 = out.to(dout.dtype).contiguous().view(torch.int16).view(rows, dim_v)
+    # The kernel's offsets are 32-bit: run it on row chunks under 2^31 bytes
+    # (packed batches pass that).
+    chunk = (2**31 - 1) // (dim_v * 2)
+    launcher = _build_preprocess(dim_v, dtype_str)
+    stream = torch.cuda.current_stream(dout.device)
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        run_compiled(launcher, do2[lo:hi], o2[lo:hi], d_vec[lo:hi], hi - lo, stream)
     return d_vec
 
 
