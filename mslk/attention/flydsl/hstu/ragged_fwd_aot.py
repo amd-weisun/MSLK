@@ -9,8 +9,11 @@
 """AOT pre-compilation of the ragged HSTU forward kernels
 (see :mod:`mslk.flydsl.aot`).
 
-Covers what ``hstu_ragged_fwd(kernel="auto")`` routes to on gfx950, for
-bf16 and the common mask features; other variants JIT on first use:
+Covers what ``hstu_ragged_fwd(kernel="auto")`` routes to on gfx950 for bf16
+lower-triangular masks with the common feature combinations (below) and all
+three scale modes. Other variants JIT on first use: fp16, upper-triangular and
+no mask, other feature combinations, and pipelined head counts outside
+1/2/4/8 (with ``MSLK_FLYDSL_DISABLE_JIT=1`` those raise instead):
 
 - the tiled kernel: D 64/128/256. It takes the head count at run time,
   but FlyDSL keys a tensor's layout on which dim has unit stride, and the
@@ -37,6 +40,8 @@ AOT_ARCHS: List[str] = ["gfx950"]
 _MASKS: Tuple[Tuple[bool, bool, bool, bool], ...] = (
     (False, False, False, False),
     (False, False, True, False),
+    (False, True, False, False),
+    (False, True, True, False),
     (True, False, False, False),
     (True, False, True, False),
     (True, True, True, False),
@@ -45,6 +50,7 @@ _MASKS: Tuple[Tuple[bool, bool, bool, bool], ...] = (
 # (scale_mode, softmax)
 _HEADS: Tuple[Tuple[str, bool], ...] = (
     ("inv_n", False),
+    ("scalar", False),
     ("token", False),
     ("inv_n", True),
 )
@@ -187,7 +193,7 @@ def _compile_tiled(
     stream,
 ):
     launcher = tiled.build_ragged_fwd(
-        d, d, "bf16", spec, scale_mode, softmax, cfg, arch, True
+        d, d, "bf16", spec, scale_mode, softmax, cfg, arch, True, h == 1
     )
     with CompilationContext.compile_hints(launcher.compile_hints):
         flyc.compile(

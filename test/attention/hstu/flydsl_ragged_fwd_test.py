@@ -430,6 +430,52 @@ def test_cuda_graph_capture():
     assert_hstu_close(out, ref, "silu")
 
 
+def test_cuda_graph_capture_pipelined():
+    """The pipelined kernel also captures and replays in a CUDA graph."""
+    from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+
+    inputs = _inputs(3, 600, heads=2, dim=128, seed=18)
+    call = {k: v for k, v in _op_args(inputs).items() if k != "shared_kv"}
+    call["num_softmax_heads"] = 2
+    call["alpha"] = 128**-0.5
+    _skip_if_declined("pipelined", call)
+    hstu_ragged_fwd(**call, kernel="pipelined")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = hstu_ragged_fwd(**call, kernel="pipelined")
+    for name in ("q", "k", "v"):
+        inputs[name].copy_(torch.rand_like(inputs[name]) * 2 - 1)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref, ref_lse = ragged_hstu_attention_ref(**call)
+    # The bound _check_softmax uses against T1.
+    torch.testing.assert_close(out.float(), ref.float(), atol=1.6e-3, rtol=3.2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-3, rtol=1e-4)
+
+
+def test_head_counts_in_one_process():
+    """H = 1 and H >= 2 give M different layouts (strides (1, 1) and (H, 1));
+    each must get its own compiled binary, in either order."""
+    for heads in (1, 2, 1):
+        inputs = _inputs(3, 150, heads=heads, seed=19 + heads)
+        inputs["num_softmax_heads"] = heads
+        _check_softmax(inputs, {"kernel": "tiled"})
+
+
+def test_rejects_bad_arguments():
+    from mslk.attention.flydsl.hstu.ragged_fwd import hstu_ragged_fwd
+
+    inputs = _inputs(2, 64, heads=2, seed=20)
+    call = {k: v for k, v in _op_args(inputs).items()}
+    # Per-token scale of the wrong length (T1 raises too).
+    with pytest.raises(ValueError, match="attn_scale"):
+        hstu_ragged_fwd(**{**call, "attn_scale": torch.ones(1, device=_CUDA)})
+    # Mixed softmax and SiLU heads are not supported.
+    with pytest.raises(ValueError, match="num_softmax_heads"):
+        hstu_ragged_fwd(**{**call, "num_softmax_heads": 1})
+
+
 def _rows_reference(inputs, b, rows, options):
     """T1's output for some rows of sequence b, without materializing the
     other rows' scores (T1's reference forms [H, n, n])."""

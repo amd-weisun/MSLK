@@ -46,6 +46,10 @@ on:
       - 'mslk/attention/fmha/flydsl_decoder.py'
       - 'mslk/attention/fmha/flydsl_splitk.py'
       - 'test/attention/fmha/**'
+      # HSTU ops: API, backend routing, and the FlyDSL kernels' tests
+      - 'mslk/attention/hstu/**'
+      - 'mslk/attention/dispatch/hstu_*.py'
+      - 'test/attention/hstu/**'
       # FlyDSL GEMM ops
       - 'mslk/gemm/flydsl/**'
       # Arbitrates which backend serves each GEMM op on ROCm

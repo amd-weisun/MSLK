@@ -63,14 +63,17 @@ SCALE_TOKEN = "token"
 
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
-# ``kernel="auto"`` takes the pipelined kernel when the max sequence length is
-# above _PIPELINED_MIN_N and any window is longer than _PIPELINED_MIN_WINDOW,
-# and the tiled kernel otherwise. Interim benchmark, MI350 bf16 D 64/128: the
-# pipelined kernel is 1.1-1.25x faster on causal and windows of 4k+ at
-# N 4k-8k (even at 2k) and 1.2-1.4x on long softmax; the tiled one is faster
-# at N <= 2048 (by 1.2-1.35x at 2048) and for windows up to about 1k (finer
-# blocks skip more); D 256 is tiled only.
+# ``kernel="auto"`` takes the pipelined kernel for lower-triangular masks when
+# the max sequence length is above _PIPELINED_MIN_N (_PIPELINED_MIN_N_SILU for
+# SiLU heads) and any window is longer than _PIPELINED_MIN_WINDOW, and the
+# tiled kernel otherwise. MI350 bf16, B 256-512 at 0.75 sparsity (pipelined /
+# tiled time): causal softmax 0.84-0.99 at N 4096 and 0.68-0.89 from N 8192;
+# causal SiLU 0.98-1.07 at N 4096 and 0.81-0.95 from N 8192; upper-
+# triangular 1.4-1.7 (the tiled kernel skips tiles on any mask); the tiled
+# kernel is faster at N <= 2048 and on windows up to about 2k. D 256 is tiled
+# only.
 _PIPELINED_MIN_N = 2048
+_PIPELINED_MIN_N_SILU = 4096
 _PIPELINED_MIN_WINDOW = 2048
 
 
@@ -98,7 +101,6 @@ def default_config(
     hidden_dim: int,
     arch: str = "",
     max_attn_len: int = 0,
-    max_seq_len: int = 0,
 ) -> FwdConfig:
     """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep. Elsewhere
     AITER's MI300X heuristic."""
@@ -148,15 +150,14 @@ def _first_supported(
     hidden_dim: int,
     arch: str,
     max_attn_len: int = 0,
-    max_seq_len: int = 0,
 ) -> FwdConfig:
-    cfg = default_config(head_dim, hidden_dim, arch, max_attn_len, max_seq_len)
+    cfg = default_config(head_dim, hidden_dim, arch, max_attn_len)
     if check_supported(q, head_dim, hidden_dim, cfg, arch) is None:
         return cfg
     for cfg in _FALLBACK_CONFIGS:
         if check_supported(q, head_dim, hidden_dim, cfg, arch) is None:
             return cfg
-    return default_config(head_dim, hidden_dim)
+    return default_config(head_dim, hidden_dim, arch, max_attn_len)
 
 
 def _arch() -> str:
@@ -239,8 +240,15 @@ def build_ragged_fwd(
     cfg: FwdConfig,
     arch: str,
     reverse_q_tiles: bool = False,
+    single_head: bool = False,
 ):
-    """Compile-time specialization of the kernel; returns its host launcher."""
+    """Compile-time specialization of the kernel; returns its host launcher.
+
+    ``single_head`` (H == 1) keys a launcher of its own: FlyDSL fixes which
+    dim of a tensor has unit stride at compile time, and M ([T, H]) has
+    strides (1, 1) at H = 1 but (H, 1) otherwise. A launcher keeps its first
+    compiled binary (``run_compiled``), so sharing one across the two
+    layouts would write M through the wrong one."""
     import flydsl.compiler as flyc  # pyre-ignore[21]
     import flydsl.expr as fx  # pyre-ignore[21]
     from flydsl.expr import const_expr, gpu, range_constexpr, rocdl  # pyre-ignore[21]
@@ -1412,6 +1420,14 @@ def hstu_ragged_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``mslk::hstu_ragged_fwd`` on a FlyDSL kernel; returns ``(out, M)``.
 
+    Every sequence must be at most ``N`` tokens (T1 checks this; checking it
+    here would need a host sync): rows past ``N`` are not written. ``M``
+    ([T, H] float32) is written for softmax heads only; for SiLU heads its
+    contents are unspecified (the backward does not read it).
+    ``num_softmax_heads`` is 0 (all SiLU) or H (all softmax). The tiled kernel
+    reads strided q/k/v (e.g. slices of a packed qkv) in place; the pipelined
+    one copies them to contiguous when their strides do not fit it.
+
     ``kernel``: ``"pipelined"`` is the gfx950 flash-attention pipeline
     (:mod:`.ragged_fwd_gfx950`), ``"tiled"`` the kernel of this module.
     ``"auto"`` (no tile ``config``) takes the pipelined kernel for long
@@ -1438,6 +1454,11 @@ def hstu_ragged_fwd(
     num_tokens, num_heads, head_dim = q.shape
     hidden_dim = v.shape[2]
     arch = _arch()
+    if num_softmax_heads not in (0, num_heads):
+        raise ValueError(
+            f"num_softmax_heads must be 0 (SiLU) or H={num_heads} (softmax), "
+            f"got {num_softmax_heads}"
+        )
     softmax = num_softmax_heads > 0
     use_pipelined = False
     if kernel in ("auto", "pipelined") and config is None:
@@ -1449,12 +1470,13 @@ def hstu_ragged_fwd(
         use_pipelined = decline is None and (
             kernel == "pipelined"
             or (
-                N > _PIPELINED_MIN_N
+                invalid_attn_mask_type == "lower_triangular"
+                and N > (_PIPELINED_MIN_N if softmax else _PIPELINED_MIN_N_SILU)
                 and (max_attn_len == 0 or max_attn_len > _PIPELINED_MIN_WINDOW)
             )
         )
     if not use_pipelined:
-        cfg = config or _first_supported(q, head_dim, hidden_dim, arch, max_attn_len, N)
+        cfg = config or _first_supported(q, head_dim, hidden_dim, arch, max_attn_len)
         reason = check_supported(q, head_dim, hidden_dim, cfg, arch)
         if reason is not None:
             raise NotImplementedError(f"FlyDSL ragged HSTU forward: {reason}")
@@ -1471,6 +1493,12 @@ def hstu_ragged_fwd(
     elif attn_scale.ndim == 0:
         scale_mode = SCALE_SCALAR
     else:
+        # As T1: one value per token (the kernel indexes it by token).
+        if attn_scale.ndim != 1 or attn_scale.numel() != num_tokens:
+            raise ValueError(
+                "attn_scale must be a 0-dim tensor or have one value per token "
+                f"(shape [{num_tokens}]), got {tuple(attn_scale.shape)}"
+            )
         scale_mode = SCALE_TOKEN
 
     out = torch.empty(v.shape, dtype=q.dtype, device=q.device)
@@ -1530,6 +1558,7 @@ def hstu_ragged_fwd(
         cfg,
         arch,
         reverse,
+        num_heads == 1,
     )
     if num_targets is None:
         num_targets = seq_offsets
