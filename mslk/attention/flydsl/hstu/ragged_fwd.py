@@ -907,8 +907,10 @@ def build_ragged_fwd(
             )
 
         N_SCORES = KV_SUBTILES * Q_SUBTILES * MFMA_ELEMS_PER_LANE
-        # A run-time contextual length > 0 makes tile_needs_mask true.
-        CAN_SKIP_MASK = MASK_TYPE == LOWER
+        # A run-time contextual length > 0 makes tile_needs_mask true, so a
+        # contextual spec can skip only in grouped calls (where a group's
+        # length may be 0); a ragged one has contextual only when > 0.
+        CAN_SKIP_MASK = MASK_TYPE == LOWER and (GROUPED or not HAS_CONTEXTUAL)
 
         def masked_values(kv_start, values):
             if const_expr(not CAN_SKIP_MASK):
@@ -1516,8 +1518,8 @@ def hstu_ragged_fwd(
     on-device argsort); ``"sorted_reverse"`` both; ``"plain"``
     neither. ``"auto"`` is ``"reverse"``: free, and 0.99-1.10x in the
     interim benchmark, while sorting gained up to 1.17x on some causal batches
-    but lost up to 1.3x elsewhere to its extra launches; revisit with the W5
-    length distribution."""
+    but lost up to 1.3x elsewhere to its extra launches; revisit with
+    production length distributions."""
     from mslk.flydsl.jit import run_compiled
 
     from . import ragged_fwd_gfx950 as pipelined

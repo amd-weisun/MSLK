@@ -157,6 +157,15 @@ def test_cuda_graph_capture():
         inputs[name].copy_(torch.rand_like(inputs[name]) * 2 - 1)
     scale.copy_(torch.tensor([0.5, 2.0], device=_CUDA))
     inputs["max_attn_len_tensor"].copy_(torch.tensor([10, 0], device=_CUDA))
+    # New lengths for the same token count, with empty sequences: the tile
+    # map is rebuilt on the device on replay.
+    T = inputs["q"].shape[0]
+    lengths = torch.tensor([0, 1, T // 3, 0, T - T // 3 - 6, 5])
+    offsets = lengths_to_offsets(lengths, _CUDA)
+    inputs["seq_offsets"].copy_(offsets)
+    inputs["group_offsets"].copy_(offsets[::3])
+    inputs["max_seq_len_tensor"].copy_(torch.tensor([T // 3, T], device=_CUDA))
+    inputs["num_targets"].copy_(torch.minimum(inputs["num_targets"], lengths.to(_CUDA)))
     graph.replay()
     torch.cuda.synchronize()
     ref = grouped_ragged_hstu_attention_ref(**_ref_args(inputs, scale))
@@ -218,3 +227,41 @@ def test_aot_cache_serves_real_calls(tmp_path):
         env=dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"),
         check=True,
     )
+
+
+@pytest.mark.parametrize(
+    "variant", ["upper_targets", "single_head_fp16_d256", "strided", "dv", "scale_2d"]
+)
+def test_variants(variant):
+    """Targets off the lower mask, H = 1 in fp16 at D 256, strided Q/K/V
+    (slices of a packed qkv), V's dim unlike Q's, and a [T, 2] per-token
+    scale (its first column, T2's per-token mode)."""
+    heads, dim, hidden, dtype = 2, 64, 64, torch.bfloat16
+    if variant == "single_head_fp16_d256":
+        heads, dim, hidden, dtype = 1, 256, 256, torch.float16
+    if variant == "dv":
+        hidden = 128
+    inputs = make_grouped_inputs(
+        2,
+        [140, 90],
+        heads,
+        dim,
+        hidden,
+        0.6,
+        dtype=dtype,
+        device=_CUDA,
+        seed=9,
+        max_targets=6,
+    )
+    scale = None
+    if variant == "upper_targets":
+        inputs["invalid_attn_mask_type"] = "upper_triangular"
+    if variant == "strided":
+        T = inputs["q"].shape[0]
+        qkv = torch.rand(T, heads, 3 * dim + 8, device=_CUDA).to(dtype)
+        inputs["q"] = qkv[:, :, :dim]
+        inputs["k"] = qkv[:, :, dim : 2 * dim]
+        inputs["v"] = qkv[:, :, 2 * dim + 8 :]
+    if variant == "scale_2d":
+        scale = torch.rand(inputs["q"].shape[0], 2, device=_CUDA) + 0.5
+    _check(inputs, scale)
