@@ -108,7 +108,6 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
         cfgs = {tiled.default_config(d, d, arch)}
         if spec.has_window:
             cfgs.add(tiled.default_config(d, d, arch, tiled._SMALL_WINDOW))
-        cfgs.add(tiled.default_config(d, d, arch, 0, tiled._SHORT_SEQ))
         for cfg in sorted(cfgs, key=repr):
             _compile_tiled(
                 tiled,

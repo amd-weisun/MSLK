@@ -228,7 +228,16 @@ def test_shared_kv(kernel):
 
 @pytest.mark.parametrize(
     "config",
-    [(64, 32, 4, 2), (128, 32, 4, 0), (128, 64, 4, 2), (64, 16, 2, 0), (32, 32, 2, 2)],
+    [
+        (64, 32, 4, 2),
+        (128, 32, 4, 0),
+        (128, 64, 4, 2),
+        (64, 16, 2, 0),
+        (32, 32, 2, 2),
+        # K double-buffered (gfx950's DMA path; a no-op elsewhere).
+        (64, 32, 4, 2, 2),
+        (32, 32, 2, 0, 2),
+    ],
 )
 def test_tile_configs(config):
     from mslk.attention.flydsl.hstu.ragged_fwd import FwdConfig

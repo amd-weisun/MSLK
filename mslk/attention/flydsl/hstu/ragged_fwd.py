@@ -82,13 +82,15 @@ class FwdConfig:
     block_n: int = 32
     num_waves: int = 4
     waves_per_eu: int = 2
+    # gfx950 DMA path: 2 double-buffers K, so the next tile's K is issued a
+    # whole tile ahead (V stays single-buffered).
+    k_stages: int = 1
 
 
 # Windows up to this many keys take 32-key tiles on gfx950: a query tile then
 # re-reads fewer K/V rows around its window, which is what bounds such calls
 # (memory-bound: a 16-key window at D 128 runs at about 35 TFLOPS).
 _SMALL_WINDOW = 64
-_SHORT_SEQ = 1024
 
 
 def default_config(
@@ -98,20 +100,23 @@ def default_config(
     max_attn_len: int = 0,
     max_seq_len: int = 0,
 ) -> FwdConfig:
-    """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep (D 256 at
-    N 4096: 0.30 ms). Elsewhere AITER's MI300X heuristic."""
+    """Default tiles. gfx950 (K/V by DMA): from an MI350 sweep. Elsewhere
+    AITER's MI300X heuristic."""
     dim = max(hidden_dim, ((head_dim + 63) // 64) * 64)
     if arch.startswith("gfx950"):
-        # Best or tied at D 64/128/256 on short, windowed and long shapes; at
-        # D 256 it fits 166 VGPRs, three waves per SIMD. Small windows: 32-key
-        # tiles (MI350, 16-key window, D 128: 2.79 vs 3.16 ms).
+        # K double-buffered throughout: the next tile's K is issued a whole
+        # tile ahead, and two K buffers plus V still fit three blocks per CU
+        # (48 KB at 32-key tiles, D 256). MI350, B512 H4: D 256 N 512 0.560
+        # -> 0.525 ms, N 4096 16.7 -> 15.7 ms; D 128 N 2048 2.31 -> 2.27 ms;
+        # 16-key softmax window, D 128: 3.85 -> 3.67 ms.
+        # Small windows: 32-key tiles (a query tile re-reads fewer K/V rows).
         if 0 < max_attn_len <= _SMALL_WINDOW:
-            return FwdConfig(64, 32, 4, 0)
-        # D 256, short sequences: 32-key tiles, 3-6% faster at N <= 1024
-        # (fewer KV tiles per block), tied from N 2048.
-        if dim >= 256 and 0 < max_seq_len <= _SHORT_SEQ:
-            return FwdConfig(64, 32, 4, 3)
-        return FwdConfig(64, 64, 4, 3)
+            return FwdConfig(64, 32, 4, 0, k_stages=2)
+        # D 128 and up: 32-key tiles keep D 256 at three waves per SIMD and
+        # are 2-8% faster than 64-key tiles at every length.
+        if dim >= 128:
+            return FwdConfig(64, 32, 4, 3, k_stages=2)
+        return FwdConfig(64, 64, 4, 3, k_stages=2)
     if dim >= 256:
         return FwdConfig(128, 16, 4, 0)
     if dim >= 192:
@@ -214,7 +219,10 @@ def check_supported(
         rows = threads // (dim // vec)
         if not (cfg.block_n % rows == 0 or rows > cfg.block_n):
             return f"tile {cfg} does not divide the load rows for dim {dim}"
-    lds = cfg.block_n * head_dim_k * 2 + hidden_dim * (cfg.block_n + 8) * 2
+    lds = (
+        cfg.block_n * head_dim_k * 2 * max(1, cfg.k_stages)
+        + hidden_dim * (cfg.block_n + 8) * 2
+    )
     if lds > _lds_capacity(arch):
         return f"LDS tile of {lds} B too large"
     return None
@@ -256,6 +264,7 @@ def build_ragged_fwd(
     BLOCK_M, BLOCK_N = cfg.block_m, cfg.block_n
     NUM_WAVES = cfg.num_waves
     WAVES_PER_EU = cfg.waves_per_eu
+    K_STAGES = cfg.k_stages
     MASK_TYPE = spec.mask_type
     HAS_WINDOW = spec.has_window
     HAS_CONTEXTUAL = spec.has_contextual
@@ -362,10 +371,17 @@ def build_ragged_fwd(
         V_ROW_STRIDE = hidden_dim
         V_ROWS = BLOCK_N
     V_LDS_ELEMS = V_ROWS * V_ROW_STRIDE if V_TR else hidden_dim * V_T_STRIDE
+    # K double-buffer (gfx950 DMA path): stage t % 2 holds tile t's K.
+    KDB = KV_DMA and K_STAGES == 2
+    K_LDS_STAGES = 2 if KDB else 1
+    K_STAGE_ELEMS = BLOCK_N * HEAD_DIM_K
+    # K DMA instructions per wave per tile: the vmcnt that leaves K(t + 1)
+    # in flight while waiting for V(t).
+    K_VM_PER_TILE = K_DMA_INSTR // NUM_WAVES
 
     @fx.struct
     class SharedStorage:
-        k: fx.Array[elem_dtype, BLOCK_N * HEAD_DIM_K, 16]
+        k: fx.Array[elem_dtype, K_LDS_STAGES * K_STAGE_ELEMS, 16]
         v: fx.Array[elem_dtype, V_LDS_ELEMS, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -461,7 +477,11 @@ def build_ragged_fwd(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_smem = lds.k.view(
             fx.make_layout(
-                (BLOCK_N, HEAD_DIM_K // MFMA_DIM_LANE_K, MFMA_DIM_LANE_K),
+                (
+                    K_LDS_STAGES * BLOCK_N,
+                    HEAD_DIM_K // MFMA_DIM_LANE_K,
+                    MFMA_DIM_LANE_K,
+                ),
                 (HEAD_DIM_K, MFMA_DIM_LANE_K, 1),
             )
         )
@@ -757,8 +777,12 @@ def build_ragged_fwd(
                 for j in range_constexpr(VEC_V):
                     v_smem[v_load_col + fx.Int32(j), kv_grp, kv_lane] = vv[j]
 
-        def read_k_packs(ng):
+        def read_k_packs(ng, stage):
             local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
+            if const_expr(KDB):
+                # Stages are BLOCK_N rows apart, a multiple of the swizzle
+                # span, so the swizzle is unchanged.
+                local_k_row = local_k_row + stage * fx.Int32(BLOCK_N)
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
@@ -767,7 +791,7 @@ def build_ragged_fwd(
                 )
             return packs
 
-        def tile_scores():
+        def tile_scores(stage):
             """GEMM1 with A = K, B = Q, so the C fragment (lane: query
             lane_mod_16, keys lane_div_16*4 + i) is GEMM2's A operand.
             Returns the scores flat, index (ng * Q_SUBTILES + qg) * 4 + i."""
@@ -775,7 +799,7 @@ def build_ragged_fwd(
             for ng in range_constexpr(KV_SUBTILES):
                 # Read this subtile's K packs just before its MFMAs, so only
                 # one subtile's packs are live (D 256: 32 VGPRs, not 128).
-                k_packs = [Vec(x) for x in read_k_packs(ng)]
+                k_packs = [Vec(x) for x in read_k_packs(ng, stage)]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = c_zero_v4f32
                     for ks in range_constexpr(K_STEPS_K):
@@ -839,10 +863,10 @@ def build_ragged_fwd(
                 )
             )
 
-        def compute_p_tile(kv_start, m_old, l_old):
+        def compute_p_tile(kv_start, m_old, l_old, stage=None):
             """Scores, mask, activation. Returns P packs and, for softmax heads,
             the new row max, row-sum partials and the output rescale factor."""
-            flat = tile_scores()
+            flat = tile_scores(stage)
             if const_expr(SOFTMAX):
                 flat = [fx.Float32(x) * score_scale for x in flat]
             flat = [fx.Float32(x) for x in masked_values(kv_start, flat)]
@@ -1102,10 +1126,12 @@ def build_ragged_fwd(
                     )
                     fx.copy(dma_atom, fx.slice(div, (None, src_elem)), dst)
 
-            def dma_k(kv_start):
+            def dma_k(kv_start, stage=None):
                 dma_tile(
                     k_div,
-                    k_lds_byte,
+                    k_lds_byte
+                    if stage is None
+                    else k_lds_byte + stage * fx.Int32(K_STAGE_ELEMS * 2),
                     HEAD_DIM_K,
                     K_DMA_INSTR,
                     K_SWZ_ROWS,
@@ -1147,6 +1173,29 @@ def build_ragged_fwd(
             o_acc = accum_o_tile(o_acc, p_packs)
             return o_acc + list(m_new) + list(l_new)
 
+        def run_kv_tile_kdb(state, t):
+            """One KV tile with K double-buffered: K(t) was issued a whole
+            tile ahead. The first barrier makes K(t) visible and frees the V
+            buffer (GEMM2 of t - 1 is done) and K's other stage (GEMM1 of
+            t - 1 is done), so V(t) and K(t + 1) go out; GEMM1 overlaps V(t),
+            and the second barrier makes V(t) visible with K(t + 1) still in
+            flight."""
+            o_acc, m_old, l_old = split_state(state)
+            rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            kv_start = tile_start(t)
+            dma_v(kv_start)
+            nxt = t + fx.Int32(1)
+            dma_k(tile_start(nxt), nxt % fx.Int32(2))
+            stage = t % fx.Int32(2)
+            p_packs, m_new, l_new, corr = compute_p_tile(kv_start, m_old, l_old, stage)
+            if const_expr(SOFTMAX):
+                o_acc = lazy_scale_o_rows(o_acc, corr)
+            rocdl.s_waitcnt(vmcnt=K_VM_PER_TILE)
+            gpu.barrier()
+            o_acc = accum_o_tile(o_acc, p_packs)
+            return o_acc + list(m_new) + list(l_new)
+
         def run_kv_tile(state, kv_start, next_start):
             """One KV tile, software-pipelined: this tile's K and V arrive in
             registers from the previous iteration; the next tile's K load is
@@ -1179,7 +1228,9 @@ def build_ragged_fwd(
                     + [c_zero_f.ir_value() for _ in range(Q_SUBTILES)]
                 )
             first = tile_start(fx.Int32(0))
-            if const_expr(KV_DMA):
+            if const_expr(KDB):
+                dma_k(first, fx.Int32(0))
+            elif const_expr(KV_DMA):
                 dma_k(first)
             else:
                 acc_init = (
@@ -1197,7 +1248,9 @@ def build_ragged_fwd(
             ):  # ty: ignore
                 state = list(it) if isinstance(it, (list, tuple)) else [it]
                 t = fx.Int32(kv_tile)
-                if const_expr(KV_DMA):
+                if const_expr(KDB):
+                    state = run_kv_tile_kdb(state, t)
+                elif const_expr(KV_DMA):
                     state = run_kv_tile_dma(
                         state, tile_start(t), tile_start(t + fx.Int32(1))
                     )
