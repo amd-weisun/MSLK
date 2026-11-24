@@ -274,3 +274,54 @@ def test_softmax_heads_not_supported_yet():
             0,
             num_softmax_heads=2,
         )
+
+
+def test_packed_gradients_past_4gib():
+    """f32 dQ/dK/dV scratch past 4 GiB: the last sequences (one empty) match
+    a call on just them (the descriptors are rebased per sequence)."""
+    from mslk.attention.flydsl.hstu.ragged_bwd import hstu_ragged_bwd
+
+    H, D, N = 8, 128, 4096
+    lengths = torch.full((262,), N)
+    lengths[-2], lengths[-1] = 37, 0
+    off = torch.zeros(lengths.numel() + 1, dtype=torch.int64)
+    off[1:] = lengths.cumsum(0)
+    T = int(off[-1])
+    assert T * H * D * 4 > 2**32
+    gen = torch.Generator(device=_CUDA).manual_seed(10)
+    q, k, dout = (
+        (torch.rand(T, H, D, device=_CUDA, generator=gen) * 0.2 - 0.1).to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    )
+
+    def run(q, k, dout, offsets):
+        dq, dk = torch.empty_like(q), torch.empty_like(k)
+        hstu_ragged_bwd(
+            dout,
+            q,
+            k,
+            k,
+            dq,
+            dk,
+            None,
+            offsets.to(_CUDA),
+            None,
+            None,
+            N,
+            1.0 / D,
+            16,
+            "lower_triangular",
+            0,
+            None,
+            0,
+            shared_kv=True,
+        )
+        return dq, dk
+
+    dq, dk = run(q, k, dout, off)
+    lo = int(off[-4])
+    dq_t, dk_t = run(q[lo:].clone(), k[lo:].clone(), dout[lo:].clone(), off[-4:] - lo)
+    torch.testing.assert_close(dq[lo:], dq_t, atol=0, rtol=0)
+    torch.testing.assert_close(dk[lo:], dk_t, atol=0, rtol=0)
