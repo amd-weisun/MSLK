@@ -78,7 +78,7 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
         k: fx.Array[elem_dtype, BLOCK_N * KS, 16]
         q: fx.Array[elem_dtype, 2 * BLOCK_M * KS, 16]
         do: fx.Array[elem_dtype, 2 * BLOCK_M * KS, 16]
-        ds: fx.Array[elem_dtype, BLOCK_N * DSS, 16]
+        ds: fx.Array[elem_dtype, 2 * BLOCK_N * DSS, 16]
         rs: fx.Array[fx.Float32, 2 * BLOCK_M, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -181,30 +181,52 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
             # view; keep it in a function.
             rs_view[idx] = val
 
-        ds_view = lds.ds.view(fx.make_layout((BLOCK_N, DSS // 4, 4), (DSS, 4, 1)))
-        k_base = fx.Int64(fx.ptrtoint(lds.k.ptr))
-        q_base = fx.Int64(fx.ptrtoint(lds.q.ptr))
-        do_base = fx.Int64(fx.ptrtoint(lds.do.ptr))
-        ds_base = fx.Int64(fx.ptrtoint(lds.ds.ptr))
+        ds_view = lds.ds.view(fx.make_layout((2 * BLOCK_N, DSS // 4, 4), (DSS, 4, 1)))
 
-        def tr4(base, stride, row, col):
-            """ds_read_b64_tr_b16 of a 4 x 16 block at (row, col): per 16-lane
-            group, lane i addresses row + i // 4, col + (i % 4) * 4 and gets
-            column col + i's four rows."""
-            elem = (
-                (row + l16 // fx.Int32(4)) * fx.Int32(stride)
-                + col
+        def _lds_addr(arr):
+            return fx.Int32(
+                ArithValue(_raw(fx.Int64(fx.ptrtoint(arr.ptr)))).trunci(T.i32)
+            )
+
+        k_base = _lds_addr(lds.k)
+        q_base = _lds_addr(lds.q)
+        do_base = _lds_addr(lds.do)
+        ds_base = _lds_addr(lds.ds)
+
+        # ds_read_b64_tr_b16 of a 4 x 16 block at (row, col): per 16-lane
+        # group, lane i addresses row + i // 4, col + (i % 4) * 4 and gets
+        # column col + i's four rows. Addresses are a per-lane byte offset
+        # (fixed for the kernel) plus a constant, in 32 bits, so the constant
+        # folds into the instruction's offset field.
+        def tr_lane(stride, row_lane, col_lane):
+            return (
+                (row_lane + l16 // fx.Int32(4)) * fx.Int32(stride)
+                + col_lane
                 + (l16 % fx.Int32(4)) * fx.Int32(4)
-            )
-            ptr = buffer_ops.create_llvm_ptr(
-                base + fx.Int64(elem) * fx.Int64(2), address_space=3
-            )
+            ) * fx.Int32(2)
+
+        def tr4(addr, const_elems):
+            ptr = _llvm_d.IntToPtrOp(
+                _ir.Type.parse("!llvm.ptr<3>"),
+                _raw(addr + fx.Int32(2 * const_elems)),
+            ).result
             return rocdl.ds_read_tr16_b64(v4_type, ptr).result
 
-        def tr8(base, stride, row_lo, row_hi, col):
-            a = tr4(base, stride, row_lo, col)
-            b = tr4(base, stride, row_hi, col)
+        def tr8(addr, stride, row_lo, row_hi, col):
+            a = tr4(addr, row_lo * stride + col)
+            b = tr4(addr, row_hi * stride + col)
             return Vec(a).shuffle(Vec(b), list(range(8))).ir_value()
+
+        # dV / dK A operands (Q / dO rows 16 ks + 4 h (+ 8), d 32 dt + 16 (g16 % 2)).
+        qdo_lane = tr_lane(KS, h * fx.Int32(4), (g16 % fx.Int32(2)) * fx.Int32(16))
+        # dQ: dS rows (keys) 16 kk + 8 h (+ 4), cols m 16 (g16 % 2); K the same
+        # rows, cols d 32 wave + 16 (g16 % 2).
+        ds_lane = tr_lane(DSS, h * fx.Int32(8), (g16 % fx.Int32(2)) * fx.Int32(16))
+        kd_lane = tr_lane(
+            KS,
+            h * fx.Int32(8),
+            wave * fx.Int32(32) + (g16 % fx.Int32(2)) * fx.Int32(16),
+        )
 
         # f32 atomics into dQ, rebased to the sequence (32-bit offsets).
         def _raw_f32_rsrc(tensor, base_byte_offset, num_records_bytes):
@@ -360,6 +382,9 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                             dq_prev_base + fx.Int32(8 * (r // 4) + r % 4) * row_bytes,
                             fx.Float32(Vec(dq_prev)[r]) * alpha,
                         )
+                    # Keep the atomics spread over the MFMAs: left alone, the
+                    # scheduler bunches them, and they stall on the queue.
+                    rocdl.sched_barrier(0)
 
                 # ---- P, dS (C layout: n = lane % 32, m = 8 (r // 4) + 4 h + r % 4) ----
                 n_abs = nw0 + l32
@@ -401,24 +426,25 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 p8 = [pack8(p_vals, ks) for ks in range(2)]
                 ds8 = [pack8(ds_vals, ks) for ks in range(2)]
 
-                # dS^T -> LDS [n][m] for dQ (its readers finished last tile).
+                # dS^T -> LDS [n][m] for dQ, double-buffered: its readers two
+                # tiles back passed the last tile's barrier.
                 ds_bf = Vec.from_elements(ds_vals, fx.Float32).to(elem_dtype)
                 for gq in range_constexpr(4):
                     ds_view[
-                        wave * fx.Int32(32) + l32, fx.Int32(2 * gq) + h, None
+                        buf * fx.Int32(BLOCK_N) + wave * fx.Int32(32) + l32,
+                        fx.Int32(2 * gq) + h,
+                        None,
                     ].store(ds_bf.shuffle(ds_bf, [4 * gq + e for e in range(4)]))
 
                 # ---- dV^T += dO^T P, dK^T += Q^T dS ----
-                q_tile_base = q_base + fx.Int64(row0 * fx.Int32(KS * 2))
-                do_tile_base = do_base + fx.Int64(row0 * fx.Int32(KS * 2))
+                q_tile = q_base + row0 * fx.Int32(KS * 2) + qdo_lane
+                do_tile = do_base + row0 * fx.Int32(KS * 2) + qdo_lane
                 do_ts, q_ts = {}, {}
                 for dt in range_constexpr(D_TILES):
-                    col = fx.Int32(dt * 32) + (g16 % fx.Int32(2)) * fx.Int32(16)
                     for ks in range_constexpr(2):
-                        r_lo = fx.Int32(16 * ks) + h * fx.Int32(4)
-                        r_hi = r_lo + fx.Int32(8)
-                        do_ts[(dt, ks)] = tr8(do_tile_base, KS, r_lo, r_hi, col)
-                        q_ts[(dt, ks)] = tr8(q_tile_base, KS, r_lo, r_hi, col)
+                        r_lo = 16 * ks
+                        do_ts[(dt, ks)] = tr8(do_tile, KS, r_lo, r_lo + 8, 32 * dt)
+                        q_ts[(dt, ks)] = tr8(q_tile, KS, r_lo, r_lo + 8, 32 * dt)
                 for dt in range_constexpr(D_TILES):
                     for ks in range_constexpr(2):
                         dv_acc[dt] = mfma(do_ts[(dt, ks)], p8[ks], dv_acc[dt])
@@ -432,24 +458,21 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 gpu.barrier()  # dS (and the next tile) visible to every wave
                 dq_acc = zero16
                 dq_cur_base = no_dq_base
+                ds_tile = ds_base + buf * fx.Int32(BLOCK_N * DSS * 2) + ds_lane
+                k_tile = k_base + kd_lane
                 if wave < fx.Int32(D_TILES):
-                    col_m = (g16 % fx.Int32(2)) * fx.Int32(16)
-                    col_d = wave * fx.Int32(32) + col_m
                     ds_as, k_bs = [], []
                     for kk in range_constexpr(BLOCK_N // 16):
-                        r_lo = fx.Int32(16 * kk) + h * fx.Int32(8)
-                        r_hi = r_lo + fx.Int32(4)
-                        ds_as.append(tr8(ds_base, DSS, r_lo, r_hi, col_m))
-                        k_bs.append(tr8(k_base, KS, r_lo, r_hi, col_d))
+                        ds_as.append(tr8(ds_tile, DSS, 16 * kk, 16 * kk + 4, 0))
+                        k_bs.append(tr8(k_tile, KS, 16 * kk, 16 * kk + 4, 0))
                     for kk in range_constexpr(BLOCK_N // 16):
                         dq_acc = mfma(ds_as[kk], k_bs[kk], dq_acc)
                     # One base per lane; row r adds a constant row count.
                     dq_cur_base = (m0 + h * fx.Int32(4)) * row_bytes + (
                         head * fx.Int32(D) + wave * fx.Int32(32) + l32
                     ) * fx.Int32(4)
-                # Fences this tile's dS / Q / dO readers from the next tile's
-                # writers.
-                gpu.barrier()
+                # No closing barrier: the next tile writes the other dS buffer
+                # and, after its own barrier, this tile's Q / dO buffer.
                 loop_out = yield (
                     dv_acc
                     + dk_acc
