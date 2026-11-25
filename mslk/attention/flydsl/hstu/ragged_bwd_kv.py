@@ -50,6 +50,7 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
     from flydsl.expr import const_expr, gpu, range_constexpr, rocdl  # pyre-ignore[21]
     from flydsl.expr.typing import T, Vector as Vec  # pyre-ignore[21]
     from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue  # pyre-ignore[21]
+    from mslk.attention.flydsl.flash_attn_utils import scf_if_dispatch
     from mslk.flydsl import buffer_ops
 
     from .common import device_ops, seq_mask
@@ -159,6 +160,11 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
 
         def _visible(m_abs, n_abs, n_id):
             return sm.visible(m_abs, n_abs, _to_id(m_abs), n_id)
+
+        def _needs_mask(m0, nk0):
+            return sm.tile_needs_mask(
+                m0, m0 + fx.Int32(BLOCK_M - 1), nk0, nk0 + fx.Int32(31)
+            )
 
         in_row8 = fx.make_layout((D // 8, 8), (8, 1))
         in_row4 = fx.make_layout((D // 4, 4), (4, 1))
@@ -387,31 +393,6 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                     rocdl.sched_barrier(0)
 
                 # ---- P, dS (C layout: n = lane % 32, m = 8 (r // 4) + 4 h + r % 4) ----
-                n_abs = nw0 + l32
-                n_id = _to_id(n_abs)
-                p_vals, ds_vals = [], []
-                for r in range_constexpr(16):
-                    m_loc = fx.Int32(8 * (r // 4) + r % 4) + h * fx.Int32(4)
-                    m_abs = m0 + m_loc
-                    ok = (
-                        (m_abs < seq_len)
-                        & (n_abs < seq_len)
-                        & _visible(m_abs, n_abs, n_id)
-                    )
-                    c = fx.Float32(rs_view[row0 + m_loc])
-                    x = fx.Float32(Vec(s_acc)[r]) * alpha
-                    e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
-                    sig = fx.Float32(
-                        fx.rocdl.rcp(
-                            fx.Float32.ir_type, (fx.Float32(1.0) + e).ir_value()
-                        )
-                    )
-                    p = ok.select(x * sig * c, fx.Float32(0.0))
-                    g = c * sig * (fx.Float32(1.0) + x * (fx.Float32(1.0) - sig))
-                    dsv = ok.select(fx.Float32(Vec(dp_acc)[r]) * g, fx.Float32(0.0))
-                    p_vals.append(p)
-                    ds_vals.append(dsv)
-
                 def pack8(vals, ks):
                     return (
                         Vec.from_elements(
@@ -423,18 +404,59 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                         .ir_value()
                     )
 
-                p8 = [pack8(p_vals, ks) for ks in range(2)]
-                ds8 = [pack8(ds_vals, ks) for ks in range(2)]
+                # Rows / keys past the sequence have zero Q / dO / K / V, so
+                # their P and dS are already 0: only the HSTU mask matters,
+                # and tiles it fully covers (uniform per wave) skip it.
+                def elementwise(masked):
+                    n_abs = nw0 + l32
+                    n_id = _to_id(n_abs)
+                    p_vals, ds_vals = [], []
+                    for r in range_constexpr(16):
+                        m_loc = fx.Int32(8 * (r // 4) + r % 4) + h * fx.Int32(4)
+                        c = fx.Float32(rs_view[row0 + m_loc])
+                        x = fx.Float32(Vec(s_acc)[r]) * alpha
+                        e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
+                        sig = fx.Float32(
+                            fx.rocdl.rcp(
+                                fx.Float32.ir_type, (fx.Float32(1.0) + e).ir_value()
+                            )
+                        )
+                        p = x * sig * c
+                        g = c * sig * (fx.Float32(1.0) + x * (fx.Float32(1.0) - sig))
+                        dsv = fx.Float32(Vec(dp_acc)[r]) * g
+                        if const_expr(masked):
+                            ok = _visible(m0 + m_loc, n_abs, n_id)
+                            p = ok.select(p, fx.Float32(0.0))
+                            dsv = ok.select(dsv, fx.Float32(0.0))
+                        p_vals.append(p)
+                        ds_vals.append(dsv)
+                    return [pack8(p_vals, ks) for ks in range(2)] + [
+                        pack8(ds_vals, ks) for ks in range(2)
+                    ]
+
+                packed = scf_if_dispatch(
+                    _needs_mask(m0, nw0),
+                    lambda *_: elementwise(True),
+                    lambda *_: elementwise(False),
+                    result_names=("_p0", "_p1", "_ds0", "_ds1"),
+                    result_values=[zero8] * 4,
+                )
+                p8 = [packed[0], packed[1]]
+                ds8 = [packed[2], packed[3]]
 
                 # dS^T -> LDS [n][m] for dQ, double-buffered: its readers two
-                # tiles back passed the last tile's barrier.
-                ds_bf = Vec.from_elements(ds_vals, fx.Float32).to(elem_dtype)
+                # tiles back passed the last tile's barrier. Group gq is half
+                # gq % 2 of ds8[gq // 2].
                 for gq in range_constexpr(4):
                     ds_view[
                         buf * fx.Int32(BLOCK_N) + wave * fx.Int32(32) + l32,
                         fx.Int32(2 * gq) + h,
                         None,
-                    ].store(ds_bf.shuffle(ds_bf, [4 * gq + e for e in range(4)]))
+                    ].store(
+                        Vec(ds8[gq // 2]).shuffle(
+                            Vec(ds8[gq // 2]), [4 * (gq % 2) + e for e in range(4)]
+                        )
+                    )
 
                 # ---- dV^T += dO^T P, dK^T += Q^T dS ----
                 q_tile = q_base + row0 * fx.Int32(KS * 2) + qdo_lane
