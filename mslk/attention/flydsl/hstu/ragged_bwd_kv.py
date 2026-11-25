@@ -207,7 +207,7 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
             return Vec(a).shuffle(Vec(b), list(range(8))).ir_value()
 
         # f32 atomics into dQ, rebased to the sequence (32-bit offsets).
-        def _raw_f32_rsrc(tensor, base_byte_offset):
+        def _raw_f32_rsrc(tensor, base_byte_offset, num_records_bytes):
             base_ptr = _fly_d.extract_aligned_pointer_as_index(
                 _ir.Type.parse("!llvm.ptr"), tensor
             )
@@ -222,19 +222,22 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 [
                     lo,
                     hi,
-                    buffer_ops._create_i32_constant(0x7FFFFFFF),
+                    _raw(num_records_bytes),
                     buffer_ops._create_i32_constant(buffer_ops._get_buffer_flags()),
                 ],
                 fx.Int32,
             ).ir_value()
 
+        # Bounded to the sequence's rows: atomics past it are dropped in
+        # hardware, so the per-row check is free.
+        row_bytes = num_heads * fx.Int32(D * 4)
         dq_rsrc = _raw_f32_rsrc(
             dq_f32,
-            fx.Int64(seq_start) * fx.Int64(num_heads) * fx.Int64(D * 4),
+            fx.Int64(seq_start) * fx.Int64(row_bytes),
+            seq_len * row_bytes,
         )
 
-        def atomic_dq(m_rel, d, val):
-            off = ((m_rel * num_heads + head) * fx.Int32(D) + d) * fx.Int32(4)
+        def atomic_dq(off, val):
             rocdl.raw_buffer_atomic_fadd(
                 T.f32,
                 _raw(val),
@@ -296,24 +299,34 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 if tid < fx.Int32(BLOCK_M):
                     _rs_store(row0 + tid, rsv)
 
-            # Prologue: the first tile into buffer 0.
-            qs0, dos0, rs0 = load_tile(phys(fx.Int32(0)) * fx.Int32(BLOCK_M))
+            def tile_m0(t):
+                t = (t < n_logical).select(t, n_logical - fx.Int32(1))
+                return phys(t) * fx.Int32(BLOCK_M)
+
+            # Prologue: tile 0 into buffer 0; tile 1 in registers. Each
+            # iteration then issues tile t + 2's loads, a whole iteration
+            # before they are stored (one tile of compute did not cover the
+            # global load latency at one wave per SIMD).
+            qs0, dos0, rs0 = load_tile(tile_m0(fx.Int32(0)))
             store_tile(fx.Int32(0), qs0, dos0, rs0)
+            qs1, dos1, rs1 = load_tile(tile_m0(fx.Int32(1)))
             gpu.barrier()
 
-            init = [zero16 for _ in range(2 * D_TILES)]
+            init = [zero16 for _ in range(2 * D_TILES)] + list(qs1) + list(dos1) + [rs1]
             for t_idx, acc in range(fx.Int32(0), n_logical, fx.Int32(1), init=init):  # ty: ignore
                 acc = list(acc) if isinstance(acc, (list, tuple)) else [acc]
                 dv_acc = acc[:D_TILES]
-                dk_acc = acc[D_TILES:]
+                dk_acc = acc[D_TILES : 2 * D_TILES]
+                pf = acc[2 * D_TILES :]
+                qs_n = pf[:QDO_PASSES]
+                dos_n = pf[QDO_PASSES : 2 * QDO_PASSES]
+                rs_n = pf[2 * QDO_PASSES]
                 t_cur = fx.Int32(t_idx)
                 m0 = phys(t_cur) * fx.Int32(BLOCK_M)
                 buf = t_cur % fx.Int32(2)
                 row0 = buf * fx.Int32(BLOCK_M)
-                # Prefetch the next tile (registers) under this tile's compute.
-                t_next = t_cur + fx.Int32(1)
-                t_next = (t_next < n_logical).select(t_next, t_cur)
-                qs_n, dos_n, rs_n = load_tile(phys(t_next) * fx.Int32(BLOCK_M))
+                # Tile t + 2 into registers under this tile's compute.
+                qs_nn, dos_nn, rs_nn = load_tile(tile_m0(t_cur + fx.Int32(2)))
 
                 # ---- S = Q K_w^T, dP = dO V_w^T ----
                 s_acc = zero16
@@ -402,18 +415,23 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                         k_b = tr8(k_base, KS, r_lo, r_hi, col_d)
                         dq_acc = mfma(ds_a, k_b, dq_acc)
                     d_col = wave * fx.Int32(32) + l32
+                    # One base per lane; row r adds a constant number of rows.
+                    dq_base = (m0 + h * fx.Int32(4)) * row_bytes + (
+                        head * fx.Int32(D) + d_col
+                    ) * fx.Int32(4)
                     for r in range_constexpr(16):
-                        m_rel = m0 + fx.Int32(8 * (r // 4) + r % 4) + h * fx.Int32(4)
-                        if m_rel < seq_len:
-                            atomic_dq(m_rel, d_col, fx.Float32(Vec(dq_acc)[r]) * alpha)
+                        atomic_dq(
+                            dq_base + fx.Int32(8 * (r // 4) + r % 4) * row_bytes,
+                            fx.Float32(Vec(dq_acc)[r]) * alpha,
+                        )
                 # Fences this tile's dS / Q / dO readers from the next tile's
                 # writers.
                 gpu.barrier()
-                loop_out = yield dv_acc + dk_acc
+                loop_out = yield dv_acc + dk_acc + list(qs_nn) + list(dos_nn) + [rs_nn]
 
             res = list(loop_out) if isinstance(loop_out, (list, tuple)) else [loop_out]
             dv_fin = res[:D_TILES]
-            dk_fin = res[D_TILES:]
+            dk_fin = res[D_TILES : 2 * D_TILES]
             # ---- dK / dV: lane n = lane % 32, d = 32 dt + 8 g + 4 h + e ----
             n_abs = nw0 + l32
             if n_abs < seq_len:
