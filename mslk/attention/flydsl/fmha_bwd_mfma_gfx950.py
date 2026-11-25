@@ -17,6 +17,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.attention.flydsl.flash_attn_utils import scf_if_dispatch
 from mslk.attention.flydsl.fmha_bwd_mfma import (
     _ds_read_tr_v4,
     _grad_ds_unscaled,
@@ -623,7 +624,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             other `scale` factor (see _grad_ds_unscaled)."""
             x = s_val * fx.Float32(scale)
             e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
-            sig = fx.Float32(1.0) / (fx.Float32(1.0) + e)
+            # Hardware reciprocal (as the forward): an IEEE divide is ~10 VALU.
+            sig = fx.Float32(
+                fx.rocdl.rcp(fx.Float32.ir_type, (fx.Float32(1.0) + e).ir_value())
+            )
             p_val = valid.select(x * sig * row_scale, fx.Float32(0.0))
             g = row_scale * sig * (fx.Float32(1.0) + x * (fx.Float32(1.0) - sig))
             return p_val, g
@@ -1768,6 +1772,52 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         _epi_passes = 2
                         _epi_p_vals, _epi_valids, _epi_keeps = {}, {}, {}
                         _epi_hstu_g = {}
+                        # HSTU mask bits for this m_sub, computed only when the
+                        # tile is not fully visible (a uniform branch; the
+                        # bits default to true): tiles below the diagonal and
+                        # inside every window skip the per-score mask.
+                        _hstu_vis = {}
+                        if const_expr(HSTU):
+                            _hv_keys = [
+                                (n_grp, m_half, r)
+                                for n_grp in range(CK_N_GROUPS)
+                                for m_half in range(M_HALVES)
+                                for r in range(4)
+                            ]
+                            _hv_m0 = m_start + (m_sub * 32)
+                            _hv_rows = min(32, BLOCK_M)
+
+                            def _hv_all(_names, *_state):
+                                bits = []
+                                for n_grp, m_half, r in _hv_keys:
+                                    n_abs = (
+                                        lane_mod_16
+                                        + wave * fx.Index(16)
+                                        + n_grp * fx.Index(NUM_WAVES * 16)
+                                        + n_start
+                                    )
+                                    m_abs = lane_div_16 * 4 + r + m_half * 16 + _hv_m0
+                                    bits.append(_hstu_visible(m_abs, n_abs).ir_value())
+                                return bits
+
+                            _hv_true = fx.Int32(0) == fx.Int32(0)
+                            _hv_bits = scf_if_dispatch(
+                                hstu_sm.tile_needs_mask(
+                                    fx.Int32(_hv_m0),
+                                    fx.Int32(_hv_m0 + fx.Index(_hv_rows - 1)),
+                                    fx.Int32(n_start),
+                                    fx.Int32(n_start + fx.Index(BLOCK_N - 1)),
+                                ),
+                                _hv_all,
+                                state_names=tuple(
+                                    "_hv%d" % i for i in range(len(_hv_keys))
+                                ),
+                                state_values=[_hv_true for _ in _hv_keys],
+                            )
+                            if not isinstance(_hv_bits, (list, tuple)):
+                                _hv_bits = [_hv_bits]
+                            for _hk, _hb in zip(_hv_keys, _hv_bits):
+                                _hstu_vis[_hk] = ArithValue(_raw(_hb))
                         for _epi_pass in range_constexpr(_epi_passes):
                             _epi_do_p = _epi_pass == 0
                             _epi_do_ds = _epi_pass == 1
@@ -1844,8 +1894,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                 ).to(fx.Float32)[0]
                                             valid_mn = bias_load_valid
                                             if const_expr(HSTU):
-                                                valid_mn = valid_mn & _hstu_visible(
-                                                    m_row_abs, n_row_abs
+                                                valid_mn = (
+                                                    valid_mn
+                                                    & _hstu_vis[(n_grp, m_half, r)]
                                                 )
                                             if const_expr(
                                                 causal_mode == CAUSAL_TOP_LEFT
