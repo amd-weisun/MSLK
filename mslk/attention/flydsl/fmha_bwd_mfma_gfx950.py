@@ -226,6 +226,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         )
     else:
         HSTU_MASK = None
+    # Skip the per-score HSTU mask on fully visible tiles only without a
+    # window: with one, nearly every tile straddles the band and the branch
+    # costs more than it saves (MI350, 16-key window: 2.86 vs 3.72 ms).
+    HSTU_MASK_SKIP = HSTU and not HSTU_MASK[1]
     assert 0 < D_QK <= D and 0 < D_V <= D and D_QK % 2 == 0 and D_V % 2 == 0
     if scale is None:
         scale = 1.0 / _pm.sqrt(D_QK)
@@ -500,6 +504,26 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         kv_head_idx = head_idx // fx.Index(heads_per_kv)
 
         hstu_slot_valid = None
+
+        def _hstu_xcd_order(total):
+            # Each XCD (bid % 8) takes a contiguous share of [0, total), so a
+            # (sequence, head)'s KV tiles, which read the same Q/dO rows, share
+            # one L2. The grid is rounded up to a multiple of 8.
+            per_xcd = (total + fx.Index(7)) // fx.Index(8)
+            order = (bid_idx % fx.Index(8)) * per_xcd + bid_idx // fx.Index(8)
+            in_range = order < total
+            return in_range.select(order, fx.Index(0)), in_range
+
+        if const_expr(HSTU and not HSTU_GROUPED):
+            # (sequence, head)-major, KV tiles consecutive, XCD-contiguous
+            # (FMHA's n_tile-major order refetches Q/dO from HBM per KV tile).
+            hstu_n_tiles = (seq_N_idx + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+            hstu_order, hstu_slot_valid = _hstu_xcd_order(num_bh_idx * hstu_n_tiles)
+            n_tile = hstu_order % hstu_n_tiles
+            bh_idx = hstu_order // hstu_n_tiles
+            batch_idx = bh_idx // n_heads_idx
+            head_idx = bh_idx % n_heads_idx
+            kv_head_idx = head_idx
         if const_expr(HSTU_GROUPED):
             from mslk.flydsl import buffer_ops as _grp_bops
 
@@ -515,11 +539,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             hstu_slots = (total_m_idx + fx.Index(BLOCK_N - 1)) // fx.Index(
                 BLOCK_N
             ) + fx.Index(batch_size)
-            head_idx = bid_idx % n_heads_idx
+            hstu_order, hstu_in_range = _hstu_xcd_order(hstu_slots * n_heads_idx)
+            head_idx = hstu_order // hstu_slots
             kv_head_idx = head_idx
-            hstu_slot = bid_idx // n_heads_idx
+            hstu_slot = hstu_order % hstu_slots
             hstu_seq = _hstu_meta(hstu_slot)
-            hstu_slot_valid = hstu_seq < fx.Index(batch_size)
+            hstu_slot_valid = hstu_in_range & (hstu_seq < fx.Index(batch_size))
             batch_idx = hstu_slot_valid.select(hstu_seq, fx.Index(0))
             n_tile = hstu_slot - _hstu_meta(hstu_slots + batch_idx)
             n_tile = hstu_slot_valid.select(n_tile, fx.Index(0))
@@ -553,9 +578,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             this_seqlen_q = seq_M_idx
             this_seqlen_k = seq_N_idx
 
-        if const_expr(HSTU_GROUPED):
-            # Surplus tile slots: an empty sequence (nothing visits, nothing is
-            # stored).
+        if const_expr(HSTU):
+            # Surplus blocks / tile slots: an empty sequence (nothing visits,
+            # nothing is stored).
             this_seqlen_q = hstu_slot_valid.select(this_seqlen_q, fx.Index(0))
             this_seqlen_k = hstu_slot_valid.select(this_seqlen_k, fx.Index(0))
 
@@ -1777,7 +1802,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # bits default to true): tiles below the diagonal and
                         # inside every window skip the per-score mask.
                         _hstu_vis = {}
-                        if const_expr(HSTU):
+                        if const_expr(HSTU_MASK_SKIP):
                             _hv_keys = [
                                 (n_grp, m_half, r)
                                 for n_grp in range(CK_N_GROUPS)
@@ -1893,7 +1918,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                     [b_elem], elem_dtype
                                                 ).to(fx.Float32)[0]
                                             valid_mn = bias_load_valid
-                                            if const_expr(HSTU):
+                                            if const_expr(HSTU and not HSTU_MASK_SKIP):
+                                                valid_mn = valid_mn & _hstu_visible(
+                                                    m_row_abs, n_row_abs
+                                                )
+                                            elif const_expr(HSTU):
                                                 valid_mn = (
                                                     valid_mn
                                                     & _hstu_vis[(n_grp, m_half, r)]
@@ -2566,6 +2595,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                     + fx.Index(B)
                 )
                 * fx.Index(H)
+            )
+        if const_expr(HSTU):
+            # XCD-contiguous order: a multiple of 8 blocks (see _hstu_xcd_order).
+            grid_x = fx.Int32(
+                (fx.Index(grid_x) + fx.Index(7)) // fx.Index(8) * fx.Index(8)
             )
         fmha_bwd_dqdkdv_mfma_gfx950_kernel(
             Q,
