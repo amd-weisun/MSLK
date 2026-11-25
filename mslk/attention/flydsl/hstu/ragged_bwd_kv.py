@@ -312,7 +312,17 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
             qs1, dos1, rs1 = load_tile(tile_m0(fx.Int32(1)))
             gpu.barrier()
 
-            init = [zero16 for _ in range(2 * D_TILES)] + list(qs1) + list(dos1) + [rs1]
+            # Tile t's dQ atomics are issued during tile t + 1's S / dP MFMAs
+            # (back to back they stall on the memory queue). The first
+            # iteration has none: its base points past the sequence, where
+            # the bounded descriptor drops them.
+            no_dq_base = seq_len * row_bytes
+            init = (
+                [zero16 for _ in range(2 * D_TILES)]
+                + list(qs1)
+                + list(dos1)
+                + [rs1, zero16, no_dq_base]
+            )
             for t_idx, acc in range(fx.Int32(0), n_logical, fx.Int32(1), init=init):  # ty: ignore
                 acc = list(acc) if isinstance(acc, (list, tuple)) else [acc]
                 dv_acc = acc[:D_TILES]
@@ -321,6 +331,8 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 qs_n = pf[:QDO_PASSES]
                 dos_n = pf[QDO_PASSES : 2 * QDO_PASSES]
                 rs_n = pf[2 * QDO_PASSES]
+                dq_prev = pf[2 * QDO_PASSES + 1]
+                dq_prev_base = fx.Int32(pf[2 * QDO_PASSES + 2])
                 t_cur = fx.Int32(t_idx)
                 m0 = phys(t_cur) * fx.Int32(BLOCK_M)
                 buf = t_cur % fx.Int32(2)
@@ -329,14 +341,25 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 qs_nn, dos_nn, rs_nn = load_tile(tile_m0(t_cur + fx.Int32(2)))
 
                 # ---- S = Q K_w^T, dP = dO V_w^T ----
-                s_acc = zero16
-                dp_acc = zero16
+                # All A operands first (registers are plentiful at one wave
+                # per SIMD), so the LDS reads overlap instead of each MFMA
+                # waiting on its own.
+                qas, das = [], []
                 for s in range_constexpr(K_STEPS):
                     grp = fx.Int32(2 * s) + h
-                    qa = q_view[row0 + l32, grp, None].load().ir_value()
-                    da = do_view[row0 + l32, grp, None].load().ir_value()
-                    s_acc = mfma(qa, k_regs[s], s_acc)
-                    dp_acc = mfma(da, v_regs[s], dp_acc)
+                    qas.append(q_view[row0 + l32, grp, None].load().ir_value())
+                    das.append(do_view[row0 + l32, grp, None].load().ir_value())
+                s_acc = zero16
+                dp_acc = zero16
+                per_step = -(-16 // K_STEPS)
+                for s in range_constexpr(K_STEPS):
+                    s_acc = mfma(qas[s], k_regs[s], s_acc)
+                    dp_acc = mfma(das[s], v_regs[s], dp_acc)
+                    for r in range_constexpr(per_step * s, min(16, per_step * (s + 1))):
+                        atomic_dq(
+                            dq_prev_base + fx.Int32(8 * (r // 4) + r % 4) * row_bytes,
+                            fx.Float32(Vec(dq_prev)[r]) * alpha,
+                        )
 
                 # ---- P, dS (C layout: n = lane % 32, m = 8 (r // 4) + 4 h + r % 4) ----
                 n_abs = nw0 + l32
@@ -388,15 +411,18 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 # ---- dV^T += dO^T P, dK^T += Q^T dS ----
                 q_tile_base = q_base + fx.Int64(row0 * fx.Int32(KS * 2))
                 do_tile_base = do_base + fx.Int64(row0 * fx.Int32(KS * 2))
+                do_ts, q_ts = {}, {}
                 for dt in range_constexpr(D_TILES):
                     col = fx.Int32(dt * 32) + (g16 % fx.Int32(2)) * fx.Int32(16)
                     for ks in range_constexpr(2):
                         r_lo = fx.Int32(16 * ks) + h * fx.Int32(4)
                         r_hi = r_lo + fx.Int32(8)
-                        do_t = tr8(do_tile_base, KS, r_lo, r_hi, col)
-                        q_t = tr8(q_tile_base, KS, r_lo, r_hi, col)
-                        dv_acc[dt] = mfma(do_t, p8[ks], dv_acc[dt])
-                        dk_acc[dt] = mfma(q_t, ds8[ks], dk_acc[dt])
+                        do_ts[(dt, ks)] = tr8(do_tile_base, KS, r_lo, r_hi, col)
+                        q_ts[(dt, ks)] = tr8(q_tile_base, KS, r_lo, r_hi, col)
+                for dt in range_constexpr(D_TILES):
+                    for ks in range_constexpr(2):
+                        dv_acc[dt] = mfma(do_ts[(dt, ks)], p8[ks], dv_acc[dt])
+                        dk_acc[dt] = mfma(q_ts[(dt, ks)], ds8[ks], dk_acc[dt])
 
                 # The next tile into the other buffer (free since the last
                 # iteration's closing barrier), before the dQ atomics: the
@@ -404,34 +430,44 @@ def build_ragged_bwd_kv(dim: int, dtype_str: str, spec: MaskSpec, arch: str):
                 # the atomics would also wait for the atomics.
                 store_tile(fx.Int32(1) - buf, qs_n, dos_n, rs_n)
                 gpu.barrier()  # dS (and the next tile) visible to every wave
+                dq_acc = zero16
+                dq_cur_base = no_dq_base
                 if wave < fx.Int32(D_TILES):
-                    dq_acc = zero16
                     col_m = (g16 % fx.Int32(2)) * fx.Int32(16)
                     col_d = wave * fx.Int32(32) + col_m
+                    ds_as, k_bs = [], []
                     for kk in range_constexpr(BLOCK_N // 16):
                         r_lo = fx.Int32(16 * kk) + h * fx.Int32(8)
                         r_hi = r_lo + fx.Int32(4)
-                        ds_a = tr8(ds_base, DSS, r_lo, r_hi, col_m)
-                        k_b = tr8(k_base, KS, r_lo, r_hi, col_d)
-                        dq_acc = mfma(ds_a, k_b, dq_acc)
-                    d_col = wave * fx.Int32(32) + l32
-                    # One base per lane; row r adds a constant number of rows.
-                    dq_base = (m0 + h * fx.Int32(4)) * row_bytes + (
-                        head * fx.Int32(D) + d_col
+                        ds_as.append(tr8(ds_base, DSS, r_lo, r_hi, col_m))
+                        k_bs.append(tr8(k_base, KS, r_lo, r_hi, col_d))
+                    for kk in range_constexpr(BLOCK_N // 16):
+                        dq_acc = mfma(ds_as[kk], k_bs[kk], dq_acc)
+                    # One base per lane; row r adds a constant row count.
+                    dq_cur_base = (m0 + h * fx.Int32(4)) * row_bytes + (
+                        head * fx.Int32(D) + wave * fx.Int32(32) + l32
                     ) * fx.Int32(4)
-                    for r in range_constexpr(16):
-                        atomic_dq(
-                            dq_base + fx.Int32(8 * (r // 4) + r % 4) * row_bytes,
-                            fx.Float32(Vec(dq_acc)[r]) * alpha,
-                        )
                 # Fences this tile's dS / Q / dO readers from the next tile's
                 # writers.
                 gpu.barrier()
-                loop_out = yield dv_acc + dk_acc + list(qs_nn) + list(dos_nn) + [rs_nn]
+                loop_out = yield (
+                    dv_acc
+                    + dk_acc
+                    + list(qs_nn)
+                    + list(dos_nn)
+                    + [rs_nn, dq_acc, dq_cur_base]
+                )
 
             res = list(loop_out) if isinstance(loop_out, (list, tuple)) else [loop_out]
             dv_fin = res[:D_TILES]
             dk_fin = res[D_TILES : 2 * D_TILES]
+            dq_last = res[2 * D_TILES + 2 * QDO_PASSES + 1]
+            dq_last_base = fx.Int32(res[2 * D_TILES + 2 * QDO_PASSES + 2])
+            for r in range_constexpr(16):
+                atomic_dq(
+                    dq_last_base + fx.Int32(8 * (r // 4) + r % 4) * row_bytes,
+                    fx.Float32(Vec(dq_last)[r]) * alpha,
+                )
             # ---- dK / dV: lane n = lane % 32, d = 32 dt + 8 g + 4 h + e ----
             n_abs = nw0 + l32
             if n_abs < seq_len:
