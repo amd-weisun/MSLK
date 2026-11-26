@@ -122,13 +122,21 @@ def test_kv_tiles_cover_every_visible_key(block_m, block_n):
 @pytest.mark.parametrize("block_m,block_n", [(1, 1), (2, 3), (4, 2), (8, 4), (16, 16)])
 def test_tile_needs_mask_is_safe(block_m, block_n):
     """A tile declared unmasked has every key visible to every row (lower
-    triangular, no contextual prefix), and the check does skip tiles,
-    including full-attention blocks outside their window."""
+    triangular), and the check does skip tiles, including full-attention
+    blocks outside their window. Both for the features of each call and for
+    every feature compiled in with run-time values (grouped calls), where a
+    contextual length > 0 must keep every tile masked."""
     skipped = skipped_full = 0
-    for mask, w, c, f, n, t in _cases():
-        if mask != LOWER or c:
+    every_feature = {
+        has_targets: MaskSpec(LOWER, True, True, has_targets, True)
+        for has_targets in (False, True)
+    }
+    for (mask, w, c, f, n, t), all_on in itertools.product(_cases(), (False, True)):
+        if mask != LOWER:
             continue
-        spec, sm = _host_seq_mask(mask, w, c, f, n, t)
+        spec, sm = _host_seq_mask(
+            mask, w, c, f, n, t, every_feature[t is not None] if all_on else None
+        )
         ref = ragged_hstu_valid_mask(n, mask, t, w, c, f)
         for r0 in range(0, n, block_m):
             r1 = min(r0 + block_m, n) - 1
@@ -146,6 +154,7 @@ def test_tile_needs_mask_is_safe(block_m, block_n):
                     r0,
                     c0,
                 )
+                assert not c, "contextual prefix: every tile is masked"
                 skipped += 1
                 if spec.has_full_attn and sm.to_id(c0) < sm.to_id(r1) - w:
                     skipped_full += 1

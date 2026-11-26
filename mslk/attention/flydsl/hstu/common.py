@@ -161,8 +161,9 @@ class SeqMask:
     ) -> Any:
         """False only when every key in ``[col0, col_last]`` is visible to
         every row in ``[row0, row_last]`` (lower-triangular mask without a
-        contextual prefix; other masks always need it). Uniform across the
-        rows, so a kernel can branch on it.
+        contextual prefix, or with a run-time contextual length of 0; other
+        masks always need it). Uniform across the rows, so a kernel can
+        branch on it.
 
         Visible everywhere means: inside the sequence, strictly below every
         row's id, and inside every row's window unless every row is a
@@ -176,6 +177,8 @@ class SeqMask:
                     self.to_id(row0) < self.max_ids - self.full_attn_size
                 )
             need = need | outside
+        if spec.has_contextual:
+            need = need | self.ctx_on
         return need
 
     def tile_hidden(self, row0: Any, row_last: Any, col0: Any, col_last: Any) -> Any:
