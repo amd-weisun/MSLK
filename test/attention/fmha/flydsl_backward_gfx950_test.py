@@ -291,7 +291,17 @@ def test_backward_flydsl_bottom_right_local_attention(
 
 
 @pytest.mark.parametrize(
-    "dims,causal", [((192, 128), True), ((64, 128), False), ((80, 48), True)]
+    "dims,causal",
+    [
+        ((192, 128), True),
+        ((64, 128), False),
+        ((80, 48), True),
+        # Dqk < Dv: the Q/K-side GEMMs run at Dqk rounded up to 32 (64 past
+        # 64), the V side at Dv.
+        ((64, 256), True),
+        ((72, 256), False),
+        ((128, 256), True),
+    ],
 )
 def test_backward_flydsl_value_head_dim_differs(
     dims: tuple[int, int], causal: bool

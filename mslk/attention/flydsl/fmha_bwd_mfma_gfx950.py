@@ -285,16 +285,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     MFMA_K = 16
     MFMA_LK = 8
     K_STEPS = D // MFMA_K
-    # HSTU: the Q/K side (S = Q K^T, dK, dQ) runs at DQ_C and the V side (dP,
-    # dV) at D: with D_QK < D_V (say 64 / 256) the padded Q/K columns are
-    # zeros and skipping them saves their MFMAs. DQ_C is D_QK rounded up to
-    # 32, or to 64 past 64: the dQ step splits DQ_C / 16 subtiles over the 4
-    # waves, and an uneven split (6 at 96) gives wrong dQ.
-    DQ_C = (
-        min(D, -(-D_QK // 32) * 32 if D_QK <= 64 else -(-D_QK // 64) * 64)
-        if hstu is not None
-        else D
-    )
+    # Q/K-side width; must split evenly over 4 waves in 16-col subtiles (96 breaks dQ).
+    DQ_C = min(D, -(-D_QK // 32) * 32 if D_QK <= 64 else -(-D_QK // 64) * 64)
     fm = arith.FastMathFlags.fast
 
     BLOCK_SIZE = 256
