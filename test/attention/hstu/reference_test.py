@@ -18,20 +18,21 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from hstu_test_utils import (
-    assert_hstu_close,
-    generate_sparse_seq_len,
-    HEAD_DIMS,
-    make_cross_inputs,
-    make_grouped_inputs,
-    make_ragged_inputs,
-)
 from mslk.attention.hstu._torch_ref import (
     cross_hstu_attention_ref,
     cross_hstu_valid_mask,
     grouped_ragged_hstu_attention_ref,
     ragged_hstu_attention_ref,
     ragged_hstu_valid_mask,
+)
+
+from .hstu_test_utils import (
+    assert_hstu_close,
+    generate_sparse_seq_len,
+    HEAD_DIMS,
+    make_cross_inputs,
+    make_grouped_inputs,
+    make_ragged_inputs,
 )
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
