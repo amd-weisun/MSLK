@@ -160,7 +160,9 @@ __configure_mslk_test_rocm () {
   export explicitly_enabled_tests=(
     ./attention/fmha/flydsl_backward_gfx950_test.py
     ./attention/hstu/flydsl_common_test.py
+    ./attention/hstu/flydsl_grouped_bwd_test.py
     ./attention/hstu/flydsl_grouped_test.py
+    ./attention/hstu/flydsl_ragged_bwd_test.py
     ./attention/hstu/flydsl_ragged_fwd_test.py
   )
 }

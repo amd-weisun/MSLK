@@ -17,6 +17,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.attention.flydsl.flash_attn_utils import scf_if_dispatch
 from mslk.attention.flydsl.fmha_bwd_mfma import (
     _ds_read_tr_v4,
     _grad_ds_unscaled,
@@ -110,6 +111,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     D_V: int | None = None,
     has_dropout: bool = False,
     dropout_p: float = 0.0,
+    hstu=None,
+    hstu_softmax: bool = False,
+    hstu_grouped: bool = False,
+    hstu_sorted: bool = False,
+    hstu_no_dq: bool = False,
+    hstu_direct_dkv: bool = False,
+    hstu_shared_dkv: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -125,8 +133,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     dQ's wave assignment is DECOUPLED from GEMM1/2/3's N-split (GEMM4 warp
     layout 1x4x1): all NUM_WAVES waves cover the SAME m_sub rows and each owns
-    its own D-subtile (GEMM4_DQ_D_SUBS_PER_WAVE contiguous 32-col slices, base =
-    wave*GEMM4_DQ_D_SUBS_PER_WAVE), sweeping the ENTIRE n range (WAVE_N_TILES*32
+    its own D-subtile (GEMM4_DQ_D_SUBS_PER_WAVE 16-col slices of the Q/K width
+    DQ_C, base = wave*GEMM4_DQ_D_SUBS_PER_WAVE), sweeping the ENTIRE n range (WAVE_N_TILES*32
     rows of lds_ds/lds_k, both already block-resident) internally via an extra
     n_sub_iter loop. Every wave therefore produces one COMPLETE,
     already-fully-summed dq_acc and fires its own atomic directly -- no
@@ -183,6 +191,35 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     D_QK = D if D_QK is None else D_QK
     D_V = D if D_V is None else D_V
+    # HSTU SiLU: the per-row output scale arrives in the LSE slot; D_vec is unused.
+    HSTU = hstu is not None
+    HSTU_SILU = HSTU and not hstu_softmax
+    # Grouped: hstu_targets (int32) = [slot -> seq (B if none)] * SLOTS, KV-tile
+    # prefix sums (B + 1), then per seq (targets, window, contextual, full_attn);
+    # SLOTS = ceil(total_m / BLOCK_N) + B.
+    HSTU_GROUPED = HSTU and hstu_grouped
+    # Sorted: hstu_targets = num_targets (B) then sequence ids by decreasing length (B).
+    HSTU_SORTED = HSTU and hstu_sorted and not HSTU_GROUPED
+    HSTU_NO_DQ = HSTU and hstu_no_dq
+    # HSTU_DIRECT: no zero fill or f32 scratch; every dK/dV row has exactly one writer.
+    HSTU_DIRECT = HSTU and hstu_direct_dkv
+    HSTU_SHARED = HSTU_DIRECT and hstu_shared_dkv
+    if HSTU_DIRECT:
+        assert D_QK % 4 == 0 and D_V % 4 == 0 and not deterministic
+        assert not HSTU_SHARED or D_QK == D_V
+    if HSTU:
+        assert varlen and causal_mode == CAUSAL_NONE and window_left < 0
+        assert not (has_bias or emit_dbias or has_dropout or heads_per_kv != 1)
+        HSTU_MASK = (
+            hstu.mask_type,
+            hstu.has_window,
+            hstu.has_contextual,
+            hstu.has_targets,
+            hstu.has_full_attn,
+        )
+    else:
+        HSTU_MASK = None
+    HSTU_MASK_SKIP = HSTU and not HSTU_MASK[1]
     assert 0 < D_QK <= D and 0 < D_V <= D and D_QK % 2 == 0 and D_V % 2 == 0
     if scale is None:
         scale = 1.0 / _pm.sqrt(D_QK)
@@ -225,15 +262,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     # D==128 hardware-transpose paths: KT/dS/Q/dO use ds_read_tr16_b64 with
     # XOR-swizzled LDS layouts. Other D values fall back to scalar gather.
-    _use_kt_tr = gpu_arch.startswith("gfx950") and D == 128
+    _EARLY_STORE = HSTU
+    _TR_DS = (64, 128) if HSTU else (128,)
+    _use_kt_tr = gpu_arch.startswith("gfx950") and D in _TR_DS
     _use_ck_kswz = _use_kt_tr
-    _use_v_swz = gpu_arch.startswith("gfx950") and D == 128
-    _use_ds_tr = gpu_arch.startswith("gfx950") and D == 128
+    _use_v_swz = gpu_arch.startswith("gfx950") and D in _TR_DS
+    _use_ds_tr = gpu_arch.startswith("gfx950") and D in _TR_DS
     _use_ds_writer_wide = _use_ds_tr
     # Hand-emitted ds_write2st64_b64 for CK_N_GROUPS==3 (kn192); no-op at kn128.
     _use_ds_write2_asm = _use_ds_writer_wide
-    # Swizzled lds_q/lds_do for bijective transpose reads (D==128 only).
-    _use_qdo_swz2 = gpu_arch.startswith("gfx950") and D == 128
+    # Swizzled lds_q/lds_do for bijective transpose reads (the _TR_DS dims).
+    _use_qdo_swz2 = gpu_arch.startswith("gfx950") and D in _TR_DS
 
     # GQA atomic dV/dK store when multiple query heads share a KV head.
     _dvdk_atomic = heads_per_kv > 1
@@ -246,6 +285,16 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     MFMA_K = 16
     MFMA_LK = 8
     K_STEPS = D // MFMA_K
+    # HSTU: the Q/K side (S = Q K^T, dK, dQ) runs at DQ_C and the V side (dP,
+    # dV) at D: with D_QK < D_V (say 64 / 256) the padded Q/K columns are
+    # zeros and skipping them saves their MFMAs. DQ_C is D_QK rounded up to
+    # 32, or to 64 past 64: the dQ step splits DQ_C / 16 subtiles over the 4
+    # waves, and an uneven split (6 at 96) gives wrong dQ.
+    DQ_C = (
+        min(D, -(-D_QK // 32) * 32 if D_QK <= 64 else -(-D_QK // 64) * 64)
+        if hstu is not None
+        else D
+    )
     fm = arith.FastMathFlags.fast
 
     BLOCK_SIZE = 256
@@ -258,6 +307,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     # Invariant: M_SUBTILES * M_HALVES == BLOCK_M // 16 (total 16-row M-tiles).
     M_SUBTILES = max(1, BLOCK_M // 32)  # 16->1, 32->1, 64->2
     M_HALVES = (BLOCK_M // 16) if BLOCK_M < 64 else 2  # 16->1, 32->2, 64->2
+    _GEMM2_K32 = HSTU and M_HALVES == 2
+    _SPLIT_EPI = HSTU_SILU and HSTU_NO_DQ and not has_bias and not has_dropout
     WAVE_N_TILES = BLOCK_N // 32  # 2 (BLOCK_N=64 fixed)
     # K/V block-entry HBM->LDS prologue: each wave covers ceil(N_BANDS_TOTAL/NUM_WAVES)
     # contiguous 32-row bands (band_idx = wave*N_BANDS_PER_WAVE + band_iter, guarded
@@ -295,16 +346,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     # has each warp sweep the FULL kN0 range internally, so every wave gets a
     # COMPLETE dq_acc directly with no cross-wave reduction needed. Excess
     # waves idle during the dQ step when NUM_WAVES exceeds the D-subtile count.
-    # GEMM4 16x16x32: Gemm4BlockWarps splits D in 16-col subtiles (NWarp=4 at D=64).
-    GEMM4_D_TOTAL_SUBS = D // 16
+    # GEMM4 16x16x32: Gemm4BlockWarps splits the Q/K width DQ_C in 16-col
+    # subtiles (NWarp=4 at DQ_C=64).
+    GEMM4_D_TOTAL_SUBS = DQ_C // 16
     GEMM4_DQ_D_SUBS_PER_WAVE = -(-GEMM4_D_TOTAL_SUBS // NUM_WAVES)
     # GEMM4 dS-transpose residency: the dS A-operand transpose slice is read
     # ONCE per n_sub_iter step and reused against EVERY D-subtile a warp owns
     # (zero LDS cost). This hoists the dS-transpose read OUTSIDE the d_iter
     # loop (caching all WAVE_N_TILES slices once, same pattern as
     # kt_gemm4_regs's residency cache) instead of re-reading the identical LDS
-    # data once per d_iter. D > 64 only: GEMM4_DQ_D_SUBS_PER_WAVE==1 at D<=64
-    # under 4 waves, so there is no redundancy to eliminate there.
+    # data once per d_iter. DQ_C > 64 only: GEMM4_DQ_D_SUBS_PER_WAVE==1 at
+    # DQ_C<=64 under 4 waves, so there is no redundancy to eliminate there.
     _use_ds4_residency = GEMM4_DQ_D_SUBS_PER_WAVE > 1
 
     LDS_MPAD = BLOCK_M + 8
@@ -404,6 +456,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
         drop_stride_q: fx.Int32,
+        hstu_targets: fx.Tensor,
+        hstu_max_attn_len: fx.Int32,
+        hstu_contextual_seq_len: fx.Int32,
+        hstu_full_attn_size: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -452,6 +508,69 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         head_idx = bh_idx % n_heads_idx
         kv_head_idx = head_idx // fx.Index(heads_per_kv)
 
+        hstu_slot_valid = None
+
+        def _hstu_xcd_order(total):
+            # Contiguous share per XCD (bid % 8) so tiles reading the same Q/dO share L2.
+            per_xcd = (total + fx.Index(7)) // fx.Index(8)
+            order = (bid_idx % fx.Index(8)) * per_xcd + bid_idx // fx.Index(8)
+            in_range = order < total
+            return in_range.select(order, fx.Index(0)), in_range
+
+        if const_expr(HSTU and not HSTU_GROUPED and not HSTU_SORTED):
+            hstu_n_tiles = (seq_N_idx + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+            hstu_order, hstu_slot_valid = _hstu_xcd_order(num_bh_idx * hstu_n_tiles)
+            n_tile = hstu_order % hstu_n_tiles
+            bh_idx = hstu_order // hstu_n_tiles
+            batch_idx = bh_idx // n_heads_idx
+            head_idx = bh_idx % n_heads_idx
+            kv_head_idx = head_idx
+        if const_expr(HSTU_SORTED):
+            from mslk.flydsl import buffer_ops as _srt_bops
+
+            hstu_n_tiles = (seq_N_idx + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+            per_seq = n_heads_idx * hstu_n_tiles
+            local = bid_idx // fx.Index(8)
+            rank = (local // per_seq) * fx.Index(8) + bid_idx % fx.Index(8)
+            rem = local % per_seq
+            hstu_slot_valid = rank < fx.Index(batch_size)
+            rank = hstu_slot_valid.select(rank, fx.Index(0))
+            batch_idx = fx.Index(
+                _srt_bops.buffer_load(
+                    _srt_bops.create_buffer_resource(hstu_targets),
+                    fx.Index(batch_size) + rank,
+                    vec_width=1,
+                    dtype=fx.Int32,
+                )
+            )
+            head_idx = rem // hstu_n_tiles
+            n_tile = rem % hstu_n_tiles
+            kv_head_idx = head_idx
+        if const_expr(HSTU_GROUPED):
+            from mslk.flydsl import buffer_ops as _grp_bops
+
+            hstu_meta_rsrc = _grp_bops.create_buffer_resource(hstu_targets)
+
+            def _hstu_meta(idx):
+                return fx.Index(
+                    _grp_bops.buffer_load(
+                        hstu_meta_rsrc, fx.Index(idx), vec_width=1, dtype=fx.Int32
+                    )
+                )
+
+            hstu_slots = (total_m_idx + fx.Index(BLOCK_N - 1)) // fx.Index(
+                BLOCK_N
+            ) + fx.Index(batch_size)
+            hstu_order, hstu_in_range = _hstu_xcd_order(hstu_slots * n_heads_idx)
+            head_idx = hstu_order // hstu_slots
+            kv_head_idx = head_idx
+            hstu_slot = hstu_order % hstu_slots
+            hstu_seq = _hstu_meta(hstu_slot)
+            hstu_slot_valid = hstu_in_range & (hstu_seq < fx.Index(batch_size))
+            batch_idx = hstu_slot_valid.select(hstu_seq, fx.Index(0))
+            n_tile = hstu_slot - _hstu_meta(hstu_slots + batch_idx)
+            n_tile = hstu_slot_valid.select(n_tile, fx.Index(0))
+
         n_start = n_tile * BLOCK_N
 
         # varlen: q_start/k_start (packed-row-offset bases) and this_seqlen_q/
@@ -480,6 +599,82 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             k_start = batch_idx * seq_N_idx
             this_seqlen_q = seq_M_idx
             this_seqlen_k = seq_N_idx
+
+        if const_expr(HSTU):
+            # Surplus blocks / tile slots run as an empty sequence.
+            this_seqlen_q = hstu_slot_valid.select(this_seqlen_q, fx.Index(0))
+            this_seqlen_k = hstu_slot_valid.select(this_seqlen_k, fx.Index(0))
+
+        # HSTU sequences may be empty: clamp to row 0 (the value is masked off).
+        seq_q_last = this_seqlen_q - fx.Index(1)
+        seq_k_last = this_seqlen_k - fx.Index(1)
+        if const_expr(HSTU):
+            seq_q_last = (this_seqlen_q > fx.Index(0)).select(seq_q_last, fx.Index(0))
+            seq_k_last = (this_seqlen_k > fx.Index(0)).select(seq_k_last, fx.Index(0))
+
+        hstu_sm = None
+        if const_expr(HSTU):
+            from mslk.attention.flydsl.hstu.common import (
+                device_ops as _hstu_ops,
+                MaskSpec as _HstuSpec,
+                seq_mask as _hstu_seq_mask,
+            )
+
+            hstu_num_target = fx.Int32(0)
+            hstu_window = hstu_max_attn_len
+            hstu_context = hstu_contextual_seq_len
+            hstu_full = hstu_full_attn_size
+            if const_expr(HSTU_GROUPED):
+                settings = (
+                    hstu_slots
+                    + fx.Index(batch_size)
+                    + fx.Index(1)
+                    + batch_idx * fx.Index(4)
+                )
+                hstu_num_target = fx.Int32(_hstu_meta(settings))
+                hstu_window = fx.Int32(_hstu_meta(settings + fx.Index(1)))
+                hstu_context = fx.Int32(_hstu_meta(settings + fx.Index(2)))
+                hstu_full = fx.Int32(_hstu_meta(settings + fx.Index(3)))
+            elif const_expr(HSTU_MASK[3]):
+                hstu_targets_rsrc = _seq_bops.create_buffer_resource(hstu_targets)
+                hstu_num_target = fx.Int32(
+                    _seq_bops.buffer_load(
+                        hstu_targets_rsrc,
+                        fx.Index(batch_idx),
+                        vec_width=1,
+                        dtype=fx.Int32,
+                    )
+                )
+            hstu_sm = _hstu_seq_mask(
+                _HstuSpec(*HSTU_MASK),
+                _hstu_ops(),
+                fx.Int32(this_seqlen_q),
+                num_targets=hstu_num_target,
+                max_attn_len=hstu_window,
+                contextual_seq_len=hstu_context,
+                full_attn_size=hstu_full,
+            )
+
+        def _hstu_visible(m_row_abs, n_row_abs):
+            m_i = fx.Int32(m_row_abs)
+            n_i = fx.Int32(n_row_abs)
+            return hstu_sm.visible(m_i, n_i, hstu_sm.to_id(m_i), hstu_sm.to_id(n_i))
+
+        def _hstu_p_grad(s_val, row_scale, valid):
+            """P = silu(scale * S) * row_scale and dS factor row_scale * silu'(scale * S)."""
+            x = s_val * fx.Float32(scale)
+            e = fx.exp2(x * fx.Float32(-_LOG2E), fastmath="afn")
+            sig = fx.Float32(
+                fx.rocdl.rcp(fx.Float32.ir_type, (fx.Float32(1.0) + e).ir_value())
+            )
+            # silu'(x) = sig (1 + x (1 - sig)) = sig + xs - xs sig, xs = x sig.
+            xs = x * sig
+            p_val = valid.select(xs * row_scale, fx.Float32(0.0))
+            u = fx.Float32(
+                fx.math.fma((-xs).ir_value(), sig.ir_value(), (sig + xs).ir_value())
+            )
+            g = row_scale * u
+            return p_val, g
 
         wave = fx.Index(tid // WARP_SIZE)
         lane = fx.Index(tid % WARP_SIZE)
@@ -541,20 +736,24 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # GQA: Q-side rows (_q_row/_do_row/_lse_row/_dvec_row) are indexed by the
         # per-block query head. K/V (_kv_row) stay indexed by kv_head_idx, derived
         # from head_idx // heads_per_kv.
+        # HSTU rebases descriptors to the sequence start: packed tensors exceed 2^31 bytes.
+        q_row0 = fx.Index(0) if HSTU else q_start
+        k_row0 = fx.Index(0) if HSTU else k_start
+
         def _q_row(q_pos, head_idx):
-            return fx.Int32((q_start + q_pos) * q_stride_m_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * q_stride_m_idx + head_idx)
 
         def _do_row(q_pos, head_idx):
-            return fx.Int32((q_start + q_pos) * do_stride_m_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * do_stride_m_idx + head_idx)
 
         def _kv_row(kv_pos):
-            return fx.Int32((k_start + kv_pos) * kv_stride_n_idx + kv_head_idx)
+            return fx.Int32((k_row0 + kv_pos) * kv_stride_n_idx + kv_head_idx)
 
         # dV/dK are freshly-allocated contiguous outputs, shaped [B,N,Hkv,D] --
         # row pitch n_kv_heads_idx (NOT kv_stride_n_idx), indexed by kv_head_idx.
         # Packed the SAME way as K/V's own N axis (varlen: k_start-relative).
         def _kv_row_out(kv_pos):
-            return fx.Int32((k_start + kv_pos) * n_kv_heads_idx + kv_head_idx)
+            return fx.Int32((k_row0 + kv_pos) * n_kv_heads_idx + kv_head_idx)
 
         # ck_scope_dvdk-only: per-query-head scope, writing dV/dK per QUERY
         # head, uncompacted, into a [B,N,H,D]-sized buffer (row pitch
@@ -562,12 +761,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # _kv_row_out performs). The GQA reduction across the heads_per_kv
         # query heads sharing a KV head must happen OUTSIDE this kernel.
         def _kv_row_out_per_qhead(kv_pos):
-            return fx.Int32((k_start + kv_pos) * n_heads_idx + head_idx)
+            return fx.Int32((k_row0 + kv_pos) * n_heads_idx + head_idx)
 
         # dQ is a freshly-allocated contiguous output -- always row pitch
         # n_heads_idx (NOT q_stride_m_idx), indexed by the per-q-head head_idx.
         def _q_row_out(q_pos, head_idx):
-            return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
+            return fx.Int32((q_row0 + q_pos) * n_heads_idx + head_idx)
 
         # LSE layout is [B,H,M] (batch-major, non-varlen) vs packed [1,H,sum_M]
         # under varlen (B collapses to 1 -- packed LSE convention).
@@ -582,14 +781,40 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # n_heads_idx regardless of Q's own stride; q_start already unifies both
         # cases the same way as _q_row_out above.
         def _dvec_row(q_pos, head_idx):
+            if const_expr(HSTU):
+                # D_vec is [T, H], not rebased (H * T floats).
+                return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
             return _q_row_out(q_pos, head_idx)
 
         from mslk.flydsl import buffer_ops as _bops
 
-        q_rsrc = _bops.create_buffer_resource(Q)
-        k_rsrc = _bops.create_buffer_resource(K)
-        v_rsrc = _bops.create_buffer_resource(V)
-        do_rsrc = _bops.create_buffer_resource(dO)
+        _u32_max = fx.Index(0xFFFFFFFF)
+
+        def _bounded(nbytes):
+            # Descriptor sizes are 32-bit.
+            return (nbytes < _u32_max).select(nbytes, _u32_max)
+
+        def _rebased(tensor, row0, row_pitch, elem_bytes):
+            """Descriptor from row `row0` of a packed per-token tensor."""
+            return _bops.create_buffer_resource(
+                tensor,
+                max_size=False,
+                num_records_bytes=_bounded(
+                    (total_m_idx - row0) * row_pitch * fx.Index(elem_bytes)
+                ),
+                base_byte_offset=row0 * row_pitch * fx.Index(elem_bytes),
+            )
+
+        if const_expr(HSTU):
+            q_rsrc = _rebased(Q, q_start, q_stride_m_idx * fx.Index(D_QK), 2)
+            k_rsrc = _rebased(K, k_start, kv_stride_n_idx * fx.Index(D_QK), 2)
+            v_rsrc = _rebased(V, k_start, kv_stride_n_idx * fx.Index(D_V), 2)
+            do_rsrc = _rebased(dO, q_start, do_stride_m_idx * fx.Index(D_V), 2)
+        else:
+            q_rsrc = _bops.create_buffer_resource(Q)
+            k_rsrc = _bops.create_buffer_resource(K)
+            v_rsrc = _bops.create_buffer_resource(V)
+            do_rsrc = _bops.create_buffer_resource(dO)
 
         # The forward folded Bias into LSE, so P cannot be recomputed without it.
         # Dense [B, H, Mq, Mk]; broadcast shapes are rejected host-side.
@@ -636,11 +861,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # by 1 / (1 - p), the same factor the forward applied to its output.
         _rp_undrop = 1.0 / (1.0 - dropout_p) if has_dropout else 1.0
 
-        def _make_raw_f32_rsrc(tensor, num_records_bytes=None):
+        def _make_raw_f32_rsrc(tensor, num_records_bytes=None, base_byte_offset=None):
             base_ptr = _fly_d.extract_aligned_pointer_as_index(
                 _ir_d.Type.parse("!llvm.ptr"), tensor
             )
             base_i64 = _llvm_d.PtrToIntOp(_T.i64, base_ptr).result
+            if base_byte_offset is not None:
+                base_i64 = _raw(fx.Int64(base_i64) + fx.Int64(base_byte_offset))
             lo = ArithValue(base_i64).trunci(_T.i32)
             hi = ArithValue(ArithValue(base_i64).shrui(fx.Int64(32))).trunci(_T.i32)
             size_val = (
@@ -658,7 +885,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 fx.Int32,
             ).ir_value()
 
-        dq_rsrc = _make_raw_f32_rsrc(dQ_f32)
+        _out_pitch = n_heads_idx * fx.Index(D)
+        if const_expr(HSTU):
+            dq_rsrc = _make_raw_f32_rsrc(
+                dQ_f32,
+                num_records_bytes=fx.Int32(
+                    _bounded((total_m_idx - q_start) * _out_pitch * fx.Index(4))
+                ),
+                base_byte_offset=q_start * _out_pitch * fx.Index(4),
+            )
+        else:
+            dq_rsrc = _make_raw_f32_rsrc(dQ_f32)
         # Deterministic dQ uses plain buffer_store (collision-free per-n_tile slot),
         # which needs the ptr<8> descriptor rather than the raw <4xi32> atomic rsrc.
         if const_expr(deterministic):
@@ -673,8 +910,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # ptr<8> ordinary buffer_store descriptor (buffer_ops.buffer_store), distinct
         # from the raw <4xi32> atomic rsrc built above for the GQA-combine path.
         if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
-            dv_store_rsrc = _bops.create_buffer_resource(dV)
-            dk_store_rsrc = _bops.create_buffer_resource(dK)
+            if const_expr(HSTU_DIRECT):
+                dk_store_rsrc = _rebased(dK, k_start, n_heads_idx * fx.Index(D_QK), 2)
+                dv_store_rsrc = _rebased(dV, k_start, n_heads_idx * fx.Index(D_V), 2)
+            elif const_expr(HSTU):
+                dv_store_rsrc = _rebased(dV, k_start, _out_pitch, 4)
+                dk_store_rsrc = _rebased(dK, k_start, _out_pitch, 4)
+            else:
+                dv_store_rsrc = _bops.create_buffer_resource(dV)
+                dk_store_rsrc = _bops.create_buffer_resource(dK)
 
         def _load_global_vec_cv(rsrc, row_i32, col_offset_idx, dim):
             flat_elem = fx.Index(row_i32) * fx.Index(dim) + col_offset_idx
@@ -787,6 +1031,19 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 v4f32_type, [b_pack, a_pack, c_acc, 0, 0, 0]
             )
 
+        def _cat_k16(lo, hi):
+            return Vec(lo).shuffle(Vec(hi), list(range(8))).ir_value()
+
+        def mfma_gemm32_tc(a_pack, b_pack, c_acc):
+            """mfma_gemm16_tc at K=32 (same TransposeC operand order)."""
+            if const_expr(dtype_str == "bf16"):
+                return rocdl.mfma_f32_16x16x32_bf16(
+                    v4f32_type, [b_pack, a_pack, c_acc, 0, 0, 0]
+                )
+            return rocdl.mfma_f32_16x16x32_f16(
+                v4f32_type, [b_pack, a_pack, c_acc, 0, 0, 0]
+            )
+
         def _pack_qdo_ck_k32(m_sub, m_half, k_iter, buf_elems, lds_arr, stride):
             # Q/dO A-operand pack: m=lane%16+m_half*16; d=(lane//16)*8+e. The MFMA_LK
             # contiguous d elements are contiguous in LDS, so read them as ONE wide
@@ -833,7 +1090,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             n_global_band_base = n_start + band_safe * 32
             n_row_abs_kv = n_global_band_base + lane_mod_32
             n_valid_kv = band_in_range & (n_row_abs_kv < this_seqlen_k)
-            n_safe_kv = n_valid_kv.select(n_row_abs_kv, this_seqlen_k - fx.Index(1))
+            n_safe_kv = n_valid_kv.select(n_row_abs_kv, seq_k_last)
             kv_row_g_pre = _kv_row(n_safe_kv)
             n_local_k_row_band = band_safe * 32 + lane_mod_32
 
@@ -1052,6 +1309,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                     _pack_kv_ck_k32(
                         k_iter, lds_k, LDS_K_STRIDE, kv_row_base, swz=_use_ck_kswz
                     )
+                    if k_iter < DQ_C // 32
+                    else None
                 )
                 v_regs_ck.append(
                     _pack_kv_ck_k32(
@@ -1062,7 +1321,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # KT residency for GEMM4 dQ: preload the K^T B-operand packs once (indexed
         # [d_iter*WAVE_N_TILES + n_sub_iter]) so the dQ loop no longer re-reads lds_k.
         kt_gemm4_regs = []
-        for d_iter in range_constexpr(GEMM4_DQ_D_SUBS_PER_WAVE):
+        for d_iter in range_constexpr(0 if HSTU_NO_DQ else GEMM4_DQ_D_SUBS_PER_WAVE):
             wave_d_sub_16_raw = wave * GEMM4_DQ_D_SUBS_PER_WAVE + d_iter
             d_in_range_g4r = wave_d_sub_16_raw < fx.Index(GEMM4_D_TOTAL_SUBS)
             wave_d_sub_16_r = d_in_range_g4r.select(wave_d_sub_16_raw, fx.Index(0))
@@ -1152,16 +1411,26 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         ROWS_PER_WAVE_LD = BLOCK_M // NUM_WAVES
         N_ITEMS_LD = ROWS_PER_WAVE_LD * VEC_COLS
         ITEMS_PER_LANE = N_ITEMS_LD // WARP_SIZE
+        # Fewer items than lanes: extra lanes duplicate an item (same value, same address).
+        _ITEM_WRAP = 0 < N_ITEMS_LD < WARP_SIZE
+        if _ITEM_WRAP:
+            ITEMS_PER_LANE = 1
+
+        def _ld_item(it):
+            item = lane + fx.Index(it * WARP_SIZE)
+            if const_expr(_ITEM_WRAP):
+                item = lane % fx.Index(N_ITEMS_LD)
+            return item
 
         def _load_qdo_item(head_idx_p, m_tile_idx, it):
             m_start_p = m_tile_idx * BLOCK_M
-            item = lane + fx.Index(it * WARP_SIZE)
+            item = _ld_item(it)
             row_off_i = item // fx.Index(VEC_COLS)
             cv_i = item % fx.Index(VEC_COLS)
             row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
             m_global_ld = m_start_p + row_in_tile
             m_valid_ld = m_global_ld < this_seqlen_q
-            m_safe_ld = m_valid_ld.select(m_global_ld, this_seqlen_q - fx.Index(1))
+            m_safe_ld = m_valid_ld.select(m_global_ld, seq_q_last)
             q_row_g = _q_row(m_safe_ld, head_idx_p)
             do_row_g = _do_row(m_safe_ld, head_idx_p)
             col_off_ld = cv_i * fx.Index(MFMA_LK)
@@ -1189,7 +1458,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             tid_idx = fx.Index(tid)
             m_g_ls = m_start_p + tid_idx
             m_ok_ls = m_g_ls < this_seqlen_q
-            m_sf_ls = m_ok_ls.select(m_g_ls, this_seqlen_q - fx.Index(1))
+            m_sf_ls = m_ok_ls.select(m_g_ls, seq_q_last)
             return (
                 _load_f32_row(LSE_buf, _lse_row(m_sf_ls, head_idx_p)),
                 _load_f32_row(Dvec_buf, _dvec_row(m_sf_ls, head_idx_p)),
@@ -1204,7 +1473,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
         def _store_qdo_regs_to_lds(regs_q, regs_do, buf_elem_off):
             for it in range_constexpr(ITEMS_PER_LANE):
-                item = lane + fx.Index(it * WARP_SIZE)
+                item = _ld_item(it)
                 row_off_i = item // fx.Index(VEC_COLS)
                 cv_i = item % fx.Index(VEC_COLS)
                 row_in_tile = wave * ROWS_PER_WAVE_LD + row_off_i
@@ -1244,6 +1513,31 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             m_tile_start = m_tile_start_full
             m_tile_end = n_M_tiles_idx
 
+            # Logical loop index drives buffer parity / handoff; _phys maps it to the tile.
+            def _phys(m_tile_logical):
+                return m_tile_logical
+
+            if const_expr(HSTU):
+                q_pre, q_lo, q_hi, q_tail, q_end = hstu_sm.q_tiles(
+                    fx.Int32(n_tile * BLOCK_N), BLOCK_N, BLOCK_M
+                )
+                q_main_n = q_hi - q_lo
+                m_tile_start = fx.Index(0)
+                m_tile_end = fx.Index(q_pre + q_main_n + (q_end - q_tail))
+
+                def _phys(m_tile_logical):  # noqa: F811
+                    t = fx.Int32(m_tile_logical)
+                    in_main = t - q_pre
+                    in_tail = in_main - q_main_n
+                    return fx.Index(
+                        (t < q_pre).select(
+                            t,
+                            (in_main < q_main_n).select(
+                                q_lo + in_main, q_tail + in_tail
+                            ),
+                        )
+                    )
+
             # Prologue: prefetch tile m_tile_start's Q/dO for this block's query head.
             # NOTE: if m_tile_start == m_tile_end (empty range, causal with the whole
             # M range masked out), this prefetch reads a tile that is never consumed
@@ -1251,13 +1545,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             # tolerance as the existing last-M-tile prefetch, clamped in-bounds by
             # _load_qdo_item).
             prologue_buf = (m_tile_start & fx.Index(1)) * fx.Index(LDS_Q_ELEMS)
-            prologue_q, prologue_do = _load_qdo_regs(head_idx, m_tile_start)
+            prologue_q, prologue_do = _load_qdo_regs(head_idx, _phys(m_tile_start))
             _store_qdo_regs_to_lds(prologue_q, prologue_do, prologue_buf)
             # Same prologue treatment as Q/dO: seed the start tile's LSE/D
             # into its double-buffer slot before the hot loop begins, so
             # the first tile's epiB barrier also waits on data with lead
             # time instead of a load issued moments earlier.
-            prologue_lse, prologue_dm = _load_lse_item(head_idx, m_tile_start)
+            prologue_lse, prologue_dm = _load_lse_item(head_idx, _phys(m_tile_start))
             prologue_lse_buf = (m_tile_start & fx.Index(1)) * fx.Index(LDS_LSE_ELEMS)
             _store_lse_regs_to_lds(prologue_lse, prologue_dm, prologue_lse_buf)
             entry_state = list(loop_results[0 : 2 * DV_DK_ACCS_PER_WAVE + 1])
@@ -1312,7 +1606,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         return cond & active
                     return cond
 
-                m_start = m_tile * BLOCK_M
+                m_start = _phys(m_tile) * BLOCK_M
                 cur_buf_elems = (m_tile & fx.Index(1)) * fx.Index(LDS_Q_ELEMS)
                 cur_lse_buf = (m_tile & fx.Index(1)) * fx.Index(LDS_LSE_ELEMS)
 
@@ -1355,6 +1649,16 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 next_dm = None
                 _lse_issued = False
 
+                def _store_next_tile():
+                    nxt_buf_elems = ((m_tile + fx.Index(1)) & fx.Index(1)) * fx.Index(
+                        LDS_Q_ELEMS
+                    )
+                    _store_qdo_regs_to_lds(next_q, next_do, nxt_buf_elems)
+                    nxt_lse_buf = ((m_tile + fx.Index(1)) & fx.Index(1)) * fx.Index(
+                        LDS_LSE_ELEMS
+                    )
+                    _store_lse_regs_to_lds(next_lse, next_dm, nxt_lse_buf)
+
                 log2e_scale_cst = fx.Float32(_LOG2E * scale)
                 log2e_cst = fx.Float32(_LOG2E)
                 scale_cst = fx.Float32(scale)
@@ -1385,7 +1689,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # epilogue's P-only pass), which hoists its own do_pack reads
                         # at that later point.
                         q_packs = [[None] * M_HALVES for _ in range_constexpr(D // 32)]
-                        for k_iter in range_constexpr(D // 32):
+                        for k_iter in range_constexpr(DQ_C // 32):
                             for m_half in range_constexpr(M_HALVES):
                                 q_packs[k_iter][m_half] = _pack_qdo_ck_k32(
                                     m_sub,
@@ -1428,7 +1732,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                         )
                                         rocdl.sched_group_barrier(_MFMA_MASK, 1, 0)
 
-                        for k_iter in range_constexpr(D // 32):
+                        for k_iter in range_constexpr(DQ_C // 32):
                             for m_half in range_constexpr(M_HALVES):
                                 q_pack = q_packs[k_iter][m_half]
                                 for n_grp in range_constexpr(CK_N_GROUPS):
@@ -1442,7 +1746,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 do_handoff and _next_load_it < ITEMS_PER_LANE
                             ):
                                 q_v, do_v = _load_qdo_item(
-                                    head_idx, m_tile + fx.Index(1), _next_load_it
+                                    head_idx, _phys(m_tile + fx.Index(1)), _next_load_it
                                 )
                                 next_q[_next_load_it] = q_v
                                 next_do[_next_load_it] = do_v
@@ -1454,7 +1758,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 # the real tile shapes, but handled by the elif chain
                                 # either way).
                                 next_lse, next_dm = _load_lse_item(
-                                    head_idx, m_tile + fx.Index(1)
+                                    head_idx, _phys(m_tile + fx.Index(1))
                                 )
                                 _lse_issued = True
                             rocdl.sched_group_barrier(_VMEM_MASK, 1, 0)
@@ -1469,7 +1773,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                             for _pad_it in range_constexpr(ITEMS_PER_LANE):
                                 if const_expr(_pad_it >= _next_load_it):
                                     q_v, do_v = _load_qdo_item(
-                                        head_idx, m_tile + fx.Index(1), _pad_it
+                                        head_idx, _phys(m_tile + fx.Index(1)), _pad_it
                                     )
                                     next_q[_pad_it] = q_v
                                     next_do[_pad_it] = do_v
@@ -1478,7 +1782,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                 # (e.g. K_STEPS==0 at some D) -- issue plainly, still
                                 # ahead of the store below.
                                 next_lse, next_dm = _load_lse_item(
-                                    head_idx, m_tile + fx.Index(1)
+                                    head_idx, _phys(m_tile + fx.Index(1))
                                 )
                                 _lse_issued = True
 
@@ -1536,326 +1840,451 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # constexpr dicts, so pass 1 recomputes no arithmetic and
                         # re-reads no LDS -- the emitted work is the same, only its
                         # order differs.
-                        _epi_passes = 2
-                        _epi_p_vals, _epi_valids, _epi_keeps = {}, {}, {}
-                        for _epi_pass in range_constexpr(_epi_passes):
-                            _epi_do_p = _epi_pass == 0
-                            _epi_do_ds = _epi_pass == 1
-                            # pass 0 (P-only) just finished -- run dP's MFMA now, before
-                            # pass 1 (dS-only) needs dp_accs. Stage order:
-                            # S (GEMM1 above) -> softmax/P (pass 0) -> dP (here)
-                            # -> dS (pass 1) -> dK.
-                            if const_expr(_epi_pass == 1):
-                                _do_gemm1_dp_only()
-                            # Holds n_grp==1's (ds_wide_elems, ds_wide_base_off) per
-                            # m_half until n_grp==2 arrives, so both can be fused into
-                            # one ds_write2st64_b64 at the flush site below.
-                            _ds_write2_pending = (
-                                [None] * M_HALVES
-                                if const_expr(_use_ds_write2_asm)
-                                else None
-                            )
-                            for n_grp in range_constexpr(CK_N_GROUPS):
-                                n_within = (
-                                    lane_mod_16
-                                    + wave * fx.Index(16)
-                                    + n_grp * fx.Index(NUM_WAVES * 16)
+                        _dp_accs_in = list(dp_accs)
+
+                        def _epi_body(masked):
+                            # dP GEMM accumulates in place: each branch restarts from the input.
+                            dp_accs[:] = _dp_accs_in
+                            _epi_passes = 2
+                            _epi_p_vals, _epi_valids, _epi_keeps = {}, {}, {}
+                            _epi_hstu_g = {}
+                            _hstu_vis = {}
+                            if const_expr(HSTU_MASK_SKIP and masked):
+                                _hv_keys = [
+                                    (n_grp, m_half, r)
+                                    for n_grp in range(CK_N_GROUPS)
+                                    for m_half in range(M_HALVES)
+                                    for r in range(4)
+                                ]
+                                _hv_m0 = m_start + (m_sub * 32)
+                                _hv_rows = min(32, BLOCK_M)
+
+                                def _hv_all(_names, *_state):
+                                    bits = []
+                                    for n_grp, m_half, r in _hv_keys:
+                                        n_abs = (
+                                            lane_mod_16
+                                            + wave * fx.Index(16)
+                                            + n_grp * fx.Index(NUM_WAVES * 16)
+                                            + n_start
+                                        )
+                                        m_abs = (
+                                            lane_div_16 * 4 + r + m_half * 16 + _hv_m0
+                                        )
+                                        bits.append(
+                                            _hstu_visible(m_abs, n_abs).ir_value()
+                                        )
+                                    return bits
+
+                                _hv_true = fx.Int32(0) == fx.Int32(0)
+                                _hv_bits = scf_if_dispatch(
+                                    hstu_sm.tile_needs_mask(
+                                        fx.Int32(_hv_m0),
+                                        fx.Int32(_hv_m0 + fx.Index(_hv_rows - 1)),
+                                        fx.Int32(n_start),
+                                        fx.Int32(n_start + fx.Index(BLOCK_N - 1)),
+                                    ),
+                                    _hv_all,
+                                    state_names=tuple(
+                                        "_hv%d" % i for i in range(len(_hv_keys))
+                                    ),
+                                    state_values=[_hv_true for _ in _hv_keys],
                                 )
-                                n_row_abs = n_within + n_start
-                                n_ok = n_row_abs < this_seqlen_k
-                                for m_half in range_constexpr(M_HALVES):
-                                    lse_grp = lse_grps_hoisted[m_half]
-                                    dm_grp = dm_grps_hoisted[m_half]
-                                    ai = n_grp * M_HALVES + m_half
-                                    ds_wide_elems = (
-                                        [] if const_expr(_use_ds_writer_wide) else None
+                                if not isinstance(_hv_bits, (list, tuple)):
+                                    _hv_bits = [_hv_bits]
+                                for _hk, _hb in zip(_hv_keys, _hv_bits):
+                                    _hstu_vis[_hk] = ArithValue(_raw(_hb))
+                            for _epi_pass in range_constexpr(_epi_passes):
+                                _epi_do_p = _epi_pass == 0
+                                _epi_do_ds = _epi_pass == 1
+                                # pass 0 (P-only) just finished -- run dP's MFMA now, before
+                                # pass 1 (dS-only) needs dp_accs. Stage order:
+                                # S (GEMM1 above) -> softmax/P (pass 0) -> dP (here)
+                                # -> dS (pass 1) -> dK.
+                                if const_expr(_epi_pass == 1):
+                                    _do_gemm1_dp_only()
+                                # Holds n_grp==1's (ds_wide_elems, ds_wide_base_off) per
+                                # m_half until n_grp==2 arrives, so both can be fused into
+                                # one ds_write2st64_b64 at the flush site below.
+                                _ds_write2_pending = (
+                                    [None] * M_HALVES
+                                    if const_expr(_use_ds_write2_asm)
+                                    else None
+                                )
+                                for n_grp in range_constexpr(CK_N_GROUPS):
+                                    n_within = (
+                                        lane_mod_16
+                                        + wave * fx.Index(16)
+                                        + n_grp * fx.Index(NUM_WAVES * 16)
                                     )
-                                    ds_wide_base_off = None
-                                    for r in range_constexpr(4):
-                                        m_within = lane_div_16 * 4 + r + m_half * 16
-                                        if const_expr(_epi_do_p):
-                                            m_row_abs = (
-                                                m_within + (m_sub * 32) + m_start
-                                            )
-                                            m_valid = m_row_abs < this_seqlen_q
-                                            # This predicate must guard the global
-                                            # bias load itself. Applying it only to P
-                                            # below is too late: tail lanes would have
-                                            # already read past the final bias plane.
-                                            bias_load_valid = _am(m_valid & n_ok)
-                                            lse_val = Vec(lse_grp)[r]
-                                            s_val = Vec(s_accs[ai])[r]
-                                            if const_expr(has_bias):
-                                                b_off = (
-                                                    bias_plane_base
-                                                    + fx.Index(m_row_abs)
-                                                    * fx.Index(bias_stride_q)
-                                                    + fx.Index(n_row_abs)
+                                    n_row_abs = n_within + n_start
+                                    n_ok = n_row_abs < this_seqlen_k
+                                    for m_half in range_constexpr(M_HALVES):
+                                        lse_grp = lse_grps_hoisted[m_half]
+                                        dm_grp = dm_grps_hoisted[m_half]
+                                        ai = n_grp * M_HALVES + m_half
+                                        ds_wide_elems = (
+                                            []
+                                            if const_expr(_use_ds_writer_wide)
+                                            else None
+                                        )
+                                        ds_wide_base_off = None
+                                        for r in range_constexpr(4):
+                                            m_within = lane_div_16 * 4 + r + m_half * 16
+                                            if const_expr(_epi_do_p):
+                                                m_row_abs = (
+                                                    m_within + (m_sub * 32) + m_start
                                                 )
-                                                # buffer_load(mask=...) redirects a
-                                                # masked lane to byte offset
-                                                # 0x7fffffff. This resource uses the
-                                                # default 0xffffffff-byte descriptor,
-                                                # so that sentinel is still in bounds
-                                                # and can fault. Redirect invalid
-                                                # lanes to bias[0]; valid_mn below
-                                                # suppresses the loaded value.
-                                                safe_b_off = bias_load_valid.select(
-                                                    fx.Index(b_off), fx.Index(0)
-                                                )
-                                                b_elem = _bops.buffer_load(
-                                                    bias_rsrc,
-                                                    safe_b_off,
-                                                    vec_width=1,
-                                                    dtype=elem_dtype,
-                                                )
-                                                b_f32 = Vec.from_elements(
-                                                    [b_elem], elem_dtype
-                                                ).to(fx.Float32)[0]
-                                            valid_mn = bias_load_valid
-                                            if const_expr(
-                                                causal_mode == CAUSAL_TOP_LEFT
-                                            ):
-                                                valid_mn = valid_mn & (
-                                                    n_row_abs <= m_row_abs
-                                                )
-                                            if const_expr(
-                                                causal_mode == CAUSAL_BOTTOM_RIGHT
-                                            ):
-                                                # Diagonal pinned to the end of
-                                                # both sequences; no unsigned wrap.
-                                                valid_mn = valid_mn & (
-                                                    n_row_abs + this_seqlen_q
-                                                    <= m_row_abs + this_seqlen_k
-                                                )
-                                            if const_expr(window_left >= 0):
-                                                valid_mn = valid_mn & _window_keep(
-                                                    causal_mode,
-                                                    window_left,
-                                                    n_row_abs,
-                                                    m_row_abs,
-                                                    this_seqlen_q,
-                                                    this_seqlen_k,
-                                                )
-                                            neg_log2e_lse = fx.Float32(
-                                                arith.mulf(
-                                                    _raw(lse_val),
-                                                    _raw(fx.Float32(-_LOG2E)),
-                                                    fastmath=fm,
-                                                )
-                                            )
-                                            # _softmax_p computes
-                                            # exp2(log2e*scale*QK + offset).
-                                            # Add log2e*bias to the offset directly
-                                            # instead of rewriting QK+bias/scale;
-                                            # the latter is undefined at scale==0.
-                                            if const_expr(has_bias):
-                                                bias_log2e = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(b_f32),
-                                                        _raw(log2e_cst),
-                                                        fastmath=fm,
+                                                m_valid = m_row_abs < this_seqlen_q
+                                                # This predicate must guard the global
+                                                # bias load itself. Applying it only to P
+                                                # below is too late: tail lanes would have
+                                                # already read past the final bias plane.
+                                                bias_load_valid = _am(m_valid & n_ok)
+                                                lse_val = Vec(lse_grp)[r]
+                                                s_val = Vec(s_accs[ai])[r]
+                                                if const_expr(has_bias):
+                                                    b_off = (
+                                                        bias_plane_base
+                                                        + fx.Index(m_row_abs)
+                                                        * fx.Index(bias_stride_q)
+                                                        + fx.Index(n_row_abs)
                                                     )
-                                                )
+                                                    # buffer_load(mask=...) redirects a
+                                                    # masked lane to byte offset
+                                                    # 0x7fffffff. This resource uses the
+                                                    # default 0xffffffff-byte descriptor,
+                                                    # so that sentinel is still in bounds
+                                                    # and can fault. Redirect invalid
+                                                    # lanes to bias[0]; valid_mn below
+                                                    # suppresses the loaded value.
+                                                    safe_b_off = bias_load_valid.select(
+                                                        fx.Index(b_off), fx.Index(0)
+                                                    )
+                                                    b_elem = _bops.buffer_load(
+                                                        bias_rsrc,
+                                                        safe_b_off,
+                                                        vec_width=1,
+                                                        dtype=elem_dtype,
+                                                    )
+                                                    b_f32 = Vec.from_elements(
+                                                        [b_elem], elem_dtype
+                                                    ).to(fx.Float32)[0]
+                                                valid_mn = bias_load_valid
+                                                if const_expr(not masked):
+                                                    valid_mn = fx.Int32(0) == fx.Int32(
+                                                        0
+                                                    )
+                                                elif const_expr(
+                                                    HSTU and not HSTU_MASK_SKIP
+                                                ):
+                                                    valid_mn = valid_mn & _hstu_visible(
+                                                        m_row_abs, n_row_abs
+                                                    )
+                                                elif const_expr(HSTU):
+                                                    valid_mn = (
+                                                        valid_mn
+                                                        & _hstu_vis[(n_grp, m_half, r)]
+                                                    )
+                                                if const_expr(
+                                                    causal_mode == CAUSAL_TOP_LEFT
+                                                ):
+                                                    valid_mn = valid_mn & (
+                                                        n_row_abs <= m_row_abs
+                                                    )
+                                                if const_expr(
+                                                    causal_mode == CAUSAL_BOTTOM_RIGHT
+                                                ):
+                                                    # Diagonal pinned to the end of
+                                                    # both sequences; no unsigned wrap.
+                                                    valid_mn = valid_mn & (
+                                                        n_row_abs + this_seqlen_q
+                                                        <= m_row_abs + this_seqlen_k
+                                                    )
+                                                if const_expr(window_left >= 0):
+                                                    valid_mn = valid_mn & _window_keep(
+                                                        causal_mode,
+                                                        window_left,
+                                                        n_row_abs,
+                                                        m_row_abs,
+                                                        this_seqlen_q,
+                                                        this_seqlen_k,
+                                                    )
                                                 neg_log2e_lse = fx.Float32(
-                                                    arith.addf(
-                                                        _raw(neg_log2e_lse),
-                                                        _raw(bias_log2e),
-                                                        fastmath=fm,
-                                                    )
-                                                )
-                                            p_val = _softmax_p(
-                                                s_val,
-                                                neg_log2e_lse,
-                                                log2e_scale_cst,
-                                                valid_mn,
-                                                fm,
-                                            )
-                                            _epi_p_vals[(n_grp, m_half, r)] = p_val
-                                            _epi_valids[(n_grp, m_half, r)] = valid_mn
-                                            # dV uses the dropped, rescaled P; dS and
-                                            # the D_vec correction keep the undropped
-                                            # P, and dP is masked the same way below.
-                                            p_dv_val = p_val
-                                            if const_expr(has_dropout):
-                                                # Invalid lanes read plane element 0
-                                                # (valid_mn already zeroes P there).
-                                                d_off = fx.Index(m_row_abs) * fx.Index(
-                                                    drop_stride_q
-                                                ) + fx.Index(n_row_abs)
-                                                safe_d_off = bias_load_valid.select(
-                                                    fx.Index(d_off), fx.Index(0)
-                                                )
-                                                keep_scale = fx.Float32(
                                                     arith.mulf(
-                                                        _raw(
-                                                            _u8_load_f32(
-                                                                drop_rsrc, safe_d_off
-                                                            )
-                                                        ),
-                                                        _raw(fx.Float32(_rp_undrop)),
+                                                        _raw(lse_val),
+                                                        _raw(fx.Float32(-_LOG2E)),
                                                         fastmath=fm,
                                                     )
                                                 )
-                                                _epi_keeps[(n_grp, m_half, r)] = (
-                                                    keep_scale
-                                                )
-                                                p_dv_val = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(p_val),
-                                                        _raw(keep_scale),
-                                                        fastmath=fm,
-                                                    )
-                                                )
-                                        else:
-                                            p_val = _epi_p_vals[(n_grp, m_half, r)]
-                                            valid_mn = _epi_valids[(n_grp, m_half, r)]
-                                        if const_expr(_epi_do_ds):
-                                            dm_val = Vec(dm_grp)[r]
-                                            dp_val = Vec(dp_accs[ai])[r]
-                                            if const_expr(has_dropout):
-                                                dp_val = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(dp_val),
-                                                        _raw(
-                                                            _epi_keeps[
-                                                                (n_grp, m_half, r)
-                                                            ]
-                                                        ),
-                                                        fastmath=fm,
-                                                    )
-                                                )
-                                            ds_val = _grad_ds_unscaled(
-                                                p_val, dp_val, dm_val, valid_mn, fm
-                                            )
-                                        # Register-only handoff for GEMM2 (dV/dK): stash P/dS
-                                        # into per-(ai,r) rmem; the N-split GEMM2 reads these
-                                        # instead of lds_p/lds_ds. BUT dS ALSO feeds GEMM4/dQ,
-                                        # which still consumes it from lds_ds (dS->dQ
-                                        # routes through LDS) -- so keep the lds_ds write;
-                                        # only the lds_p write is dropped (P feeds only
-                                        # dV/GEMM2).
-                                        if const_expr(_epi_do_p):
-                                            fx.memref_store(
-                                                Vec.from_elements(
-                                                    [p_dv_val], fx.Float32
-                                                ).to(elem_dtype)[0],
-                                                p_regs_ns[ai],
-                                                r,
-                                            )
-                                        if const_expr(_epi_do_ds):
-                                            fx.memref_store(
-                                                Vec.from_elements(
-                                                    [ds_val], fx.Float32
-                                                ).to(elem_dtype)[0],
-                                                ds_regs_ns[ai],
-                                                r,
-                                            )
-                                            m_local = m_within + (m_sub * 32)
-                                            n_local = n_within
-                                            if const_expr(emit_dbias):
-                                                # Bound only on the P pass;
-                                                # recompute, don't reuse.
-                                                db_off_ok = fx.Int32(
-                                                    dbias_plane_base
-                                                    + (m_local + m_start) * seq_N_idx
-                                                    + (n_local + n_start)
-                                                )
-                                                _bops.buffer_store(
-                                                    _raw(ds_val),
-                                                    dbias_rsrc,
-                                                    fx.Index(
-                                                        valid_mn.select(
-                                                            db_off_ok,
-                                                            fx.Int32(dbias_sink),
+                                                # _softmax_p computes
+                                                # exp2(log2e*scale*QK + offset).
+                                                # Add log2e*bias to the offset directly
+                                                # instead of rewriting QK+bias/scale;
+                                                # the latter is undefined at scale==0.
+                                                if const_expr(has_bias):
+                                                    bias_log2e = fx.Float32(
+                                                        arith.mulf(
+                                                            _raw(b_f32),
+                                                            _raw(log2e_cst),
+                                                            fastmath=fm,
                                                         )
-                                                    ),
+                                                    )
+                                                    neg_log2e_lse = fx.Float32(
+                                                        arith.addf(
+                                                            _raw(neg_log2e_lse),
+                                                            _raw(bias_log2e),
+                                                            fastmath=fm,
+                                                        )
+                                                    )
+                                                p_val = _softmax_p(
+                                                    s_val,
+                                                    neg_log2e_lse,
+                                                    log2e_scale_cst,
+                                                    valid_mn,
+                                                    fm,
                                                 )
-                                            # Default [n,m] m-contiguous store, UNLESS _use_ds_tr
-                                            # (paired with the ds_read_tr A-operand read below --
-                                            # _dq_ds_pack_gemm4_tr) -- then use the
-                                            # swizzled layout (_ck_ds_off).
-                                            if const_expr(_use_ds_writer_wide):
-                                                # Buffer this group's 4 ds_val's (r=0..3,
-                                                # contiguous _ck_ds_off addresses) and issue
-                                                # ONE v4 store after the loop instead of 4
-                                                # scalar ones.
-                                                ds_wide_elems.append(ds_val)
-                                                if const_expr(r == 0):
-                                                    ds_wide_base_off = _ck_ds_off(
-                                                        m_local, n_local
+                                                if const_expr(HSTU_SILU):
+                                                    p_val, hstu_g = _hstu_p_grad(
+                                                        s_val, lse_val, valid_mn
+                                                    )
+                                                    _epi_hstu_g[(n_grp, m_half, r)] = (
+                                                        hstu_g
+                                                    )
+                                                _epi_p_vals[(n_grp, m_half, r)] = p_val
+                                                _epi_valids[(n_grp, m_half, r)] = (
+                                                    valid_mn
+                                                )
+                                                # dV uses the dropped, rescaled P; dS and
+                                                # the D_vec correction keep the undropped
+                                                # P, and dP is masked the same way below.
+                                                p_dv_val = p_val
+                                                if const_expr(has_dropout):
+                                                    # Invalid lanes read plane element 0
+                                                    # (valid_mn already zeroes P there).
+                                                    d_off = fx.Index(
+                                                        m_row_abs
+                                                    ) * fx.Index(
+                                                        drop_stride_q
+                                                    ) + fx.Index(n_row_abs)
+                                                    safe_d_off = bias_load_valid.select(
+                                                        fx.Index(d_off), fx.Index(0)
+                                                    )
+                                                    keep_scale = fx.Float32(
+                                                        arith.mulf(
+                                                            _raw(
+                                                                _u8_load_f32(
+                                                                    drop_rsrc,
+                                                                    safe_d_off,
+                                                                )
+                                                            ),
+                                                            _raw(
+                                                                fx.Float32(_rp_undrop)
+                                                            ),
+                                                            fastmath=fm,
+                                                        )
+                                                    )
+                                                    _epi_keeps[(n_grp, m_half, r)] = (
+                                                        keep_scale
+                                                    )
+                                                    p_dv_val = fx.Float32(
+                                                        arith.mulf(
+                                                            _raw(p_val),
+                                                            _raw(keep_scale),
+                                                            fastmath=fm,
+                                                        )
                                                     )
                                             else:
-                                                ds_off = (
-                                                    _ck_ds_off(m_local, n_local)
-                                                    if const_expr(_use_ds_tr)
-                                                    else (n_local * LDS_MPAD + m_local)
+                                                p_val = _epi_p_vals[(n_grp, m_half, r)]
+                                                valid_mn = _epi_valids[
+                                                    (n_grp, m_half, r)
+                                                ]
+                                            if const_expr(_epi_do_ds):
+                                                dm_val = Vec(dm_grp)[r]
+                                                dp_val = Vec(dp_accs[ai])[r]
+                                                if const_expr(has_dropout):
+                                                    dp_val = fx.Float32(
+                                                        arith.mulf(
+                                                            _raw(dp_val),
+                                                            _raw(
+                                                                _epi_keeps[
+                                                                    (n_grp, m_half, r)
+                                                                ]
+                                                            ),
+                                                            fastmath=fm,
+                                                        )
+                                                    )
+                                                ds_val = _grad_ds_unscaled(
+                                                    p_val, dp_val, dm_val, valid_mn, fm
                                                 )
-                                                Vec.from_elements(
-                                                    [ds_val], fx.Float32
-                                                ).to(elem_dtype).store(lds_ds, [ds_off])
-                                    # end for r in range_constexpr(4): flush the buffered wide dS
-                                    # store, firing only on the branch that populated ds_wide_elems.
-                                    if const_expr(_epi_do_ds and _use_ds_writer_wide):
-                                        if const_expr(_use_ds_write2_asm):
-                                            # Fused write2 pattern:
-                                            # n_grp==0 stays a plain wide store, n_grp==1's
-                                            # payload is held until n_grp==2 arrives, then both
-                                            # are fused into ONE ds_write2st64_b64 hand-asm call
-                                            # (n_grp==1's base address as ADDR/offset0, n_grp==2
-                                            # at the fixed +4-ST64-unit delta as offset1 -- see
-                                            # _ds_write2st64_b64_asm and _DS_WRITE2_OFFSET1_ST64).
-                                            if const_expr(n_grp == 0):
+                                                if const_expr(HSTU_SILU):
+                                                    ds_val = valid_mn.select(
+                                                        dp_val
+                                                        * _epi_hstu_g[
+                                                            (n_grp, m_half, r)
+                                                        ],
+                                                        fx.Float32(0.0),
+                                                    )
+                                            # Register-only handoff for GEMM2 (dV/dK): stash P/dS
+                                            # into per-(ai,r) rmem; the N-split GEMM2 reads these
+                                            # instead of lds_p/lds_ds. BUT dS ALSO feeds GEMM4/dQ,
+                                            # which still consumes it from lds_ds (dS->dQ
+                                            # routes through LDS) -- so keep the lds_ds write;
+                                            # only the lds_p write is dropped (P feeds only
+                                            # dV/GEMM2).
+                                            if const_expr(_epi_do_p):
+                                                fx.memref_store(
+                                                    Vec.from_elements(
+                                                        [p_dv_val], fx.Float32
+                                                    ).to(elem_dtype)[0],
+                                                    p_regs_ns[ai],
+                                                    r,
+                                                )
+                                            if const_expr(_epi_do_ds):
+                                                fx.memref_store(
+                                                    Vec.from_elements(
+                                                        [ds_val], fx.Float32
+                                                    ).to(elem_dtype)[0],
+                                                    ds_regs_ns[ai],
+                                                    r,
+                                                )
+                                                m_local = m_within + (m_sub * 32)
+                                                n_local = n_within
+                                                if const_expr(emit_dbias):
+                                                    # Bound only on the P pass;
+                                                    # recompute, don't reuse.
+                                                    db_off_ok = fx.Int32(
+                                                        dbias_plane_base
+                                                        + (m_local + m_start)
+                                                        * seq_N_idx
+                                                        + (n_local + n_start)
+                                                    )
+                                                    _bops.buffer_store(
+                                                        _raw(ds_val),
+                                                        dbias_rsrc,
+                                                        fx.Index(
+                                                            valid_mn.select(
+                                                                db_off_ok,
+                                                                fx.Int32(dbias_sink),
+                                                            )
+                                                        ),
+                                                    )
+                                                # Default [n,m] m-contiguous store, UNLESS _use_ds_tr
+                                                # (paired with the ds_read_tr A-operand read below --
+                                                # _dq_ds_pack_gemm4_tr) -- then use the
+                                                # swizzled layout (_ck_ds_off).
+                                                if const_expr(HSTU_NO_DQ):
+                                                    pass
+                                                elif const_expr(_use_ds_writer_wide):
+                                                    # Buffer this group's 4 ds_val's (r=0..3,
+                                                    # contiguous _ck_ds_off addresses) and issue
+                                                    # ONE v4 store after the loop instead of 4
+                                                    # scalar ones.
+                                                    ds_wide_elems.append(ds_val)
+                                                    if const_expr(r == 0):
+                                                        ds_wide_base_off = _ck_ds_off(
+                                                            m_local, n_local
+                                                        )
+                                                else:
+                                                    ds_off = (
+                                                        _ck_ds_off(m_local, n_local)
+                                                        if const_expr(_use_ds_tr)
+                                                        else (
+                                                            n_local * LDS_MPAD + m_local
+                                                        )
+                                                    )
+                                                    Vec.from_elements(
+                                                        [ds_val], fx.Float32
+                                                    ).to(elem_dtype).store(
+                                                        lds_ds, [ds_off]
+                                                    )
+                                        # end for r in range_constexpr(4): flush the buffered wide dS
+                                        # store, firing only on the branch that populated ds_wide_elems.
+                                        if const_expr(
+                                            _epi_do_ds
+                                            and _use_ds_writer_wide
+                                            and not HSTU_NO_DQ
+                                        ):
+                                            if const_expr(_use_ds_write2_asm):
+                                                # Fused write2 pattern:
+                                                # n_grp==0 stays a plain wide store, n_grp==1's
+                                                # payload is held until n_grp==2 arrives, then both
+                                                # are fused into ONE ds_write2st64_b64 hand-asm call
+                                                # (n_grp==1's base address as ADDR/offset0, n_grp==2
+                                                # at the fixed +4-ST64-unit delta as offset1 -- see
+                                                # _ds_write2st64_b64_asm and _DS_WRITE2_OFFSET1_ST64).
+                                                if const_expr(n_grp == 0):
+                                                    Vec.from_elements(
+                                                        ds_wide_elems, fx.Float32
+                                                    ).to(elem_dtype).store(
+                                                        lds_ds, [ds_wide_base_off]
+                                                    )
+                                                elif const_expr(n_grp == 1):
+                                                    _ds_write2_pending[m_half] = (
+                                                        ds_wide_elems,
+                                                        ds_wide_base_off,
+                                                    )
+                                                else:
+                                                    _prev_elems, _prev_base_off = (
+                                                        _ds_write2_pending[m_half]
+                                                    )
+                                                    data0 = (
+                                                        Vec.from_elements(
+                                                            _prev_elems, fx.Float32
+                                                        )
+                                                        .to(elem_dtype)
+                                                        .bitcast(fx.Int32)
+                                                        .ir_value()
+                                                    )
+                                                    data1 = (
+                                                        Vec.from_elements(
+                                                            ds_wide_elems, fx.Float32
+                                                        )
+                                                        .to(elem_dtype)
+                                                        .bitcast(fx.Int32)
+                                                        .ir_value()
+                                                    )
+                                                    _ds_write2st64_b64_asm(
+                                                        _prev_base_off,
+                                                        lds_ds_off,
+                                                        data0,
+                                                        data1,
+                                                        _DS_WRITE2_OFFSET1_ST64,
+                                                    )
+                                                rocdl.sched_group_barrier(
+                                                    _LDS_WRITE_MASK, 1, 0
+                                                )
+                                            else:
                                                 Vec.from_elements(
                                                     ds_wide_elems, fx.Float32
                                                 ).to(elem_dtype).store(
                                                     lds_ds, [ds_wide_base_off]
                                                 )
-                                            elif const_expr(n_grp == 1):
-                                                _ds_write2_pending[m_half] = (
-                                                    ds_wide_elems,
-                                                    ds_wide_base_off,
+                                                rocdl.sched_group_barrier(
+                                                    _LDS_WRITE_MASK, 1, 0
                                                 )
-                                            else:
-                                                _prev_elems, _prev_base_off = (
-                                                    _ds_write2_pending[m_half]
-                                                )
-                                                data0 = (
-                                                    Vec.from_elements(
-                                                        _prev_elems, fx.Float32
-                                                    )
-                                                    .to(elem_dtype)
-                                                    .bitcast(fx.Int32)
-                                                    .ir_value()
-                                                )
-                                                data1 = (
-                                                    Vec.from_elements(
-                                                        ds_wide_elems, fx.Float32
-                                                    )
-                                                    .to(elem_dtype)
-                                                    .bitcast(fx.Int32)
-                                                    .ir_value()
-                                                )
-                                                _ds_write2st64_b64_asm(
-                                                    _prev_base_off,
-                                                    lds_ds_off,
-                                                    data0,
-                                                    data1,
-                                                    _DS_WRITE2_OFFSET1_ST64,
-                                                )
-                                            rocdl.sched_group_barrier(
-                                                _LDS_WRITE_MASK, 1, 0
-                                            )
-                                        else:
-                                            Vec.from_elements(
-                                                ds_wide_elems, fx.Float32
-                                            ).to(elem_dtype).store(
-                                                lds_ds, [ds_wide_base_off]
-                                            )
-                                            rocdl.sched_group_barrier(
-                                                _LDS_WRITE_MASK, 1, 0
-                                            )
 
+                        if const_expr(_SPLIT_EPI):
+                            _ft_m0 = m_start + (m_sub * 32)
+                            _ft_inb = (
+                                _ft_m0 + fx.Index(min(32, BLOCK_M)) <= this_seqlen_q
+                            ) & (n_start + fx.Index(BLOCK_N) <= this_seqlen_k)
+                            _ft_needs = hstu_sm.tile_needs_mask(
+                                fx.Int32(_ft_m0),
+                                fx.Int32(_ft_m0 + fx.Index(min(32, BLOCK_M) - 1)),
+                                fx.Int32(n_start),
+                                fx.Int32(n_start + fx.Index(BLOCK_N - 1)),
+                            )
+                            _ft_full = _ft_needs.select(
+                                fx.Int32(0) == fx.Int32(1), _ft_inb
+                            )
+                            scf_if_dispatch(
+                                _ft_full,
+                                lambda *_: _epi_body(False),
+                                lambda *_: _epi_body(True),
+                            )
+                        else:
+                            _epi_body(True)
                         rocdl.sched_barrier(0)
 
                         gpu.barrier()
@@ -2030,14 +2459,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                             d_in_range_ns = (d_full * 16) < fx.Index(D)
                             d_band = d_in_range_ns.select(fx.Index(d_full), fx.Index(0))
                             for ks in range_constexpr(M_HALVES):
-                                qdo_tr_q_packs[d_full][ks] = _qdo_read_k16_tr(
-                                    m_sub, ks, d_band, cur_buf_elems, lds_q_off
-                                )
+                                if const_expr(d_full < DQ_C // 16):
+                                    qdo_tr_q_packs[d_full][ks] = _qdo_read_k16_tr(
+                                        m_sub, ks, d_band, cur_buf_elems, lds_q_off
+                                    )
                                 qdo_tr_do_packs[d_full][ks] = _qdo_read_k16_tr(
                                     m_sub, ks, d_band, cur_buf_elems, lds_do_off
                                 )
                                 rocdl.sched_group_barrier(_LDS_READ_MASK, 1, 0)
-                        for d_full in range_constexpr(NSPLIT_NITER):
+                        for d_full in range_constexpr(
+                            0 if _GEMM2_K32 else NSPLIT_NITER
+                        ):
                             d_in_range_ns = (d_full * 16) < fx.Index(D)
                             d_band = d_in_range_ns.select(fx.Index(d_full), fx.Index(0))
                             for ks in range_constexpr(M_HALVES):
@@ -2051,13 +2483,54 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                     dv_accs[acc_i] = mfma_gemm16_tc(
                                         p_pack, do_pack, dv_accs[acc_i]
                                     )
-                                    dk_accs[acc_i] = mfma_gemm16_tc(
-                                        ds_pack, q_pack, dk_accs[acc_i]
-                                    )
+                                    if const_expr(d_full < DQ_C // 16):
+                                        dk_accs[acc_i] = mfma_gemm16_tc(
+                                            ds_pack, q_pack, dk_accs[acc_i]
+                                        )
                                     rocdl.sched_group_barrier(_MFMA_MASK, 1, 0)
                                     rocdl.sched_group_barrier(_LDS_READ_MASK, 1, 0)
+                        # Two 16-row halves as one K=32 MFMA: both operands concatenate in the same order.
+                        for d_full in range_constexpr(
+                            NSPLIT_NITER if _GEMM2_K32 else 0
+                        ):
+                            q8 = None
+                            if const_expr(d_full < DQ_C // 16):
+                                q8 = _cat_k16(
+                                    qdo_tr_q_packs[d_full][0],
+                                    qdo_tr_q_packs[d_full][1],
+                                )
+                            do8 = _cat_k16(
+                                qdo_tr_do_packs[d_full][0], qdo_tr_do_packs[d_full][1]
+                            )
+                            for mIter in range_constexpr(CK_N_GROUPS):
+                                acc_i = mIter * NSPLIT_NITER + d_full
+                                a0, a1 = mIter * M_HALVES, mIter * M_HALVES + 1
+                                p8 = _cat_k16(
+                                    fx.memref_load_vec(p_regs_ns[a0]),
+                                    fx.memref_load_vec(p_regs_ns[a1]),
+                                )
+                                dv_accs[acc_i] = mfma_gemm32_tc(p8, do8, dv_accs[acc_i])
+                                if const_expr(d_full < DQ_C // 16):
+                                    ds8 = _cat_k16(
+                                        fx.memref_load_vec(ds_regs_ns[a0]),
+                                        fx.memref_load_vec(ds_regs_ns[a1]),
+                                    )
+                                    dk_accs[acc_i] = mfma_gemm32_tc(
+                                        ds8, q8, dk_accs[acc_i]
+                                    )
+                                rocdl.sched_group_barrier(_MFMA_MASK, 1, 0)
+                                rocdl.sched_group_barrier(_LDS_READ_MASK, 1, 0)
 
-                    _do_gemm4_dq()
+                    if const_expr(
+                        _EARLY_STORE
+                        and _do_gemm1
+                        and do_handoff
+                        and m_sub == M_SUBTILES - 1
+                    ):
+                        # Before the dQ atomics: vmcnt also counts atomics, so waiting after them stalls.
+                        _store_next_tile()
+                    if const_expr(not HSTU_NO_DQ):
+                        _do_gemm4_dq()
                     _do_gemm2_dvdk()
                     rocdl.sched_barrier(0)
 
@@ -2067,15 +2540,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                     if const_expr(phase == "all"):
                         gpu.barrier()
 
-                if const_expr(_do_gemm1 and do_handoff):
-                    nxt_buf_elems = ((m_tile + fx.Index(1)) & fx.Index(1)) * fx.Index(
-                        LDS_Q_ELEMS
-                    )
-                    _store_qdo_regs_to_lds(next_q, next_do, nxt_buf_elems)
-                    nxt_lse_buf = ((m_tile + fx.Index(1)) & fx.Index(1)) * fx.Index(
-                        LDS_LSE_ELEMS
-                    )
-                    _store_lse_regs_to_lds(next_lse, next_dm, nxt_lse_buf)
+                if const_expr(
+                    _do_gemm1 and do_handoff and not (_EARLY_STORE and _do_stageb)
+                ):
+                    _store_next_tile()
 
                 if const_expr(phase == "gemm1"):
                     return _sdp[0], _sdp[1]
@@ -2126,7 +2594,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 + n_start
             )
             n_ok = n_row_abs < this_seqlen_k
-            n_safe = n_ok.select(n_row_abs, this_seqlen_k - fx.Index(1))
+            n_safe = n_ok.select(n_row_abs, seq_k_last)
             kv_row_g = (
                 _kv_row_out_per_qhead(n_safe)
                 if const_expr(_use_ck_scope_dvdk)
@@ -2137,7 +2605,35 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                 d_col_abs0 = d_full * fx.Index(16) + lane_div_16 * 4
                 d_ok0 = d_col_abs0 < fx.Index(D)
                 flat_col0 = fx.Int32(fx.Index(kv_row_g) * fx.Index(D) + d_col_abs0)
-                if const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
+                if const_expr(HSTU_DIRECT):
+                    hstu_dk_vals = [
+                        Vec(dk_finals[acc_i])[r] * store_scale_cst for r in range(4)
+                    ]
+                    hstu_dv_vals = [Vec(dv_finals[acc_i])[r] for r in range(4)]
+                    if const_expr(HSTU_SHARED):
+                        hstu_dk_vals = [
+                            hstu_dk_vals[r] + hstu_dv_vals[r] for r in range(4)
+                        ]
+                    if n_ok & (d_col_abs0 < fx.Index(D_QK)):
+                        _bops.buffer_store(
+                            Vec.from_elements(hstu_dk_vals, fx.Float32)
+                            .to(elem_dtype)
+                            .ir_value(),
+                            dk_store_rsrc,
+                            fx.Int32(fx.Index(kv_row_g) * fx.Index(D_QK) + d_col_abs0),
+                        )
+                    if const_expr(not HSTU_SHARED):
+                        if n_ok & (d_col_abs0 < fx.Index(D_V)):
+                            _bops.buffer_store(
+                                Vec.from_elements(hstu_dv_vals, fx.Float32)
+                                .to(elem_dtype)
+                                .ir_value(),
+                                dv_store_rsrc,
+                                fx.Int32(
+                                    fx.Index(kv_row_g) * fx.Index(D_V) + d_col_abs0
+                                ),
+                            )
+                elif const_expr(not (_dvdk_atomic and not _use_ck_scope_dvdk)):
                     if n_ok & d_ok0:
                         dk_vals = [
                             fx.Float32(
@@ -2210,6 +2706,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         drop_stride_b: fx.Int32,
         drop_stride_h: fx.Int32,
         drop_stride_q: fx.Int32,
+        hstu_targets: fx.Tensor,
+        hstu_max_attn_len: fx.Int32,
+        hstu_contextual_seq_len: fx.Int32,
+        hstu_full_attn_size: fx.Int32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2227,6 +2727,26 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # dV/dK partials combined via atomic-add. varlen: B already collapsed to 1 by
         # the caller.
         grid_x = fx.Int32(fx.Index(B) * fx.Index(H) * num_N_tiles)
+        if const_expr(HSTU_GROUPED):
+            grid_x = fx.Int32(
+                (
+                    (fx.Index(total_m) + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+                    + fx.Index(B)
+                )
+                * fx.Index(H)
+            )
+        if const_expr(HSTU):
+            grid_x = fx.Int32(
+                (fx.Index(grid_x) + fx.Index(7)) // fx.Index(8) * fx.Index(8)
+            )
+        if const_expr(HSTU_SORTED):
+            grid_x = fx.Int32(
+                (fx.Index(B) + fx.Index(7))
+                // fx.Index(8)
+                * fx.Index(8)
+                * fx.Index(H)
+                * num_N_tiles
+            )
         fmha_bwd_dqdkdv_mfma_gfx950_kernel(
             Q,
             K,
@@ -2258,6 +2778,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             drop_stride_b,
             drop_stride_h,
             drop_stride_q,
+            hstu_targets,
+            hstu_max_attn_len,
+            hstu_contextual_seq_len,
+            hstu_full_attn_size,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),

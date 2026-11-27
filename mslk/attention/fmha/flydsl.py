@@ -1322,6 +1322,11 @@ def _flydsl_bwd(
             drop_stride_b,
             drop_stride_h,
             drop_stride_q,
+            # HSTU arguments (unused by FMHA).
+            _seqstart_q_arg,
+            0,
+            0,
+            0,
             stream,
         )
         gfx950_key = (
@@ -1404,6 +1409,10 @@ def _flydsl_bwd(
                 drop_stride_b,
                 drop_stride_h,
                 drop_stride_q,
+                _seqstart_q_arg,
+                0,
+                0,
+                0,
                 stream,
             )
             compiled_gfx950 = flyc.compile(launch_gfx950, *args_compile)

@@ -120,9 +120,49 @@ def test_kv_tiles_cover_every_visible_key(block_m, block_n):
 
 
 @pytest.mark.parametrize("block_m,block_n", [(1, 1), (2, 3), (4, 2), (8, 4), (16, 16)])
+def test_q_tiles_cover_every_visible_row(block_m, block_n):
+    """The backward's query-tile ranges per KV tile are ordered and cover
+    every row that sees a key of the tile, for each call's features and with
+    every feature compiled in at run-time values; they skip work somewhere."""
+    skipped = 0
+    every_feature = {
+        has_targets: MaskSpec(LOWER, True, True, has_targets, True)
+        for has_targets in (False, True)
+    }
+    for (mask, w, c, f, n, t), all_on in itertools.product(_cases(), (False, True)):
+        if all_on and mask != LOWER:
+            continue
+        spec, sm = _host_seq_mask(
+            mask, w, c, f, n, t, every_feature[t is not None] if all_on else None
+        )
+        ref = ragged_hstu_valid_mask(n, mask, t, w, c, f)
+        n_q_tiles = -(-n // block_m)
+        for k_start in range(0, n + block_n, block_n):
+            pre, lo, hi, tail, end = sm.q_tiles(k_start, block_n, block_m)
+            assert 0 <= pre <= lo <= hi <= tail <= end <= n_q_tiles, (
+                pre,
+                lo,
+                hi,
+                tail,
+                end,
+            )
+            if k_start >= n:
+                assert end == 0 and hi == 0
+                continue
+            visited = torch.zeros(n, dtype=torch.bool)
+            for tile in itertools.chain(range(pre), range(lo, hi), range(tail, end)):
+                visited[tile * block_m : (tile + 1) * block_m] = True
+            rows = ref[:, k_start : k_start + block_n].any(dim=1)
+            missing = rows & ~visited
+            assert not missing.any(), (mask, w, c, f, n, t, k_start, pre, lo, hi, tail)
+            skipped += int((~visited).sum())
+    assert skipped > 0
+
+
+@pytest.mark.parametrize("block_m,block_n", [(1, 1), (2, 3), (4, 2), (8, 4), (16, 16)])
 def test_tile_needs_mask_is_safe(block_m, block_n):
-    """A tile declared unmasked has every key visible to every row (lower
-    triangular), and the check does skip tiles, including full-attention
+    """A tile declared unmasked has every key visible to every row (every
+    mask type), and the check does skip tiles, including full-attention
     blocks outside their window. Both for the features of each call and for
     every feature compiled in with run-time values (grouped calls), where a
     contextual length > 0 must keep every tile masked."""
@@ -132,7 +172,7 @@ def test_tile_needs_mask_is_safe(block_m, block_n):
         for has_targets in (False, True)
     }
     for (mask, w, c, f, n, t), all_on in itertools.product(_cases(), (False, True)):
-        if mask != LOWER:
+        if all_on and mask != LOWER:
             continue
         spec, sm = _host_seq_mask(
             mask, w, c, f, n, t, every_feature[t is not None] if all_on else None
@@ -159,3 +199,43 @@ def test_tile_needs_mask_is_safe(block_m, block_n):
                 if spec.has_full_attn and sm.to_id(c0) < sm.to_id(r1) - w:
                     skipped_full += 1
     assert skipped > 0 and skipped_full > 0
+
+
+@pytest.mark.parametrize("block_m,block_n", [(1, 1), (2, 3), (4, 2), (8, 4)])
+def test_tile_hidden_is_safe(block_m, block_n):
+    """A tile declared hidden has no key visible to any row (every mask
+    type, with each call's features and with every feature compiled in), and
+    the check does fire, before windows and after the diagonal."""
+    hidden_after = hidden_before = 0
+    every_feature = {
+        has_targets: MaskSpec(LOWER, True, True, has_targets, True)
+        for has_targets in (False, True)
+    }
+    for (mask, w, c, f, n, t), all_on in itertools.product(_cases(), (False, True)):
+        if all_on and mask != LOWER:
+            continue
+        spec, sm = _host_seq_mask(
+            mask, w, c, f, n, t, every_feature[t is not None] if all_on else None
+        )
+        ref = ragged_hstu_valid_mask(n, mask, t, w, c, f)
+        for r0 in range(0, n, block_m):
+            r1 = min(r0 + block_m, n) - 1
+            for c0 in range(0, n, block_n):
+                c1 = min(c0 + block_n, n) - 1
+                if not sm.tile_hidden(r0, r1, c0, c1):
+                    continue
+                assert not ref[r0 : r1 + 1, c0 : c1 + 1].any(), (
+                    mask,
+                    w,
+                    c,
+                    f,
+                    n,
+                    t,
+                    r0,
+                    c0,
+                )
+                if c0 > r1:
+                    hidden_after += 1
+                else:
+                    hidden_before += 1
+    assert hidden_after > 0 and hidden_before > 0

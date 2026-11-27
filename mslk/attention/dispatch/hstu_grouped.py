@@ -39,9 +39,10 @@ def _mslk_fwd(q: torch.Tensor, **kwargs: Any) -> torch.Tensor:
 
 
 def _mslk_bwd(q: torch.Tensor, **kwargs: Any) -> None:
-    raise NotImplementedError(
-        "MSLK has no grouped HSTU backward kernel; no backend can serve this call"
-    )
+    # Lazy: importing the routing must not import FlyDSL.
+    from mslk.attention.flydsl.hstu.grouped_bwd import hstu_grouped_bwd
+
+    hstu_grouped_bwd(q=q, **kwargs)
 
 
 def key(
